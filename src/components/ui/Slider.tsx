@@ -18,6 +18,7 @@ interface SliderProps {
   min: number;
   onChange(event: SliderChangeEvent): void;
   onDragStateChange?(state: boolean): void;
+  onEditingChange?(state: boolean): void;
   onPointerUp?(): void;
   step: number;
   value: number;
@@ -42,6 +43,7 @@ const Slider = ({
   min,
   onChange,
   onDragStateChange = () => {},
+  onEditingChange = () => {},
   onPointerUp,
   step = 1,
   value,
@@ -114,6 +116,13 @@ const Slider = ({
   useEffect(() => {
     onDragStateChangeRef.current(isDragging);
   }, [isDragging]);
+
+  const onEditingChangeRef = useRef(onEditingChange);
+  onEditingChangeRef.current = onEditingChange;
+
+  useEffect(() => {
+    onEditingChangeRef.current(isEditing);
+  }, [isEditing]);
 
   useEffect(() => {
     if (!disabled) return;

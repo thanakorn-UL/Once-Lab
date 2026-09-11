@@ -23,6 +23,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
   const xmpProfilePath = useEditorStore((s) => s.xmpProfilePath);
+  const xmpProfileAmountPercent = useEditorStore((s) => s.xmpProfileAmountPercent);
 
   // Tracks the image whose sidecar metadata has already been applied, so that a
   // profile-triggered reload of the same image keeps the user's adjustments.
@@ -69,11 +70,18 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
       const loadFullImageData = async () => {
         try {
-          const profilePath = useEditorStore.getState().xmpProfilePath;
+          const {
+            xmpProfilePath: profilePath,
+            xmpProfileAmountPercent,
+            xmpProfileSupportsAmount,
+          } = useEditorStore.getState();
           const loadImageResult: any = profilePath
             ? await invoke(Invokes.LoadImageWithXmpProfile, {
                 path: selectedImage.path,
                 xmpProfilePath: profilePath,
+                // A profile that does not support an amount hard-rejects any
+                // override, so only the raw percent of a supporting profile is sent.
+                profileAmountPercent: xmpProfileSupportsAmount ? xmpProfileAmountPercent : null,
               })
             : await invoke(Invokes.LoadImage, { path: selectedImage.path });
           if (!isEffectActive) return;
@@ -125,9 +133,13 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
           });
 
           // The reload carried the profile change, so the optimistic transaction
-          // is closed: the committed profile is the one now rendered.
+          // is closed: the committed profile is the one now rendered. Clearing is
+          // guarded by the transaction id so a superseded request cannot wipe the
+          // rollback a newer reload is relying on.
           if (profileRollback) {
-            setEditor({ xmpProfileRollback: null });
+            setEditor((state) =>
+              state.xmpProfileRollback?.id === profileRollback.id ? { ...state, xmpProfileRollback: null } : state,
+            );
           }
         } catch (err) {
           if (isEffectActive) {
@@ -138,12 +150,22 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
               // Changing a profile reloads the image that is already open, so a
               // failed attempt must keep it selected and put the previous profile
               // back rather than closing the image with the failed one committed.
-              setEditor((state) => ({
-                selectedImage: state.selectedImage ? { ...state.selectedImage, isReady: true } : state.selectedImage,
-                xmpProfilePath: profileRollback.path,
-                xmpProfileName: profileRollback.name,
-                xmpProfileRollback: null,
-              }));
+              // Only the owning transaction may restore: if a newer commit has
+              // superseded this one, that commit owns the state and resolves its
+              // own outcome, so leave the store completely untouched here.
+              setEditor((state) => {
+                if (state.xmpProfileRollback?.id !== profileRollback.id) return state;
+                return {
+                  selectedImage: state.selectedImage
+                    ? { ...state.selectedImage, isReady: true }
+                    : state.selectedImage,
+                  xmpProfilePath: profileRollback.path,
+                  xmpProfileName: profileRollback.name,
+                  xmpProfileAmountPercent: profileRollback.amountPercent,
+                  xmpProfileSupportsAmount: profileRollback.supportsAmount,
+                  xmpProfileRollback: null,
+                };
+              });
             } else {
               setEditor({ selectedImage: null });
             }
@@ -172,6 +194,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
     selectedImage?.path,
     selectedImage?.isReady,
     xmpProfilePath,
+    xmpProfileAmountPercent,
     appSettings?.editorPreviewResolution,
     resetHistory,
     setEditor,

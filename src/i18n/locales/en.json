@@ -1990,6 +1990,7 @@
       }
     },
     "xmpProfile": {
+      "amount": "Amount",
       "applyFailed": "Failed to apply XMP profile",
       "change": "Change",
       "choose": "Choose XMP Profile",

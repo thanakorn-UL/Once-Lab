@@ -4,7 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { homeDir } from '@tauri-apps/api/path';
 import { toast } from 'react-toastify';
 import { useLibraryStore } from '../store/useLibraryStore';
-import { useEditorStore } from '../store/useEditorStore';
+import { useEditorStore, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
@@ -206,6 +206,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         // the user to another image and is never restored from cache.
         xmpProfilePath: null,
         xmpProfileName: null,
+        xmpProfileAmountPercent: DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+        xmpProfileSupportsAmount: false,
         xmpProfileRollback: null,
       });
 

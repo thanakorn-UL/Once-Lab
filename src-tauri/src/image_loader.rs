@@ -90,6 +90,7 @@ pub fn load_base_image_from_bytes(
         use_fast_raw_dev,
         settings,
         None,
+        None,
         cancel_token,
     )
 }
@@ -100,6 +101,7 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
     use_fast_raw_dev: bool,
     settings: &AppSettings,
     xmp_profile_path: Option<&Path>,
+    profile_amount_percent: Option<f32>,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
@@ -151,6 +153,7 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
                 highlight_compression,
                 linear_mode,
                 profile_ref,
+                profile_amount_percent,
                 cancel_token,
             )
         }) {
@@ -897,26 +900,36 @@ pub async fn load_image(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<LoadImageResult, String> {
-    load_image_inner(path, None, &state, &app_handle).await
+    load_image_inner(path, None, None, &state, &app_handle).await
 }
 
 /// Profile-aware companion to [`load_image`].
 ///
 /// Exists as a separate command so the existing no-profile callers keep calling
-/// `load_image` unchanged.
+/// `load_image` unchanged. `profile_amount_percent` is the raw Profile Amount
+/// slider value; the backend owns the authored amount and the table bounds.
 #[tauri::command]
 pub async fn load_image_with_xmp_profile(
     path: String,
     xmp_profile_path: String,
+    profile_amount_percent: Option<f32>,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<LoadImageResult, String> {
-    load_image_inner(path, Some(PathBuf::from(xmp_profile_path)), &state, &app_handle).await
+    load_image_inner(
+        path,
+        Some(PathBuf::from(xmp_profile_path)),
+        profile_amount_percent,
+        &state,
+        &app_handle,
+    )
+    .await
 }
 
 async fn load_image_inner(
     path: String,
     xmp_profile_path: Option<PathBuf>,
+    profile_amount_percent: Option<f32>,
     state: &AppState,
     app_handle: &tauri::AppHandle,
 ) -> Result<LoadImageResult, String> {
@@ -978,6 +991,7 @@ async fn load_image_inner(
                             false,
                             &settings,
                             xmp_profile_path.as_deref(),
+                            profile_amount_percent,
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
@@ -1004,6 +1018,7 @@ async fn load_image_inner(
                             false,
                             &settings,
                             xmp_profile_path.as_deref(),
+                            profile_amount_percent,
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
@@ -1450,6 +1465,7 @@ mod tests {
             false,
             &settings,
             Some(profile_path),
+            None,
             None,
         )
         .expect_err("a non-RAW image with an XMP profile must be rejected");

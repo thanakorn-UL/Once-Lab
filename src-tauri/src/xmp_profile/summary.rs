@@ -17,6 +17,9 @@ use crate::xmp_profile::XmpRgbProfile;
 pub struct XmpProfileSummary {
     pub name: String,
     pub path: String,
+    /// Whether the profile advertises a scalable Amount, i.e. whether the
+    /// frontend should offer the control at all.
+    pub supports_amount: bool,
 }
 
 /// Builds the UI summary from an already-parsed profile.
@@ -24,6 +27,7 @@ pub(crate) fn summarize_xmp_profile(profile: &XmpRgbProfile, path: &Path) -> Xmp
     XmpProfileSummary {
         name: profile.name.clone(),
         path: normalize_path_string(path),
+        supports_amount: profile.supports_amount,
     }
 }
 
@@ -71,6 +75,10 @@ mod tests {
     /// Profile whose embedded name differs from its file name, so a summary
     /// derived from the path would be visibly wrong.
     fn named_profile_xmp() -> String {
+        named_profile_xmp_with_amount_support("True")
+    }
+
+    fn named_profile_xmp_with_amount_support(supports_amount: &str) -> String {
         format!(
             r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -79,7 +87,7 @@ mod tests {
       xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
       crs:PresetType="Look"
       crs:UUID="TEST123"
-      crs:SupportsAmount="True"
+      crs:SupportsAmount="{supports_amount}"
       crs:ConvertToGrayscale="False"
       crs:RGBTable="TESTTABLE"
       crs:RGBTableAmount="0.5"
@@ -94,6 +102,23 @@ mod tests {
 </x:xmpmeta>"#,
             table = IDENTITY_2X2X2_BASE85
         )
+    }
+
+    #[test]
+    fn profile_summary_exposes_amount_support_from_the_parsed_profile() {
+        for (declared, expected) in [("True", true), ("False", false)] {
+            let path = unique_temp_path("xmp");
+            fs::write(&path, named_profile_xmp_with_amount_support(declared)).expect("write temp xmp");
+
+            let summary = inspect_xmp_profile(&path.to_string_lossy()).expect("inspect");
+
+            assert_eq!(
+                summary.supports_amount, expected,
+                "SupportsAmount=\"{declared}\" must be exposed verbatim"
+            );
+
+            fs::remove_file(&path).expect("remove temp xmp");
+        }
     }
 
     #[test]

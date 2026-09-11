@@ -21,6 +21,32 @@ interface BaseRenderSize extends ImageDimensions {
   offsetY: number;
 }
 
+/**
+ * Snapshot of the profile transaction a same-image reload belongs to, so a
+ * failed reload can put the previously rendered profile back.
+ */
+export interface XmpProfileRollback {
+  path: string | null;
+  name: string | null;
+  amountPercent: number;
+  supportsAmount: boolean;
+  // Identifies ONE profile transaction, so a superseded reload can never clear
+  // or restore a newer transaction's rollback that reused the same fields.
+  id: number;
+}
+
+/** Default Profile Amount, which renders a profile exactly as authored. */
+export const DEFAULT_XMP_PROFILE_AMOUNT_PERCENT = 100;
+
+// Monotonic source of profile transaction ids; module-level so the store keeps
+// no counter field of its own.
+let xmpProfileTransactionId = 0;
+
+/** Returns the next unique id for a single XMP profile transaction. */
+export function nextXmpProfileTransactionId(): number {
+  return ++xmpProfileTransactionId;
+}
+
 interface EditorState {
   // Core Image & Adjustments
   selectedImage: SelectedImage | null;
@@ -30,7 +56,9 @@ interface EditorState {
   // XMP Profile (session only, never persisted)
   xmpProfilePath: string | null;
   xmpProfileName: string | null;
-  xmpProfileRollback: { path: string | null; name: string | null } | null;
+  xmpProfileAmountPercent: number;
+  xmpProfileSupportsAmount: boolean;
+  xmpProfileRollback: XmpProfileRollback | null;
 
   // History State
   history: Adjustments[];
@@ -99,6 +127,8 @@ export const useEditorStore = create<EditorState>((set) => ({
   previewOverride: null,
   xmpProfilePath: null,
   xmpProfileName: null,
+  xmpProfileAmountPercent: DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+  xmpProfileSupportsAmount: false,
   xmpProfileRollback: null,
   history: [INITIAL_ADJUSTMENTS],
   historyIndex: 0,
