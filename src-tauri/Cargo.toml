@@ -65,6 +65,7 @@ jxl-oxide = { version = "0.12.6", features = ["image"] }
 jxl-encoder = "0.3.1"
 filetime = "0.2"
 libc = "0.2.189"
+flate2 = "1"
 rgb = "0.8.53"
 imgref = "1.12.2"
 sysinfo = "0.39.6"
