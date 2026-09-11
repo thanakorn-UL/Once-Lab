@@ -1,6 +1,7 @@
 import { motion } from 'framer-motion';
 import clsx from 'clsx';
 import Slider from '../ui/Slider';
+import XmpProfileControl from '../ui/XmpProfileControl';
 import { Adjustments, BasicAdjustment } from '../../utils/adjustments';
 import { useEffect, useRef, useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -179,6 +180,11 @@ export default function BasicAdjustments({
 
   return (
     <div>
+      {!isForMask && (
+        <div className="p-2 bg-bg-tertiary rounded-md mb-3">
+          <XmpProfileControl />
+        </div>
+      )}
       {hideTonemapper ? (
         <Slider
           label={t('adjustments.basic.evShift')}

@@ -27,6 +27,11 @@ interface EditorState {
   adjustments: Adjustments;
   previewOverride: Adjustments | null;
 
+  // XMP Profile (session only, never persisted)
+  xmpProfilePath: string | null;
+  xmpProfileName: string | null;
+  xmpProfileRollback: { path: string | null; name: string | null } | null;
+
   // History State
   history: Adjustments[];
   historyIndex: number;
@@ -92,6 +97,9 @@ export const useEditorStore = create<EditorState>((set) => ({
   selectedImage: null,
   adjustments: INITIAL_ADJUSTMENTS,
   previewOverride: null,
+  xmpProfilePath: null,
+  xmpProfileName: null,
+  xmpProfileRollback: null,
   history: [INITIAL_ADJUSTMENTS],
   historyIndex: 0,
 

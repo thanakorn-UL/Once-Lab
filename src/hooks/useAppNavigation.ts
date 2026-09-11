@@ -202,6 +202,11 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         activeAiSubMaskId: null,
         isWbPickerActive: false,
         previewOverride: null,
+        // XMP profile selection is per-image and session only: it never follows
+        // the user to another image and is never restored from cache.
+        xmpProfilePath: null,
+        xmpProfileName: null,
+        xmpProfileRollback: null,
       });
 
       setUI({

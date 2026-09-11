@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
@@ -897,58 +897,36 @@ pub async fn load_image(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<LoadImageResult, String> {
+    load_image_inner(path, None, &state, &app_handle).await
+}
+
+/// Profile-aware companion to [`load_image`].
+///
+/// Exists as a separate command so the existing no-profile callers keep calling
+/// `load_image` unchanged.
+#[tauri::command]
+pub async fn load_image_with_xmp_profile(
+    path: String,
+    xmp_profile_path: String,
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<LoadImageResult, String> {
+    load_image_inner(path, Some(PathBuf::from(xmp_profile_path)), &state, &app_handle).await
+}
+
+async fn load_image_inner(
+    path: String,
+    xmp_profile_path: Option<PathBuf>,
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<LoadImageResult, String> {
     let my_generation = state.load_image_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let generation_tracker = state.load_image_generation.clone();
     let cancel_token = Some((generation_tracker.clone(), my_generation));
+    let is_profile_load = xmp_profile_path.is_some();
+    let same_image_reload = is_same_image_reload(state, is_profile_load, &path);
 
-    {
-        *state
-            .original_image
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .cached_preview
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .gpu_image_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .full_warped_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .full_transformed_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-
-        state
-            .mask_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        state
-            .patch_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        state
-            .geometry_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-
-        *state
-            .denoise_result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state.hdr_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .panorama_result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-    }
+    prepare_image_load(state, same_image_reload);
 
     let (source_path, sidecar_path) = parse_virtual_path(&path);
     let source_path_str = source_path.to_string_lossy().to_string();
@@ -959,11 +937,18 @@ pub async fn load_image(
 
     let path_clone = source_path_str.clone();
 
-    let cached_data = state
-        .decoded_image_cache
-        .lock()
-        .unwrap()
-        .get(&source_path_str);
+    let cached_data = if is_profile_load {
+        // A profile changes the decoded pixels, so the path-keyed pristine cache
+        // must be neither read nor written here: reading it would silently drop
+        // the profile, and writing it would poison the baseline entry.
+        None
+    } else {
+        state
+            .decoded_image_cache
+            .lock()
+            .unwrap()
+            .get(&source_path_str)
+    };
 
     let (pristine_arc, exif_data) = if let Some((cached_img, cached_exif)) = cached_data {
         (cached_img, cached_exif)
@@ -987,11 +972,12 @@ pub async fn load_image(
                             return Err("Load cancelled".to_string());
                         }
 
-                        let img = load_base_image_from_bytes(
+                        let img = load_base_image_from_bytes_with_xmp_profile(
                             &mmap,
                             &path_clone,
                             false,
                             &settings,
+                            xmp_profile_path.as_deref(),
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
@@ -1012,11 +998,12 @@ pub async fn load_image(
                             return Err("Load cancelled".to_string());
                         }
 
-                        let img = load_base_image_from_bytes(
+                        let img = load_base_image_from_bytes_with_xmp_profile(
                             &bytes,
                             &path_clone,
                             false,
                             &settings,
+                            xmp_profile_path.as_deref(),
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
@@ -1031,11 +1018,13 @@ pub async fn load_image(
 
         let arc_img = Arc::new(pristine_img);
 
-        state.decoded_image_cache.lock().unwrap().insert(
-            source_path_str.clone(),
-            arc_img.clone(),
-            exif_data_loaded.clone(),
-        );
+        if !is_profile_load {
+            state.decoded_image_cache.lock().unwrap().insert(
+                source_path_str.clone(),
+                arc_img.clone(),
+                exif_data_loaded.clone(),
+            );
+        }
 
         (arc_img, exif_data_loaded)
     };
@@ -1045,18 +1034,16 @@ pub async fn load_image(
     }
 
     let is_raw = is_raw_file(&source_path_str);
-
-    if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
-        return Err("Load cancelled".to_string());
-    }
-
     let (orig_width, orig_height) = pristine_arc.dimensions();
 
-    *state.original_image.lock().unwrap() = Some(LoadedImage {
+    commit_loaded_image(
+        state,
+        my_generation,
+        same_image_reload,
         path,
-        image: pristine_arc,
+        pristine_arc,
         is_raw,
-    });
+    )?;
 
     Ok(LoadImageResult {
         width: orig_width,
@@ -1067,9 +1054,387 @@ pub async fn load_image(
     })
 }
 
+/// Drops the image that is currently loaded and everything derived from it.
+fn reset_image_state(state: &AppState) {
+    *state
+        .original_image
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *state
+        .cached_preview
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *state
+        .gpu_image_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *state
+        .full_warped_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *state
+        .full_transformed_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+
+    state
+        .mask_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .patch_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .geometry_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    *state
+        .denoise_result
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *state.hdr_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *state
+        .panorama_result
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Whether this load replaces the image that is already open instead of opening a
+/// different one.
+///
+/// A profile-aware command always is such a reload; a plain load is one when it
+/// asks for the path that is already loaded, which is how a profile is removed.
+/// Those reloads are transactional: the image on screen must stay usable until
+/// its replacement has been developed, so their destructive reset is deferred.
+fn is_same_image_reload(state: &AppState, is_profile_load: bool, path: &str) -> bool {
+    if is_profile_load {
+        return true;
+    }
+
+    state
+        .original_image
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|loaded| loaded.path == path)
+}
+
+/// Prepares `state` for an incoming load.
+///
+/// A reload of the image that is already open must not destroy that image (nor
+/// anything derived from it) until the replacement has been developed: it defers
+/// the reset to [`commit_loaded_image`], which leaves the previous image usable if
+/// the attempt fails. Opening a different image keeps clearing up front, exactly
+/// as before.
+fn prepare_image_load(state: &AppState, same_image_reload: bool) {
+    if !same_image_reload {
+        reset_image_state(state);
+    }
+}
+
+/// Installs a freshly developed image, replacing the previous one (and everything
+/// derived from it) once it is known-good.
+///
+/// Re-checks the load generation so a cancelled or superseded request can never
+/// replace the image of the newer request that won.
+fn commit_loaded_image(
+    state: &AppState,
+    my_generation: usize,
+    same_image_reload: bool,
+    path: String,
+    image: Arc<DynamicImage>,
+    is_raw: bool,
+) -> Result<(), String> {
+    if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
+        return Err("Load cancelled".to_string());
+    }
+
+    if same_image_reload {
+        reset_image_state(state);
+    }
+
+    *state.original_image.lock().unwrap() = Some(LoadedImage {
+        path,
+        image,
+        is_raw,
+    });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::app_state::{CachedPreview, MetadataManager, ThumbnailManager, ThumbnailProgressTracker};
+    use crate::cache_utils::DecodedImageCache;
+    use crate::camera_tethering::CameraSession;
+    use image::{GrayImage, Rgb, RgbImage};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Backend state with nothing loaded. Every field is an empty slot, so the
+    /// image-transaction helpers can be exercised without a Tauri app instance.
+    fn test_state() -> AppState {
+        AppState {
+            window_setup_complete: AtomicBool::new(false),
+            gpu_crash_flag_path: Mutex::new(None),
+            original_image: Mutex::new(None),
+            cached_preview: Mutex::new(None),
+            gpu_context: Mutex::new(None),
+            gpu_image_cache: Mutex::new(None),
+            gpu_processor: Mutex::new(None),
+            ai_state: Mutex::new(None),
+            ai_init_lock: TokioMutex::new(()),
+            export_task_token: Arc::new(Mutex::new(None)),
+            hdr_result: Arc::new(Mutex::new(None)),
+            panorama_result: Arc::new(Mutex::new(None)),
+            focus_stack_result: Arc::new(Mutex::new(None)),
+            denoise_result: Arc::new(Mutex::new(None)),
+            indexing_task_handle: Mutex::new(None),
+            lut_cache: Mutex::new(HashMap::new()),
+            initial_file_path: Mutex::new(None),
+            pending_edit_session: Mutex::new(None),
+            thumbnail_cancellation_token: Arc::new(AtomicBool::new(false)),
+            thumbnail_progress: Mutex::new(ThumbnailProgressTracker { total: 0, completed: 0 }),
+            preview_worker_tx: Mutex::new(None),
+            analytics_worker_tx: Mutex::new(None),
+            mask_cache: Mutex::new(HashMap::new()),
+            patch_cache: Mutex::new(HashMap::new()),
+            geometry_cache: Mutex::new(HashMap::new()),
+            thumbnail_geometry_cache: Mutex::new(HashMap::new()),
+            lens_db: Mutex::new(None),
+            load_image_generation: Arc::new(AtomicUsize::new(0)),
+            full_warped_cache: Mutex::new(None),
+            full_transformed_cache: Mutex::new(None),
+            decoded_image_cache: Mutex::new(DecodedImageCache::new(5)),
+            thumbnail_manager: ThumbnailManager::new(),
+            metadata_manager: MetadataManager::new(),
+            disks_cache: Mutex::new(None),
+            disks_cache_refreshing: AtomicBool::new(false),
+            camera_session: Mutex::new(CameraSession::new()),
+        }
+    }
+
+    fn tiny_image(rgb: [u8; 3]) -> Arc<DynamicImage> {
+        Arc::new(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            2,
+            2,
+            Rgb(rgb),
+        )))
+    }
+
+    fn first_pixel(image: &DynamicImage) -> [u8; 3] {
+        image.to_rgb8().get_pixel(0, 0).0
+    }
+
+    /// Installs an image as if a previous load had succeeded, together with
+    /// derived state that a new image must invalidate.
+    fn install_previous_image(state: &AppState, rgb: [u8; 3]) -> Arc<DynamicImage> {
+        let previous = tiny_image(rgb);
+        *state.original_image.lock().unwrap() = Some(LoadedImage {
+            path: "TLP_8278.NEF".to_string(),
+            image: previous.clone(),
+            is_raw: true,
+        });
+        *state.cached_preview.lock().unwrap() = Some(CachedPreview {
+            image: previous.clone(),
+            small_image: previous.clone(),
+            transform_hash: 1,
+            scale: 1.0,
+            unscaled_crop_offset: (0.0, 0.0),
+            preview_dim: 512,
+            interactive_divisor: 1.0,
+        });
+        state.mask_cache.lock().unwrap().insert(7, GrayImage::new(2, 2));
+
+        previous
+    }
+
+    /// Mirrors the production sequence at the start of `load_image_inner` and
+    /// returns the flag the commit step receives for the same request.
+    fn begin_load(state: &AppState, is_profile_load: bool, path: &str) -> bool {
+        let same_image_reload = is_same_image_reload(state, is_profile_load, path);
+        prepare_image_load(state, same_image_reload);
+        same_image_reload
+    }
+
+    #[test]
+    fn profile_reload_failure_preserves_previous_original_image() {
+        let state = test_state();
+        let previous = install_previous_image(&state, [10, 20, 30]);
+
+        // A profile-aware reload of the image that is already open begins here. Its
+        // decode fails, so `commit_loaded_image` is never reached and the load
+        // returns an error with no further state mutation.
+        assert!(begin_load(&state, true, "TLP_8278.NEF"));
+
+        let guard = state.original_image.lock().unwrap();
+        let loaded = guard
+            .as_ref()
+            .expect("a failed profile reload must keep the previous image loaded");
+        assert!(
+            Arc::ptr_eq(&loaded.image, &previous),
+            "the previous image must not be replaced or copied"
+        );
+        assert_eq!(loaded.path, "TLP_8278.NEF");
+        assert_eq!(first_pixel(&loaded.image), [10, 20, 30]);
+        drop(guard);
+
+        assert!(
+            state.cached_preview.lock().unwrap().is_some(),
+            "the render cache of the previous image must survive a failed reload"
+        );
+        assert_eq!(
+            state.mask_cache.lock().unwrap().len(),
+            1,
+            "mask results of the previous image must survive a failed reload"
+        );
+    }
+
+    #[test]
+    fn failed_clear_reload_preserves_previous_original_image() {
+        let state = test_state();
+        let previous = install_previous_image(&state, [10, 20, 30]);
+
+        // Clear reloads the same image without a profile. The decode fails, so
+        // `commit_loaded_image` is never reached.
+        assert!(
+            begin_load(&state, false, "TLP_8278.NEF"),
+            "reloading the image that is open must be treated as a same-image reload"
+        );
+
+        let guard = state.original_image.lock().unwrap();
+        let loaded = guard
+            .as_ref()
+            .expect("a failed Clear must keep the profiled image loaded");
+        assert!(Arc::ptr_eq(&loaded.image, &previous));
+        assert_eq!(first_pixel(&loaded.image), [10, 20, 30]);
+        drop(guard);
+
+        assert!(state.cached_preview.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn same_image_reload_detection() {
+        let state = test_state();
+
+        assert!(
+            !is_same_image_reload(&state, false, "TLP_8278.NEF"),
+            "with nothing loaded this is an image opening, not a reload"
+        );
+        assert!(is_same_image_reload(&state, true, "TLP_8278.NEF"));
+
+        install_previous_image(&state, [10, 20, 30]);
+
+        assert!(
+            is_same_image_reload(&state, false, "TLP_8278.NEF"),
+            "a plain load of the open image reloads it"
+        );
+        assert!(
+            !is_same_image_reload(&state, false, "other.NEF"),
+            "a plain load of another image opens it"
+        );
+        assert!(
+            is_same_image_reload(&state, true, "other.NEF"),
+            "the profile-aware command is always a reload"
+        );
+    }
+
+    #[test]
+    fn normal_image_load_still_clears_the_previous_image_up_front() {
+        let state = test_state();
+        install_previous_image(&state, [10, 20, 30]);
+
+        begin_load(&state, false, "other.NEF");
+
+        assert!(
+            state.original_image.lock().unwrap().is_none(),
+            "opening another image must keep clearing up front"
+        );
+        assert!(state.cached_preview.lock().unwrap().is_none());
+        assert!(state.mask_cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn successful_profile_commit_replaces_the_previous_image() {
+        let state = test_state();
+        let previous = install_previous_image(&state, [10, 20, 30]);
+
+        let same_image_reload = begin_load(&state, true, "TLP_8278.NEF");
+        state.load_image_generation.store(4, Ordering::SeqCst);
+
+        let candidate = tiny_image([200, 100, 50]);
+        commit_loaded_image(
+            &state,
+            4,
+            same_image_reload,
+            "TLP_8278.NEF".to_string(),
+            candidate.clone(),
+            true,
+        )
+        .expect("the winning request must be able to commit");
+
+        let guard = state.original_image.lock().unwrap();
+        let loaded = guard.as_ref().expect("the profiled image must be installed");
+        assert!(
+            Arc::ptr_eq(&loaded.image, &candidate),
+            "the profiled candidate must become the loaded image"
+        );
+        assert!(
+            !Arc::ptr_eq(&loaded.image, &previous),
+            "the previous pixels must not be retained"
+        );
+        assert_eq!(first_pixel(&loaded.image), [200, 100, 50]);
+        drop(guard);
+
+        assert!(
+            state.cached_preview.lock().unwrap().is_none(),
+            "the previous transform cache must be dropped"
+        );
+        assert!(
+            state.mask_cache.lock().unwrap().is_empty(),
+            "mask results of the previous image must be dropped"
+        );
+    }
+
+    #[test]
+    fn superseded_profile_commit_cannot_replace_the_newer_image() {
+        let state = test_state();
+        let previous = install_previous_image(&state, [10, 20, 30]);
+
+        let same_image_reload = begin_load(&state, true, "TLP_8278.NEF");
+
+        // This candidate belongs to generation 4, but a newer load has taken over.
+        state.load_image_generation.store(5, Ordering::SeqCst);
+
+        let error = commit_loaded_image(
+            &state,
+            4,
+            same_image_reload,
+            "TLP_8278.NEF".to_string(),
+            tiny_image([200, 100, 50]),
+            true,
+        )
+        .expect_err("a superseded request must not commit its image");
+
+        assert_eq!(error, "Load cancelled");
+
+        let guard = state.original_image.lock().unwrap();
+        let loaded = guard.as_ref().expect("the newer image must stay in place");
+        assert!(Arc::ptr_eq(&loaded.image, &previous));
+        assert_eq!(first_pixel(&loaded.image), [10, 20, 30]);
+        drop(guard);
+
+        assert!(state.cached_preview.lock().unwrap().is_some());
+        assert_eq!(state.mask_cache.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn non_raw_image_rejects_xmp_profile() {

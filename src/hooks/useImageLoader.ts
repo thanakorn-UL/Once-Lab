@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
 import { useEditorStore } from '../store/useEditorStore';
@@ -22,6 +22,11 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const resetHistory = useEditorStore((s) => s.resetHistory);
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
+  const xmpProfilePath = useEditorStore((s) => s.xmpProfilePath);
+
+  // Tracks the image whose sidecar metadata has already been applied, so that a
+  // profile-triggered reload of the same image keeps the user's adjustments.
+  const loadedMetadataPathRef = useRef<string | null>(null);
 
   const isWgpuActive = appSettings?.useWgpuRenderer !== false && selectedImage?.isReady && hasRenderedFirstFrame;
 
@@ -29,10 +34,20 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
     if (selectedImage && !selectedImage.isReady && selectedImage.path) {
       let isEffectActive = true;
 
+      // Snapshot of the profile transaction this reload belongs to, taken when the
+      // reload is requested. A non-null rollback means this load is the same-image
+      // reload that applies (or clears) an XMP profile, so a failure must put the
+      // previous profile back instead of closing the image that is already open.
+      const { xmpProfileRollback: profileRollback } = useEditorStore.getState();
+
       const loadMetadataEarly = async () => {
         try {
           useEditorStore.getState().patchesSentToBackend.clear();
           await invoke('clear_session_caches').catch((e) => console.warn('Cache clear failed:', e));
+
+          // Reloading the same image to change its XMP profile must not reset
+          // the current adjustments or the undo history.
+          if (loadedMetadataPathRef.current === selectedImage.path) return;
 
           const metadata: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
           if (!isEffectActive) return;
@@ -46,6 +61,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
           setEditor({ adjustments: initialAdjusts });
           resetHistory(initialAdjusts);
+          loadedMetadataPathRef.current = selectedImage.path;
         } catch (err) {
           console.error('Failed to load metadata early:', err);
         }
@@ -53,7 +69,13 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
       const loadFullImageData = async () => {
         try {
-          const loadImageResult: any = await invoke(Invokes.LoadImage, { path: selectedImage.path });
+          const profilePath = useEditorStore.getState().xmpProfilePath;
+          const loadImageResult: any = profilePath
+            ? await invoke(Invokes.LoadImageWithXmpProfile, {
+                path: selectedImage.path,
+                xmpProfilePath: profilePath,
+              })
+            : await invoke(Invokes.LoadImage, { path: selectedImage.path });
           if (!isEffectActive) return;
 
           const { width, height } = loadImageResult;
@@ -101,11 +123,30 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
             }
             return state;
           });
+
+          // The reload carried the profile change, so the optimistic transaction
+          // is closed: the committed profile is the one now rendered.
+          if (profileRollback) {
+            setEditor({ xmpProfileRollback: null });
+          }
         } catch (err) {
           if (isEffectActive) {
             console.error('Failed to load image:', err);
             toast.error(`Failed to load image: ${err}`);
-            setEditor({ selectedImage: null });
+
+            if (profileRollback) {
+              // Changing a profile reloads the image that is already open, so a
+              // failed attempt must keep it selected and put the previous profile
+              // back rather than closing the image with the failed one committed.
+              setEditor((state) => ({
+                selectedImage: state.selectedImage ? { ...state.selectedImage, isReady: true } : state.selectedImage,
+                xmpProfilePath: profileRollback.path,
+                xmpProfileName: profileRollback.name,
+                xmpProfileRollback: null,
+              }));
+            } else {
+              setEditor({ selectedImage: null });
+            }
           }
         } finally {
           if (isEffectActive) {
@@ -130,6 +171,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   }, [
     selectedImage?.path,
     selectedImage?.isReady,
+    xmpProfilePath,
     appSettings?.editorPreviewResolution,
     resetHistory,
     setEditor,

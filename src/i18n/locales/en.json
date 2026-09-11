@@ -1988,6 +1988,15 @@
         "showClipping": "Show Clipping Warnings",
         "vectorscope": "Vectorscope"
       }
+    },
+    "xmpProfile": {
+      "applyFailed": "Failed to apply XMP profile",
+      "change": "Change",
+      "choose": "Choose XMP Profile",
+      "clear": "Clear",
+      "filterLabel": "XMP Profile",
+      "label": "XMP Profile",
+      "rawOnly": "XMP RGB profiles are available for RAW images only"
     }
   }
 }
