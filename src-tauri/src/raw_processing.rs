@@ -19,11 +19,30 @@ pub fn develop_raw_image(
     linear_mode: String,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
+    develop_raw_image_with_profile(
+        file_bytes,
+        fast_demosaic,
+        highlight_compression,
+        linear_mode,
+        None,
+        cancel_token,
+    )
+}
+
+pub(crate) fn develop_raw_image_with_profile(
+    file_bytes: &[u8],
+    fast_demosaic: bool,
+    highlight_compression: f32,
+    linear_mode: String,
+    profile: Option<&crate::xmp_profile::XmpRgbProfile>,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<DynamicImage> {
     let (developed_image, orientation) = develop_internal(
         file_bytes,
         fast_demosaic,
         highlight_compression,
         linear_mode,
+        profile,
         cancel_token,
     )?;
     Ok(apply_orientation(developed_image, orientation))
@@ -50,6 +69,7 @@ fn develop_internal(
     fast_demosaic: bool,
     highlight_compression: f32,
     linear_mode: String,
+    profile: Option<&crate::xmp_profile::XmpRgbProfile>,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<(DynamicImage, Orientation)> {
     let check_cancel = || -> Result<()> {
@@ -200,6 +220,18 @@ fn develop_internal(
                     *c = linear_val.clamp(0.0, clamp_limit);
                 });
             });
+        }
+    }
+
+    if let Some(profile) = profile {
+        match &mut developed_intermediate {
+            Intermediate::ThreeColor(pixels) => {
+                crate::xmp_profile::apply_profile_to_three_color_pixels(&mut pixels.data, profile)
+                    .map_err(|error| anyhow!(error))?;
+            }
+            _ => {
+                return Err(anyhow!("XMP RGB profile requires ThreeColor intermediate"));
+            }
         }
     }
 

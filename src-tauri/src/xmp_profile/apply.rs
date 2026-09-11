@@ -19,6 +19,9 @@
 
 use crate::xmp_profile::rgb_table::RgbTable;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// Supported `primaries_enum` value: `primaries_sRGB`.
 const SUPPORTED_PRIMARIES: u32 = 0;
 
@@ -31,56 +34,119 @@ const SUPPORTED_GAMUT: u32 = 0;
 const MIN_SIZE: usize = 2;
 const MAX_SIZE: usize = 32;
 
+// Test-only counter of how many times the full (O(size^3)) table validation
+// runs. It is thread-local so tests running in parallel cannot observe each
+// other's validations.
+#[cfg(test)]
+thread_local! {
+    static FULL_TABLE_VALIDATIONS: AtomicUsize = const { AtomicUsize::new(0) };
+}
+
+/// Records one run of the full table validation.
+///
+/// Outside `cfg(test)` this expands to nothing, so non-test builds carry no
+/// counting overhead.
+#[inline(always)]
+fn record_full_table_validation() {
+    #[cfg(test)]
+    FULL_TABLE_VALIDATIONS.with(|count| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+}
+
+#[cfg(test)]
+fn reset_full_table_validations() {
+    FULL_TABLE_VALIDATIONS.with(|count| count.store(0, Ordering::SeqCst));
+}
+
+#[cfg(test)]
+fn full_table_validations() -> usize {
+    FULL_TABLE_VALIDATIONS.with(|count| count.load(Ordering::SeqCst))
+}
+
+/// A validated rendering context for a single Adobe RGBTable.
+///
+/// All expensive, profile-level work happens exactly once in
+/// [`RgbTableApplyContext::new`]: metadata support, amount finiteness and
+/// bounds, amount clamping, table size, checked node count, exact LUT length
+/// and full LUT finiteness. [`RgbTableApplyContext::apply`] then performs only
+/// per-pixel work, so rendering a whole image does not repeat the O(size^3)
+/// validation for every pixel.
+///
+/// The table is borrowed, never copied.
+pub(crate) struct RgbTableApplyContext<'a> {
+    table: &'a RgbTable,
+    effective_amount: f32,
+}
+
+impl<'a> RgbTableApplyContext<'a> {
+    pub(crate) fn new(table: &'a RgbTable, amount: f32) -> Result<Self, String> {
+        validate_render_metadata(table)?;
+
+        if !amount.is_finite() {
+            return Err("invalid RGBTable amount".to_string());
+        }
+
+        if !table.min_amount.is_finite()
+            || !table.max_amount.is_finite()
+            || !(0.0..=1.0).contains(&table.min_amount)
+            || table.max_amount < 1.0
+        {
+            return Err("invalid RGBTable amount bounds".to_string());
+        }
+
+        let effective_amount = f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
+
+        validate_table_structure(table)?;
+
+        Ok(Self {
+            table,
+            effective_amount,
+        })
+    }
+
+    /// Renders one pixel. Performs no profile-level validation.
+    pub(crate) fn apply(&self, rgb: [f32; 3]) -> Result<[f32; 3], String> {
+        // gamut_clip: any excursion outside [0,1] is discarded before the table.
+        let mut encoded = [0.0f32; 3];
+
+        for channel in 0..3 {
+            let value = rgb[channel];
+
+            if !value.is_finite() {
+                return Err("RGBTable input contains non-finite value".to_string());
+            }
+
+            encoded[channel] = srgb_encode(value.clamp(0.0, 1.0));
+        }
+
+        let lut = interpolate(self.table, encoded)?;
+
+        let mut out = [0.0f32; 3];
+
+        for channel in 0..3 {
+            let lut_value = lut[channel].clamp(0.0, 1.0);
+            let input = encoded[channel];
+
+            let blended = (input + self.effective_amount * (lut_value - input)).clamp(0.0, 1.0);
+
+            out[channel] = srgb_decode(blended);
+        }
+
+        Ok(out)
+    }
+}
+
+/// Convenience wrapper: validates the table, renders a single pixel.
+///
+/// For more than a handful of pixels prefer [`RgbTableApplyContext`], which
+/// validates once and then renders many pixels.
 pub(crate) fn apply_rgb_table(
     rgb: [f32; 3],
     table: &RgbTable,
     amount: f32,
 ) -> Result<[f32; 3], String> {
-    validate_render_metadata(table)?;
-
-    if !amount.is_finite() {
-        return Err("invalid RGBTable amount".to_string());
-    }
-
-    if !table.min_amount.is_finite()
-        || !table.max_amount.is_finite()
-        || !(0.0..=1.0).contains(&table.min_amount)
-        || table.max_amount < 1.0
-    {
-        return Err("invalid RGBTable amount bounds".to_string());
-    }
-
-    let effective_amount = f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
-
-    validate_table_structure(table)?;
-
-    // gamut_clip: any excursion outside [0,1] is discarded before the table.
-    let mut encoded = [0.0f32; 3];
-
-    for channel in 0..3 {
-        let value = rgb[channel];
-
-        if !value.is_finite() {
-            return Err("RGBTable input contains non-finite value".to_string());
-        }
-
-        encoded[channel] = srgb_encode(value.clamp(0.0, 1.0));
-    }
-
-    let lut = interpolate(table, encoded)?;
-
-    let mut out = [0.0f32; 3];
-
-    for channel in 0..3 {
-        let lut_value = lut[channel].clamp(0.0, 1.0);
-        let input = encoded[channel];
-
-        let blended = (input + effective_amount * (lut_value - input)).clamp(0.0, 1.0);
-
-        out[channel] = srgb_decode(blended);
-    }
-
-    Ok(out)
+    RgbTableApplyContext::new(table, amount)?.apply(rgb)
 }
 
 fn validate_render_metadata(table: &RgbTable) -> Result<(), String> {
@@ -103,6 +169,8 @@ fn validate_render_metadata(table: &RgbTable) -> Result<(), String> {
 }
 
 fn validate_table_structure(table: &RgbTable) -> Result<(), String> {
+    record_full_table_validation();
+
     let size = table.size;
 
     if !(MIN_SIZE..=MAX_SIZE).contains(&size) {
@@ -672,6 +740,110 @@ mod tests {
         assert!(
             apply_rgb_table(input, &clean_table, 1.0).is_ok(),
             "the clean table must render, otherwise this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn context_validates_table_only_once_for_multiple_pixels() {
+        reset_full_table_validations();
+
+        let table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+        let context = RgbTableApplyContext::new(&table, 1.0).expect("valid context");
+
+        assert_eq!(
+            full_table_validations(),
+            1,
+            "constructing the context must validate the table exactly once"
+        );
+
+        for index in 0..200 {
+            let x = index as f32 / 200.0;
+            let output = context.apply([x, 0.5, 0.25]).expect("apply");
+            for channel in output {
+                assert!(channel.is_finite());
+            }
+        }
+
+        assert_eq!(
+            full_table_validations(),
+            1,
+            "applying many pixels must not revalidate the table"
+        );
+    }
+
+    #[test]
+    fn context_apply_matches_apply_rgb_table() {
+        let inputs = [
+            [0.0f32, 0.0, 0.0],
+            [0.18, 0.5, 0.9],
+            [1.0, 1.0, 1.0],
+            [-0.5, 0.25, 1.5],
+            [0.05, 0.10, 0.15],
+            [0.9, 0.4, 0.1],
+        ];
+
+        // A non-identity table plus every amount regime the renderer supports,
+        // including extrapolation above 1 and clamping at the bounds.
+        let cases: [([[f32; 3]; 8], f64, f64, f32); 5] = [
+            (IDENTITY_2X2X2, 0.0, 1.0, 1.0),
+            (IDENTITY_2X2X2, 0.0, 1.5, 1.5),
+            (CONSTANT_2X2X2, 0.0, 1.0, 0.0),
+            (CONSTANT_2X2X2, 0.25, 1.5, 0.6),
+            (
+                [
+                    [0.00, 0.00, 0.00],
+                    [0.20, 0.30, 0.70],
+                    [0.10, 0.80, 0.30],
+                    [0.40, 0.10, 0.90],
+                    [0.90, 0.20, 0.10],
+                    [0.30, 0.90, 0.20],
+                    [0.70, 0.60, 0.40],
+                    [0.60, 0.50, 1.00],
+                ],
+                0.0,
+                1.5,
+                1.5,
+            ),
+        ];
+
+        for (values, min_amount, max_amount, amount) in cases {
+            let table = table_2x2x2(values, min_amount, max_amount);
+            let context = RgbTableApplyContext::new(&table, amount).expect("valid context");
+
+            for input in inputs {
+                let from_context = context.apply(input).expect("context apply");
+                let from_wrapper = apply_rgb_table(input, &table, amount).expect("wrapper apply");
+
+                for channel in 0..3 {
+                    assert!(
+                        (from_context[channel] - from_wrapper[channel]).abs() < 1e-7,
+                        "input {input:?} channel {channel}: context {} vs wrapper {}",
+                        from_context[channel],
+                        from_wrapper[channel]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_constructor_rejects_invalid_tables_without_touching_pixels() {
+        reset_full_table_validations();
+
+        let mut table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+        table.color_space = 2;
+
+        let result = RgbTableApplyContext::new(&table, 1.0);
+        assert_eq!(
+            result.err().expect("unsupported primaries"),
+            "unsupported RGBTable primaries: 2"
+        );
+
+        // A rejected table must not even reach the full-table scan.
+        assert_eq!(
+            full_table_validations(),
+            0,
+            "invalid metadata should be rejected before the full table scan"
         );
     }
 }
