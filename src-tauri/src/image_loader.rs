@@ -84,6 +84,24 @@ pub fn load_base_image_from_bytes(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
+    load_base_image_from_bytes_with_xmp_profile(
+        bytes,
+        path_for_ext_check,
+        use_fast_raw_dev,
+        settings,
+        None,
+        cancel_token,
+    )
+}
+
+pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    xmp_profile_path: Option<&Path>,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<DynamicImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
     let linear_mode = settings.linear_raw_mode.clone();
     let color_nr_setting = settings.raw_preprocessing_color_nr.unwrap_or(0.5);
@@ -96,19 +114,43 @@ pub fn load_base_image_from_bytes(
     let sharpening_amount = settings.raw_preprocessing_sharpening.unwrap_or(0.35);
     let apply_to_non_raws = settings.apply_preprocessing_to_non_raws.unwrap_or(false);
 
+    let is_raw = is_raw_file(path_for_ext_check);
+
+    // A supplied profile is only meaningful for RAW input. Reject it explicitly
+    // rather than silently ignoring it; this happens before any file read.
+    if !is_raw && xmp_profile_path.is_some() {
+        return Err(anyhow!(
+            "XMP RGB profiles are supported only for RAW images"
+        ));
+    }
+
     crate::exif_processing::persist_exif_if_missing(
         Path::new(path_for_ext_check),
         path_for_ext_check,
         bytes,
     );
 
-    if is_raw_file(path_for_ext_check) {
+    // Load and parse the profile before RAW development, outside the Rawler
+    // panic boundary, so a bad profile surfaces as a profile error instead of
+    // silently degrading into an unprofiled render.
+    let profile = match xmp_profile_path {
+        Some(profile_path) if is_raw => Some(
+            crate::xmp_profile::load_xmp_rgb_profile_from_path(profile_path)
+                .map_err(|error| anyhow!(error))?,
+        ),
+        _ => None,
+    };
+
+    if is_raw {
+        let profile_ref = profile.as_ref();
+
         match panic::catch_unwind(move || {
-            crate::raw_processing::develop_raw_image(
+            crate::raw_processing::develop_raw_image_with_profile(
                 bytes,
                 use_fast_raw_dev,
                 highlight_compression,
                 linear_mode,
+                profile_ref,
                 cancel_token,
             )
         }) {
@@ -136,6 +178,16 @@ pub fn load_base_image_from_bytes(
                     return Err(classified);
                 }
 
+                // An explicitly requested profile must never be substituted by an
+                // embedded preview: the preview does not contain the requested look.
+                if let Some(profile_path) = xmp_profile_path {
+                    return Err(anyhow!(
+                        "failed to develop RAW with XMP profile '{}': {}",
+                        profile_path.display(),
+                        classified
+                    ));
+                }
+
                 log::warn!(
                     "Error developing RAW file '{}': {}",
                     path_for_ext_check,
@@ -154,6 +206,13 @@ pub fn load_base_image_from_bytes(
                 Err(classified)
             }
             Err(_) => {
+                if let Some(profile_path) = xmp_profile_path {
+                    return Err(anyhow!(
+                        "RAW development panicked while applying XMP profile '{}'",
+                        profile_path.display()
+                    ));
+                }
+
                 log::error!("Panic while processing RAW file: {}", path_for_ext_check);
                 if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
                     log::warn!(
@@ -1006,4 +1065,33 @@ pub async fn load_image(
         exif: exif_data,
         is_raw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_raw_image_rejects_xmp_profile() {
+        let settings = AppSettings::default();
+
+        // The rejection must happen before any profile file read, so the
+        // supplied path is deliberately nonexistent and the bytes are empty.
+        let profile_path = Path::new("/definitely/not/a/real/profile.xmp");
+
+        let error = load_base_image_from_bytes_with_xmp_profile(
+            b"",
+            "photo.jpg",
+            false,
+            &settings,
+            Some(profile_path),
+            None,
+        )
+        .expect_err("a non-RAW image with an XMP profile must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "XMP RGB profiles are supported only for RAW images"
+        );
+    }
 }
