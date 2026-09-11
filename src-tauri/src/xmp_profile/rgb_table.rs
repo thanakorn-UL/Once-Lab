@@ -11,11 +11,17 @@ const INVALID_BASE85_DIGIT: u8 = 0xFF;
 
 const HEADER_BYTES: usize = 16;
 const FOOTER_BYTES: usize = 12;
-const RANGE_BYTES: usize = 16;
+const AMOUNT_BYTES: usize = 16;
 const BYTES_PER_NODE: usize = 6;
 const MIN_SIZE: u32 = 2;
 const MAX_SIZE: u32 = 32;
-const SUPPORTED_VERSION: u32 = 1;
+
+/// BigTableTypeEnum::btt_RGBTable.
+const RGB_TABLE_TYPE: u32 = 1;
+
+/// dng_rgb_table::kRGBTableVersion.
+const RGB_TABLE_VERSION: u32 = 1;
+
 const SUPPORTED_DIMENSIONS: u32 = 3;
 const CHANNEL_LEVELS: u32 = 65536;
 const CHANNEL_MAX: u32 = 65535;
@@ -23,12 +29,12 @@ const CHANNEL_MAX: u32 = 65535;
 const MAX_BLOCK_BYTES: usize = HEADER_BYTES
     + (MAX_SIZE as usize * MAX_SIZE as usize * MAX_SIZE as usize * BYTES_PER_NODE)
     + FOOTER_BYTES
-    + RANGE_BYTES;
+    + AMOUNT_BYTES;
 
 const MIN_BLOCK_BYTES: usize = HEADER_BYTES
     + (MIN_SIZE as usize * MIN_SIZE as usize * MIN_SIZE as usize * BYTES_PER_NODE)
     + FOOTER_BYTES
-    + RANGE_BYTES;
+    + AMOUNT_BYTES;
 
 const fn build_base85_lookup() -> [u8; 256] {
     let mut table = [INVALID_BASE85_DIGIT; 256];
@@ -47,8 +53,8 @@ pub(crate) struct RgbTable {
     pub color_space: u32,
     pub gamma: u32,
     pub gamut: u32,
-    pub range_min: f64,
-    pub range_max: f64,
+    pub min_amount: f64,
+    pub max_amount: f64,
 }
 
 pub(crate) fn decode_adobe_rgb_table(encoded: &str) -> Result<RgbTable, String> {
@@ -142,14 +148,20 @@ fn decode_base85(encoded: &str) -> Result<Vec<u8>, String> {
 }
 
 fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
-    let version_1 = read_u32(block, 0)?;
-    let version_2 = read_u32(block, 4)?;
+    let table_type = read_u32(block, 0)?;
+    let table_version = read_u32(block, 4)?;
     let dimensions = read_u32(block, 8)?;
     let size_field = read_u32(block, 12)?;
 
-    if version_1 != SUPPORTED_VERSION || version_2 != SUPPORTED_VERSION {
+    if table_type != RGB_TABLE_TYPE {
         return Err(format!(
-            "unsupported embedded RGBTable version {version_1}.{version_2}, expected {SUPPORTED_VERSION}.{SUPPORTED_VERSION}"
+            "unsupported embedded RGBTable type {table_type}, expected {RGB_TABLE_TYPE}"
+        ));
+    }
+
+    if table_version != RGB_TABLE_VERSION {
+        return Err(format!(
+            "unsupported embedded RGBTable version {table_version}, expected {RGB_TABLE_VERSION}"
         ));
     }
 
@@ -179,7 +191,7 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
     let expected_block_size = HEADER_BYTES
         .checked_add(sample_bytes)
         .and_then(|total| total.checked_add(FOOTER_BYTES))
-        .and_then(|total| total.checked_add(RANGE_BYTES))
+        .and_then(|total| total.checked_add(AMOUNT_BYTES))
         .ok_or_else(|| "embedded RGBTable block size overflows usize".to_string())?;
 
     if block.len() != expected_block_size {
@@ -223,8 +235,8 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
     let gamut = read_u32(block, offset + 8)?;
     offset += FOOTER_BYTES;
 
-    let range_min = read_f64(block, offset)?;
-    let range_max = read_f64(block, offset + 8)?;
+    let min_amount = read_f64(block, offset)?;
+    let max_amount = read_f64(block, offset + 8)?;
 
     Ok(RgbTable {
         size,
@@ -232,8 +244,8 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         color_space,
         gamma,
         gamut,
-        range_min,
-        range_max,
+        min_amount,
+        max_amount,
     })
 }
 
@@ -366,8 +378,8 @@ mod tests {
         assert_eq!(table.color_space, 0);
         assert_eq!(table.gamma, 1);
         assert_eq!(table.gamut, 0);
-        assert_eq!(table.range_min, 0.0);
-        assert_eq!(table.range_max, 1.5);
+        assert_eq!(table.min_amount, 0.0);
+        assert_eq!(table.max_amount, 1.5);
 
         for (index, expected) in EXPECTED_IDENTITY.iter().enumerate() {
             let actual = table.values[index];
