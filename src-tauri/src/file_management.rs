@@ -30,6 +30,7 @@ use crate::PendingMetadata;
 #[cfg(target_os = "android")]
 use crate::android_integration::*;
 use crate::app_settings::*;
+use crate::develop_state::DevelopProfileReference;
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
 use crate::gpu_processing;
@@ -2641,26 +2642,11 @@ pub async fn apply_adjustments_to_paths(
             let mut existing_metadata =
                 crate::exif_processing::load_sidecar_with_exif(&sidecar_path, &source_path);
 
-            let mut new_adjustments = existing_metadata.adjustments;
-            if new_adjustments.is_null() {
-                new_adjustments = serde_json::json!({});
-            }
-
-            if let (Some(new_map), Some(pasted_map)) =
-                (new_adjustments.as_object_mut(), adjustments.as_object())
-            {
-                for (k, v) in pasted_map {
-                    new_map.insert(k.clone(), v.clone());
-                }
-            }
-
-            resolve_lens_params_in_adjustments(
-                &mut new_adjustments,
-                &existing_metadata.exif,
+            merge_adjustments_into_metadata(
+                &mut existing_metadata,
+                &adjustments,
                 lens_db.as_deref(),
             );
-
-            existing_metadata.adjustments = new_adjustments;
 
             if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
                 let _ = std::fs::write(&sidecar_path, json_string);
@@ -2671,6 +2657,243 @@ pub async fn apply_adjustments_to_paths(
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
         });
+
+        let state = app_handle.state::<AppState>();
+        let thumb_cache_dir = match resolve_thumbnail_cache_dir(&app_handle) {
+            Ok(dir) => dir,
+            Err(e) => {
+                log::warn!("Unable to initialize thumbnail cache directory: {}", e);
+                for path in &paths {
+                    emit_thumbnail_cache_setup_error(&app_handle, path, &e);
+                }
+                for _ in 0..paths.len() {
+                    increment_thumbnail_progress(&state, &app_handle);
+                }
+                return;
+            }
+        };
+
+        let gpu_context = gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
+
+        paths.par_iter().for_each(|path_str| {
+            let result = generate_single_thumbnail_and_cache(
+                path_str,
+                &thumb_cache_dir,
+                gpu_context.as_ref(),
+                None,
+                true,
+                &app_handle,
+                &settings,
+            );
+
+            if let Some((small_path, medium_path, rating, is_edited)) = result {
+                emit_thumbnail_generated(
+                    &app_handle,
+                    path_str,
+                    &small_path,
+                    &medium_path,
+                    rating,
+                    is_edited,
+                );
+            }
+
+            increment_thumbnail_progress(&state, &app_handle);
+        });
+    });
+
+    Ok(())
+}
+
+/// Merges `delta` into a sidecar's adjustments and resolves its lens parameters,
+/// so the adjustments batch and the combined develop-state batch share exactly
+/// one merge implementation.
+///
+/// `delta` overwrites top-level keys only; a `null` adjustments payload becomes
+/// `{}` first, then the lens parameters are resolved against the metadata's own
+/// EXIF and the given lens database — the same order the adjustments batch used
+/// before this helper existed.
+pub(crate) fn merge_adjustments_into_metadata(
+    metadata: &mut ImageMetadata,
+    delta: &Value,
+    lens_db: Option<&crate::lens_correction::LensDatabase>,
+) {
+    let mut new_adjustments = std::mem::take(&mut metadata.adjustments);
+    if new_adjustments.is_null() {
+        new_adjustments = serde_json::json!({});
+    }
+
+    if let (Some(new_map), Some(pasted_map)) = (new_adjustments.as_object_mut(), delta.as_object())
+    {
+        for (k, v) in pasted_map {
+            new_map.insert(k.clone(), v.clone());
+        }
+    }
+
+    resolve_lens_params_in_adjustments(&mut new_adjustments, &metadata.exif, lens_db);
+    metadata.adjustments = new_adjustments;
+}
+
+/// Which develop-state profile change a batch should apply to each target.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProfileUpdate {
+    /// Leave every target's profile untouched.
+    Keep,
+    /// Write this reference to every target; a `None` profile clears it.
+    Set {
+        profile: Option<DevelopProfileReference>,
+    },
+}
+
+/// Applies BOTH halves of a paste to ONE target in a single read-modify-write.
+///
+/// The sidecar is resolved from the target's own virtual path (a `?vc=` target
+/// writes its own `<img>.<id>.rrdata`), read once with its EXIF, adjusted and
+/// profiled in memory, then written once. A target whose existing develop state
+/// was written by a newer build keeps that record exactly as it was read: the
+/// profile half is refused and logged, but the merged adjustments are still
+/// written — one half of the feature is never held hostage by the other.
+///
+/// When the batch carried adjustments AND `enable_xmp_sync` is on, the target's
+/// `<img>.xmp` rating/label/tags are refreshed after the write, restoring the
+/// pre-6C4 `apply_adjustments_to_paths` paste behaviour. A profile-only change
+/// never syncs, and the develop-state XMP writer (6C3) is never called here.
+pub(crate) fn apply_develop_state_for_path(
+    path: &str,
+    adjustments: Option<&Value>,
+    profile: &ProfileUpdate,
+    lens_db: Option<&crate::lens_correction::LensDatabase>,
+    enable_xmp_sync: bool,
+    create_xmp_if_missing: bool,
+) -> Result<(), String> {
+    let (source_path, sidecar_path) = parse_virtual_path(path);
+
+    // Exactly ONE read.
+    let mut metadata = crate::exif_processing::load_sidecar_with_exif(&sidecar_path, &source_path);
+
+    if let Some(delta) = adjustments {
+        merge_adjustments_into_metadata(&mut metadata, delta, lens_db);
+    }
+
+    if let ProfileUpdate::Set { profile } = profile
+        && let Err(error) =
+            crate::develop_state_io::apply_profile_to_metadata(&mut metadata, profile.clone())
+    {
+        // A develop state written by a newer build is never overwritten, but it
+        // must not abort the adjustments half: log the refusal, leave the record
+        // untouched in memory and continue to the single write below.
+        log::warn!("Skipping develop profile write for '{path}': {error}");
+    }
+
+    // Exactly ONE write.
+    let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
+    std::fs::write(&sidecar_path, json_string).map_err(|e| e.to_string())?;
+
+    // Restores the pre-6C4 paste behaviour: when this batch carried adjustments
+    // and XMP sync is enabled, refresh the target's XMP rating/label/tags. Only
+    // `sync_metadata_to_xmp` is called — never the 6C3 develop-state XMP writer.
+    if adjustments.is_some() && enable_xmp_sync {
+        sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
+    }
+
+    Ok(())
+}
+
+/// Applies the combined develop-state update to every target in parallel.
+///
+/// Structurally mirrors `apply_adjustments_to_paths` and
+/// `save_develop_profile_for_paths`: each target is an independent
+/// read-modify-write, so a target that cannot be written (an unwritable
+/// location) is logged and skipped rather than failing the batch. A target whose
+/// existing develop state was written by a newer build only skips the profile
+/// half (see `apply_develop_state_for_path`).
+pub(crate) fn apply_develop_state_batch(
+    paths: &[String],
+    adjustments: Option<&Value>,
+    profile: &ProfileUpdate,
+    lens_db: Option<&crate::lens_correction::LensDatabase>,
+    enable_xmp_sync: bool,
+    create_xmp_if_missing: bool,
+) {
+    paths.par_iter().for_each(|path| {
+        if let Err(error) = apply_develop_state_for_path(
+            path,
+            adjustments,
+            profile,
+            lens_db,
+            enable_xmp_sync,
+            create_xmp_if_missing,
+        ) {
+            log::warn!("Skipping develop state write for '{path}': {error}");
+        }
+    });
+}
+
+/// Removes duplicated paths while preserving the order of their first
+/// occurrence, so a batch never reads and writes the same target twice.
+pub(crate) fn deduplicate_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+/// Applies adjustments AND/OR a develop-state profile change to `paths` with ONE
+/// read-modify-write per target.
+///
+/// This is the paste path's single writer: the adjustments-only
+/// `apply_adjustments_to_paths` and the profile-only
+/// `save_develop_profile_for_paths` would otherwise race over the same sidecar,
+/// and whichever wrote last would silently drop the other's field. The
+/// develop-state XMP sidecar is never written here; when the batch carries
+/// adjustments, the pre-6C4 rating/label/tag XMP sync runs as it did on the
+/// paste path before (gated on `enable_xmp_sync`).
+#[tauri::command]
+pub async fn apply_develop_state_to_paths(
+    paths: Vec<String>,
+    adjustments: Option<Value>,
+    profile: ProfileUpdate,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let state = app_handle.state::<AppState>();
+
+    // A duplicated path would otherwise be read and written twice. Dedupe while
+    // preserving order BEFORE the queue count and the per-path loop, so both use
+    // exactly the same list.
+    let paths = deduplicate_paths(paths);
+
+    // A profile-only change regenerates nothing (6C2-R8), so the thumbnail pass
+    // runs only when this batch also carried adjustments.
+    if adjustments.is_some() {
+        add_to_thumbnail_queue(&state, paths.len(), &app_handle);
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load_settings(app_handle.clone()).unwrap_or_default();
+        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+
+        let lens_db = app_handle
+            .state::<AppState>()
+            .lens_db
+            .lock()
+            .unwrap()
+            .clone();
+
+        apply_develop_state_batch(
+            &paths,
+            adjustments.as_ref(),
+            &profile,
+            lens_db.as_deref(),
+            enable_xmp_sync,
+            create_xmp_if_missing,
+        );
+
+        if adjustments.is_none() {
+            return;
+        }
 
         let state = app_handle.state::<AppState>();
         let thumb_cache_dir = match resolve_thumbnail_cache_dir(&app_handle) {

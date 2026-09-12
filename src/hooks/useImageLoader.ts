@@ -7,6 +7,7 @@ import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes } from '../components/ui/AppProperties';
 import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import { globalImageCache } from '../utils/ImageLRUCache';
 import {
   PROFILE_PROJECTION_NONE,
   activeProfilePath,
@@ -154,18 +155,38 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
             const shouldPersist = useEditorStore.getState().xmpProfileRollback?.id === profileRollback.id;
             if (shouldPersist) {
               const profile = useEditorStore.getState().xmpProfile;
+              const payload = developStateFromProfileFields({
+                path: profile.path,
+                name: profile.name,
+                uuid: profile.uuid,
+                amountPercent: profile.amountPercent,
+              }).profile;
+
               invoke(Invokes.SaveImageDevelopProfile, {
                 path: selectedImage.path,
-                profile: developStateFromProfileFields({
-                  path: profile.path,
-                  name: profile.name,
-                  uuid: profile.uuid,
-                  amountPercent: profile.amountPercent,
-                }).profile,
+                profile: payload,
               }).catch((err) => {
                 console.error('Failed to save develop profile:', err);
                 toast.error(`${t('ui.xmpProfile.applyFailed')}: ${err}`);
               });
+
+              // 6C4-R6: the existing autoSync setting IS the multi-image sync path.
+              // A committed profile change propagates to the rest of the selection
+              // through the same batch command the paste uses; a failed target is
+              // logged, never toasted per target.
+              const { copyPasteSettings } = useSettingsStore.getState().appSettings ?? {};
+              const otherPaths = useLibraryStore.getState().multiSelectedPaths.filter((p) => p !== selectedImage.path);
+
+              if (
+                copyPasteSettings?.autoSync &&
+                (copyPasteSettings.includedAdjustments ?? []).includes('xmpProfile') &&
+                otherPaths.length > 0
+              ) {
+                otherPaths.forEach((p) => globalImageCache.delete(p));
+                invoke(Invokes.SaveDevelopProfileForPaths, { paths: otherPaths, profile: payload }).catch((err) => {
+                  console.error('Failed to sync develop profile to the selection:', err);
+                });
+              }
             }
             setEditor((state) =>
               state.xmpProfileRollback?.id === profileRollback.id ? { ...state, xmpProfileRollback: null } : state,

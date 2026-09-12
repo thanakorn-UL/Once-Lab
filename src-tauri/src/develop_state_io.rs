@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -14,6 +15,7 @@ use crate::develop_state::{
     DEVELOP_STATE_VERSION, DevelopProfileReference, DevelopState, DiscoveredProfile,
     ProfileResolution, resolve_profile_reference,
 };
+use crate::image_processing::ImageMetadata;
 use crate::xmp_profile::load_xmp_rgb_profile_from_path;
 use crate::xmp_profile::summary::{XmpProfileSummary, summarize_xmp_profile};
 
@@ -177,6 +179,36 @@ pub(crate) fn develop_profile_roots(home: Option<&Path>, user_roots: &[String]) 
     roots
 }
 
+/// Applies `profile` to the develop state of an ALREADY-LOADED sidecar.
+///
+/// The single place a profile is written, shared by
+/// `write_develop_profile_to_sidecar` (the profile-only path) and the combined
+/// adjustments+profile batch: a record written by a newer build is refused (the
+/// error is returned so the caller can skip that path, leaving its file
+/// byte-unchanged), a `None` profile clears the reference, and the record's
+/// unknown keys are preserved.
+pub(crate) fn apply_profile_to_metadata(
+    metadata: &mut ImageMetadata,
+    profile: Option<DevelopProfileReference>,
+) -> Result<(), String> {
+    let existing = metadata.develop_state();
+
+    if metadata.develop_state.is_some() && !existing.is_supported() {
+        return Err(format!(
+            "refusing to overwrite a develop state written by a newer Once-Lab version ({})",
+            existing.version
+        ));
+    }
+
+    metadata.set_develop_state(DevelopState {
+        version: DEVELOP_STATE_VERSION,
+        profile,
+        unknown: existing.unknown,
+    });
+
+    Ok(())
+}
+
 /// Persists `profile` as the image's develop state, keeping every other field of
 /// the sidecar byte-for-byte.
 ///
@@ -187,22 +219,9 @@ pub(crate) fn write_develop_profile_to_sidecar(
     profile: Option<DevelopProfileReference>,
 ) -> Result<(), String> {
     let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
-    let existing = metadata.develop_state();
-
-    if metadata.develop_state.is_some() && !existing.is_supported() {
-        return Err(format!(
-            "refusing to overwrite a develop state written by a newer Once-Lab version ({})",
-            existing.version
-        ));
-    }
-
     let saved_profile = profile.is_some();
 
-    metadata.set_develop_state(DevelopState {
-        version: DEVELOP_STATE_VERSION,
-        profile,
-        unknown: existing.unknown,
-    });
+    apply_profile_to_metadata(&mut metadata, profile)?;
 
     let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
     std::fs::write(sidecar_path, json_string).map_err(|e| e.to_string())?;
@@ -247,9 +266,49 @@ pub fn save_image_develop_profile(
     write_develop_profile_to_sidecar(&sidecar_path, profile)
 }
 
+/// Applies `profile` to the develop state of ONE target.
+///
+/// The read-modify-write is `write_develop_profile_to_sidecar`, so the version
+/// refusal, the byte-preservation of every other sidecar field and the
+/// "a cleared profile is omitted" shape stay in a single place. The sidecar is
+/// resolved from the target's VIRTUAL path, so a `?vc=<id>` target writes its
+/// OWN `<img>.<id>.rrdata` rather than the physical image's state.
+pub(crate) fn save_develop_profile_for_path(
+    path: &str,
+    profile: Option<&DevelopProfileReference>,
+) -> Result<(), String> {
+    let (_, sidecar_path) = crate::file_management::parse_virtual_path(path);
+
+    write_develop_profile_to_sidecar(&sidecar_path, profile.cloned())
+}
+
+/// Applies `profile` to every target in `paths`, in parallel.
+///
+/// Structurally mirrors `apply_adjustments_to_paths`: each target is an
+/// independent read-modify-write, so a target that cannot be written (an
+/// unwritable location, or an existing develop state written by a newer build)
+/// is logged and skipped rather than failing the batch. The XMP sidecar is
+/// deliberately never written here: only the explicit 6C3 commands may do that.
+#[tauri::command]
+pub fn save_develop_profile_for_paths(
+    paths: Vec<String>,
+    profile: Option<DevelopProfileReference>,
+) -> Result<(), String> {
+    let profile = profile.as_ref();
+
+    paths.par_iter().for_each(|path| {
+        if let Err(error) = save_develop_profile_for_path(path, profile) {
+            log::warn!("Skipping develop profile write for '{path}': {error}");
+        }
+    });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_management::{ProfileUpdate, apply_develop_state_batch, deduplicate_paths};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1058,5 +1117,830 @@ mod tests {
         assert_eq!(summary.path, profile_path_string);
 
         fs::remove_dir_all(&parent).expect("remove temp dir");
+    }
+
+    /// The virtual path of `<dir>/<name>.NEF`, the exact shape the frontend
+    /// passes to the batch command.
+    fn image_path(dir: &Path, name: &str) -> String {
+        dir.join(format!("{name}.NEF"))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn batch_write_applies_the_profile_to_every_target() {
+        let root = unique_temp_dir("batch_apply_root");
+        let profile_path = write_profile(&root, "Alpha.xmp", "Alpha Profile", "UUID-ALPHA");
+        let profile_path_string = profile_path.to_string_lossy().to_string();
+
+        let targets = vec![
+            image_path(&root, "a"),
+            image_path(&root, "b"),
+            image_path(&root, "c"),
+        ];
+        let saved = reference(
+            Some("UUID-ALPHA"),
+            Some(&profile_path_string),
+            Some("Alpha Profile"),
+            42.0,
+        );
+
+        save_develop_profile_for_paths(targets.clone(), Some(saved.clone())).expect("batch write");
+
+        for target in &targets {
+            let (_, sidecar) = crate::file_management::parse_virtual_path(target);
+            let restore =
+                resolve_develop_profile_from_sidecar(&sidecar, std::slice::from_ref(&root));
+            let DevelopProfileRestore::Resolved { reference, .. } = restore else {
+                panic!("every target must resolve the written profile ('{target}'): {restore:?}");
+            };
+            assert_eq!(reference, saved, "the reference survives for '{target}'");
+            assert_eq!(reference.amount_percent, 42.0);
+        }
+
+        // Non-vacuity: a path that was never in the batch has no sidecar, so the
+        // three above cannot be a coincidence of a directory-wide write.
+        assert!(!root.join("d.NEF.rrdata").exists());
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_clears_a_target_profile_with_none() {
+        let root = unique_temp_dir("batch_clear_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+
+        write_develop_profile_to_sidecar(
+            &sidecar,
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("seed a profile");
+        assert!(read_sidecar(&sidecar)["develop_state"]["profile"].is_object());
+
+        save_develop_profile_for_paths(vec![target], None).expect("batch clear");
+
+        let stored = read_sidecar(&sidecar);
+        assert!(
+            stored["develop_state"].get("profile").is_none(),
+            "a cleared profile is omitted entirely: {stored}"
+        );
+        assert_eq!(
+            resolve_develop_profile_from_sidecar(&sidecar, std::slice::from_ref(&root)),
+            DevelopProfileRestore::None
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_leaves_the_source_unchanged_when_it_is_not_in_the_paths() {
+        let root = unique_temp_dir("batch_source_root");
+        let source = image_path(&root, "source");
+        let (_, source_sidecar) = crate::file_management::parse_virtual_path(&source);
+        let source_reference = reference(Some("UUID-SOURCE"), None, Some("Source"), 30.0);
+        write_develop_profile_to_sidecar(&source_sidecar, Some(source_reference.clone()))
+            .expect("seed the source");
+
+        let before = fs::read(&source_sidecar).expect("read the source before");
+
+        save_develop_profile_for_paths(
+            vec![image_path(&root, "a"), image_path(&root, "b")],
+            Some(reference(Some("UUID-NEW"), None, Some("New"), 80.0)),
+        )
+        .expect("batch write");
+
+        assert_eq!(
+            fs::read(&source_sidecar).expect("re-read the source"),
+            before,
+            "a path outside the batch must be byte-unchanged"
+        );
+        assert_eq!(
+            resolve_develop_profile_from_sidecar(&source_sidecar, std::slice::from_ref(&root)),
+            DevelopProfileRestore::Missing {
+                reference: source_reference,
+            },
+            "the source still references its own profile"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_reports_ok_when_one_path_is_unwritable() {
+        let root = unique_temp_dir("batch_unwritable_root");
+        // Precondition: the parent directory genuinely does not exist, so the
+        // write for this one path must fail.
+        assert!(
+            !root.join("missing-dir").exists(),
+            "the fixture parent must not exist"
+        );
+        let unwritable = root
+            .join("missing-dir")
+            .join("photo.NEF")
+            .to_string_lossy()
+            .to_string();
+        let good = image_path(&root, "good");
+
+        save_develop_profile_for_paths(
+            vec![unwritable.clone(), good.clone()],
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("a per-path failure must never fail the batch");
+
+        let (_, good_sidecar) = crate::file_management::parse_virtual_path(&good);
+        assert!(
+            good_sidecar.exists(),
+            "the writable target must still be written"
+        );
+        assert_eq!(
+            read_sidecar(&good_sidecar)["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+
+        let (_, bad_sidecar) = crate::file_management::parse_virtual_path(&unwritable);
+        assert!(
+            !bad_sidecar.exists(),
+            "an unwritable target must not produce a file"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_skips_a_target_with_an_unsupported_develop_state_version() {
+        let root = unique_temp_dir("batch_newer_root");
+        let newer = image_path(&root, "newer");
+        let (_, newer_sidecar) = crate::file_management::parse_virtual_path(&newer);
+        write_sidecar(
+            &root,
+            "newer.NEF.rrdata",
+            &json!({
+                "version": 1,
+                "rating": 0,
+                "adjustments": null,
+                "develop_state": {
+                    "version": 2,
+                    "profile": { "uuid": "UUID-FUTURE", "amount_percent": 100.0 },
+                },
+            }),
+        );
+        let before = fs::read(&newer_sidecar).expect("read the newer sidecar");
+
+        let good = image_path(&root, "good");
+
+        save_develop_profile_for_paths(
+            vec![newer.clone(), good.clone()],
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("batch write");
+
+        assert_eq!(
+            fs::read(&newer_sidecar).expect("re-read the newer sidecar"),
+            before,
+            "a develop state this build must not interpret is left byte-unchanged"
+        );
+
+        let (_, good_sidecar) = crate::file_management::parse_virtual_path(&good);
+        assert_eq!(
+            read_sidecar(&good_sidecar)["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA"),
+            "the other target still succeeds"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_is_virtual_copy_aware() {
+        let root = unique_temp_dir("batch_vc_root");
+        // The physical image's own develop state.
+        let physical_sidecar = write_sidecar(&root, "photo.NEF.rrdata", &legacy_document());
+        let physical_before = fs::read(&physical_sidecar).expect("read the physical sidecar");
+
+        let virtual_path = format!("{}?vc=copy-1", image_path(&root, "photo"));
+        let saved = reference(Some("UUID-ALPHA"), None, Some("Alpha"), 55.0);
+
+        save_develop_profile_for_paths(vec![virtual_path.clone()], Some(saved))
+            .expect("batch write");
+
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&virtual_path);
+        assert_eq!(
+            copy_sidecar,
+            root.join("photo.NEF.copy-1.rrdata"),
+            "a virtual copy must write its OWN sidecar"
+        );
+        let stored = read_sidecar(&copy_sidecar);
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["amount_percent"],
+            json!(55.0)
+        );
+
+        assert_eq!(
+            fs::read(&physical_sidecar).expect("re-read the physical sidecar"),
+            physical_before,
+            "the physical image's own state must be byte-unchanged"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn batch_write_preserves_every_other_field() {
+        let root = unique_temp_dir("batch_preserve_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+        write_sidecar(&root, "photo.NEF.rrdata", &legacy_document());
+
+        let before = read_sidecar(&sidecar);
+        assert!(before.get("develop_state").is_none());
+
+        save_develop_profile_for_paths(
+            vec![target],
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("batch write");
+
+        let mut after = read_sidecar(&sidecar);
+        after
+            .as_object_mut()
+            .expect("sidecar is an object")
+            .remove("develop_state");
+
+        assert_eq!(
+            after, before,
+            "rating, tags, exif and adjustments must be untouched"
+        );
+        assert_eq!(after["rating"], json!(4));
+        assert_eq!(after["adjustments"], json!({ "exposure": 0.5 }));
+        assert_eq!(after["tags"], json!(["keep"]));
+        assert_eq!(after["exif"], json!({ "Make": "Once" }));
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// The combined batch is the paste's SINGLE writer: each target's `.rrdata`
+    /// ends up carrying BOTH the merged adjustments and the develop state.
+    ///
+    /// Non-vacuity: the lost-update shape the two-command paste had — writing the
+    /// file after only the adjustments step, before the profile step — would
+    /// leave `develop_state` absent here and fail.
+    #[test]
+    fn combined_batch_applies_adjustments_and_profile_in_one_write() {
+        let root = unique_temp_dir("combined_both_root");
+        let targets = vec![
+            image_path(&root, "a"),
+            image_path(&root, "b"),
+            image_path(&root, "c"),
+        ];
+        let delta = json!({ "exposure": 1.5, "contrast": 20 });
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 42.0)),
+        };
+
+        apply_develop_state_batch(&targets, Some(&delta), &profile, None, false, false);
+
+        for target in &targets {
+            let (_, sidecar) = crate::file_management::parse_virtual_path(target);
+            let stored = read_sidecar(&sidecar);
+            assert_eq!(
+                stored["adjustments"]["exposure"],
+                json!(1.5),
+                "the pasted adjustment key must be written for '{target}': {stored}"
+            );
+            assert_eq!(
+                stored["adjustments"]["contrast"],
+                json!(20),
+                "every pasted adjustment key must be written for '{target}': {stored}"
+            );
+            assert_eq!(
+                stored["develop_state"]["profile"]["uuid"],
+                json!("UUID-ALPHA"),
+                "the develop state must survive beside the adjustments for '{target}': {stored}"
+            );
+            assert_eq!(
+                stored["develop_state"]["profile"]["amount_percent"],
+                json!(42.0)
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_keeps_the_profile_when_asked_to_keep() {
+        let root = unique_temp_dir("combined_keep_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+
+        write_sidecar(
+            &root,
+            "photo.NEF.rrdata",
+            &json!({
+                "version": 1,
+                "rating": 0,
+                "adjustments": { "exposure": 0.5 },
+                "develop_state": {
+                    "version": 1,
+                    "profile": { "uuid": "UUID-SEED", "name": "Seed", "amount_percent": 77.0 },
+                },
+            }),
+        );
+
+        let before = read_sidecar(&sidecar);
+        let delta = json!({ "exposure": 2.0 });
+
+        apply_develop_state_batch(
+            &[target],
+            Some(&delta),
+            &ProfileUpdate::Keep,
+            None,
+            false,
+            false,
+        );
+
+        let after = read_sidecar(&sidecar);
+        assert_eq!(
+            after["develop_state"], before["develop_state"],
+            "ProfileUpdate::Keep must leave the develop state untouched: {after}"
+        );
+        assert_eq!(
+            after["develop_state"]["profile"]["uuid"],
+            json!("UUID-SEED"),
+            "an existing profile survives a Keep"
+        );
+        assert_eq!(
+            after["develop_state"]["profile"]["amount_percent"],
+            json!(77.0)
+        );
+        // Non-vacuity: the same call DID change the adjustments half, so the
+        // unchanged develop state is not a no-op batch.
+        assert_eq!(after["adjustments"]["exposure"], json!(2.0));
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_keeps_adjustments_when_none() {
+        let root = unique_temp_dir("combined_none_adjust_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+
+        write_sidecar(
+            &root,
+            "photo.NEF.rrdata",
+            &json!({
+                "version": 1,
+                "rating": 3,
+                "adjustments": { "exposure": 0.5, "saturation": -10 },
+                "tags": ["keep"],
+            }),
+        );
+
+        let before = read_sidecar(&sidecar);
+        assert!(before.get("develop_state").is_none());
+
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        };
+        apply_develop_state_batch(&[target], None, &profile, None, false, false);
+
+        let after = read_sidecar(&sidecar);
+        assert_eq!(
+            after["adjustments"], before["adjustments"],
+            "with adjustments: None the adjustment payload is unchanged: {after}"
+        );
+        assert_eq!(after["rating"], json!(3));
+        assert_eq!(after["tags"], json!(["keep"]));
+        assert_eq!(
+            after["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA"),
+            "only the develop state changed"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_clears_a_profile_with_a_null_profile() {
+        let root = unique_temp_dir("combined_clear_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+
+        write_develop_profile_to_sidecar(
+            &sidecar,
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("seed a profile");
+        assert!(read_sidecar(&sidecar)["develop_state"]["profile"].is_object());
+
+        let profile = ProfileUpdate::Set { profile: None };
+        apply_develop_state_batch(&[target], None, &profile, None, false, false);
+
+        let stored = read_sidecar(&sidecar);
+        assert!(
+            stored["develop_state"].get("profile").is_none(),
+            "a null profile in a Set clears the reference entirely: {stored}"
+        );
+        assert_eq!(
+            resolve_develop_profile_from_sidecar(&sidecar, std::slice::from_ref(&root)),
+            DevelopProfileRestore::None
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_is_virtual_copy_aware() {
+        let root = unique_temp_dir("combined_vc_root");
+        let physical_sidecar = write_sidecar(&root, "photo.NEF.rrdata", &legacy_document());
+        let physical_before = fs::read(&physical_sidecar).expect("read the physical sidecar");
+
+        let virtual_path = format!("{}?vc=copy-1", image_path(&root, "photo"));
+        let delta = json!({ "exposure": 1.25 });
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 55.0)),
+        };
+
+        apply_develop_state_batch(
+            std::slice::from_ref(&virtual_path),
+            Some(&delta),
+            &profile,
+            None,
+            false,
+            false,
+        );
+
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&virtual_path);
+        assert_eq!(
+            copy_sidecar,
+            root.join("photo.NEF.copy-1.rrdata"),
+            "a virtual copy must write its OWN sidecar"
+        );
+        let stored = read_sidecar(&copy_sidecar);
+        assert_eq!(stored["adjustments"]["exposure"], json!(1.25));
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["amount_percent"],
+            json!(55.0)
+        );
+
+        assert_eq!(
+            fs::read(&physical_sidecar).expect("re-read the physical sidecar"),
+            physical_before,
+            "the physical image's own state must be byte-unchanged"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// A target whose existing develop state was written by a newer build does
+    /// not lose the adjustments half of the paste: the profile is refused (the
+    /// record stays byte-for-byte as it was read) while the merged adjustment
+    /// delta is still written.
+    ///
+    /// Non-vacuity: propagating the profile refusal with `?` (as
+    /// `write_develop_profile_to_sidecar` still does for a profile-only write)
+    /// aborts the whole per-path body, leaving `adjustments` untouched and
+    /// failing the `exposure == 1.0` assertion below.
+    #[test]
+    fn combined_batch_keeps_a_newer_develop_state_but_still_applies_adjustments() {
+        let root = unique_temp_dir("combined_newer_root");
+        let newer = image_path(&root, "newer");
+        let (_, newer_sidecar) = crate::file_management::parse_virtual_path(&newer);
+        write_sidecar(
+            &root,
+            "newer.NEF.rrdata",
+            &json!({
+                "version": 1,
+                "rating": 0,
+                "adjustments": null,
+                "develop_state": {
+                    "version": 2,
+                    "profile": { "uuid": "UUID-FUTURE", "amount_percent": 100.0 },
+                },
+            }),
+        );
+        let before = read_sidecar(&newer_sidecar);
+        let before_develop_state = before["develop_state"].clone();
+
+        let good = image_path(&root, "good");
+        let delta = json!({ "exposure": 1.0 });
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        };
+
+        apply_develop_state_batch(
+            &[newer.clone(), good.clone()],
+            Some(&delta),
+            &profile,
+            None,
+            false,
+            false,
+        );
+
+        let stored = read_sidecar(&newer_sidecar);
+        assert_eq!(
+            stored["develop_state"], before_develop_state,
+            "a newer develop state is kept byte-unchanged, version, profile and all: {stored}"
+        );
+        assert_eq!(
+            stored["develop_state"]["version"],
+            json!(2),
+            "the newer record must not be rewritten to the current version"
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-FUTURE"),
+            "the newer profile reference must not be overwritten"
+        );
+        assert_eq!(
+            stored["adjustments"]["exposure"],
+            json!(1.0),
+            "the adjustments half must still be written even though the profile was refused: {stored}"
+        );
+
+        let (_, good_sidecar) = crate::file_management::parse_virtual_path(&good);
+        let stored_good = read_sidecar(&good_sidecar);
+        assert_eq!(stored_good["adjustments"]["exposure"], json!(1.0));
+        assert_eq!(
+            stored_good["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA"),
+            "the other target still succeeds"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_reports_ok_when_one_path_is_unwritable() {
+        let root = unique_temp_dir("combined_unwritable_root");
+        // Precondition: the parent directory genuinely does not exist, so the
+        // write for this one path must fail.
+        assert!(
+            !root.join("missing-dir").exists(),
+            "the fixture parent must not exist"
+        );
+        let unwritable = root
+            .join("missing-dir")
+            .join("photo.NEF")
+            .to_string_lossy()
+            .to_string();
+        let good = image_path(&root, "good");
+
+        let delta = json!({ "exposure": 1.0 });
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        };
+
+        // A single target's failure is logged and skipped; the batch itself never
+        // rejects the caller.
+        apply_develop_state_batch(
+            &[unwritable.clone(), good.clone()],
+            Some(&delta),
+            &profile,
+            None,
+            false,
+            false,
+        );
+
+        let (_, good_sidecar) = crate::file_management::parse_virtual_path(&good);
+        let stored = read_sidecar(&good_sidecar);
+        assert_eq!(
+            stored["adjustments"]["exposure"],
+            json!(1.0),
+            "the writable target must still be written"
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+
+        let (_, bad_sidecar) = crate::file_management::parse_virtual_path(&unwritable);
+        assert!(
+            !bad_sidecar.exists(),
+            "an unwritable target must not produce a file"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn combined_batch_preserves_rating_tags_and_exif() {
+        let root = unique_temp_dir("combined_preserve_root");
+        let target = image_path(&root, "photo");
+        let (_, sidecar) = crate::file_management::parse_virtual_path(&target);
+        write_sidecar(&root, "photo.NEF.rrdata", &legacy_document());
+
+        let delta = json!({ "contrast": 12 });
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        };
+        apply_develop_state_batch(&[target], Some(&delta), &profile, None, false, false);
+
+        let stored = read_sidecar(&sidecar);
+        assert_eq!(stored["rating"], json!(4));
+        assert_eq!(stored["tags"], json!(["keep"]));
+        assert_eq!(stored["exif"], json!({ "Make": "Once" }));
+        assert_eq!(
+            stored["adjustments"]["exposure"],
+            json!(0.5),
+            "the existing adjustment key survives the merge"
+        );
+        assert_eq!(
+            stored["adjustments"]["contrast"],
+            json!(12),
+            "the pasted adjustment key is merged in"
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// Tripwire, NOT evidence: the profile-only batch only ever writes a target's
+    /// `.rrdata`, so with the current code this assertion cannot fail. It exists
+    /// to catch a FUTURE change that would make the profile-only batch begin
+    /// touching the image's `<img>.xmp`, and must not be read as proving the XMP
+    /// sidecar is safe today. (The pre-existing rating/label/tag XMP sync under
+    /// `enable_xmp_sync` fires from `ApplyAdjustmentsToPaths` and, when the batch
+    /// carries adjustments, from the combined batch; a profile-only write never
+    /// syncs.)
+    #[test]
+    fn batch_write_never_touches_an_xmp_sidecar() {
+        let root = unique_temp_dir("batch_xmp_root");
+        let xmp_path = write_sidecar(&root, "photo.NEF.xmp", &json!({ "handwritten": true }));
+        let xmp_before = fs::read(&xmp_path).expect("read the xmp sidecar");
+
+        save_develop_profile_for_paths(
+            vec![image_path(&root, "photo")],
+            Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+        )
+        .expect("batch write");
+
+        assert_eq!(
+            fs::read(&xmp_path).expect("re-read the xmp sidecar"),
+            xmp_before,
+            "only the explicit 6C3 commands may write an XMP sidecar"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// FIX 1: the combined paste path restores the pre-6C4 rating/label/tag XMP
+    /// sync. With `enable_xmp_sync` on and adjustments present, the target's
+    /// `<img>.xmp` is rewritten from the sidecar's rating (`xmp:Rating`), colour
+    /// tag (`xmp:Label`) and plain tags (`dc:subject`); a profile-only paste
+    /// (`adjustments: None`) must never touch it.
+    ///
+    /// The exact observable form is `sync_metadata_to_xmp`'s behaviour: it
+    /// replaces the existing `xmp:Rating` attribute, inserts an `xmp:Label`
+    /// element and inserts a `dc:subject`/`rdf:Bag` for the non-colour tags.
+    ///
+    /// Non-vacuity:
+    ///  - positive half: deleting the `sync_metadata_to_xmp` call from
+    ///    `apply_develop_state_for_path` (or dropping its `enable_xmp_sync`
+    ///    guard) leaves the XMP at `xmp:Rating="0"` and fails the sync asserts;
+    ///  - negative half: dropping the `adjustments.is_some()` gate lets the
+    ///    profile-only paste sync too, rewriting `xmp:Rating="0"` to `"4"` and
+    ///    failing the byte-unchanged assert.
+    #[test]
+    fn combined_batch_syncs_augmented_xmp_when_adjustments_change() {
+        let root = unique_temp_dir("combined_xmp_sync_root");
+
+        // The pre-existing XMP a paste would amend: no label, no subject and a
+        // zero rating the sidecar's rating/label/tags must overwrite.
+        let xmp_fixture = |rating: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="RapidRAW">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmp:Rating="{rating}">
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#
+            )
+        };
+
+        // The sidecar carries rating 4, the colour tag `color:red` (-> label
+        // "Red") and the plain tag `keep` (-> dc:subject bag), none of which the
+        // XMP currently holds.
+        let sidecar_document = json!({
+            "version": 1,
+            "rating": 4,
+            "adjustments": { "exposure": 0.5 },
+            "tags": ["color:red", "keep"],
+        });
+
+        // --- positive half: adjustments are present, so the XMP is synced.
+        let synced = image_path(&root, "synced");
+        write_sidecar(&root, "synced.NEF.rrdata", &sidecar_document);
+        let synced_xmp = root.join("synced.xmp");
+        fs::write(&synced_xmp, xmp_fixture("0")).expect("write xmp fixture");
+        assert!(
+            !fs::read_to_string(&synced_xmp)
+                .expect("read xmp fixture")
+                .contains(r#"xmp:Rating="4""#),
+            "precondition: the XMP must not already carry the sidecar's rating"
+        );
+
+        apply_develop_state_batch(
+            std::slice::from_ref(&synced),
+            Some(&json!({ "contrast": 20 })),
+            &ProfileUpdate::Keep,
+            None,
+            true,
+            false,
+        );
+
+        let (_, synced_sidecar) = crate::file_management::parse_virtual_path(&synced);
+        assert_eq!(
+            read_sidecar(&synced_sidecar)["adjustments"]["contrast"],
+            json!(20),
+            "precondition: the batch really ran and wrote the sidecar"
+        );
+
+        let synced_after = fs::read_to_string(&synced_xmp).expect("read synced xmp");
+        assert!(
+            synced_after.contains(r#"xmp:Rating="4""#),
+            "the sidecar's rating must be synced into the XMP: {synced_after}"
+        );
+        assert!(
+            synced_after.contains("<xmp:Label>Red</xmp:Label>"),
+            "the sidecar's colour tag must become the XMP label: {synced_after}"
+        );
+        assert!(
+            synced_after.contains("<rdf:li>keep</rdf:li>"),
+            "the sidecar's plain tags must become the dc:subject bag: {synced_after}"
+        );
+
+        // --- negative half: a profile-only paste must leave the XMP untouched.
+        let profile_only = image_path(&root, "profile_only");
+        write_sidecar(&root, "profile_only.NEF.rrdata", &sidecar_document);
+        let profile_only_xmp = root.join("profile_only.xmp");
+        fs::write(&profile_only_xmp, xmp_fixture("0")).expect("write xmp fixture");
+        let profile_only_xmp_before = fs::read(&profile_only_xmp).expect("read xmp fixture");
+
+        apply_develop_state_batch(
+            std::slice::from_ref(&profile_only),
+            None,
+            &ProfileUpdate::Set {
+                profile: Some(reference(Some("UUID-ALPHA"), None, Some("Alpha"), 100.0)),
+            },
+            None,
+            true,
+            false,
+        );
+
+        let (_, profile_only_sidecar) = crate::file_management::parse_virtual_path(&profile_only);
+        assert_eq!(
+            read_sidecar(&profile_only_sidecar)["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA"),
+            "precondition: the profile-only batch really ran"
+        );
+        assert_eq!(
+            fs::read(&profile_only_xmp).expect("re-read xmp"),
+            profile_only_xmp_before,
+            "a profile-only change must never sync the rating/label/tag XMP"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// FIX 2: the combined command deduplicates its incoming paths, preserving
+    /// first-seen order, BEFORE the thumbnail queue count and the per-path loop,
+    /// so a repeated path is read and written once. The command itself needs an
+    /// `AppHandle`, so this asserts the exact helper the command calls; the
+    /// duplicate-write risk it removes cannot be observed through file content
+    /// (the merge is idempotent).
+    ///
+    /// Non-vacuity: making `deduplicate_paths` a pass-through (returning its
+    /// input unchanged) yields the five-element input and fails the equality.
+    #[test]
+    fn apply_develop_state_to_paths_deduplicates_its_paths() {
+        let a = "/photos/a.NEF".to_string();
+        let b = "/photos/b.NEF".to_string();
+
+        let deduped =
+            deduplicate_paths(vec![a.clone(), b.clone(), a.clone(), b.clone(), a.clone()]);
+
+        assert_eq!(
+            deduped,
+            vec![a, b],
+            "duplicates must be removed while first-seen order is preserved"
+        );
     }
 }

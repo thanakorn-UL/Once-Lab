@@ -142,6 +142,7 @@ pub fn all_available_adjustments() -> HashSet<String> {
         "transformXOffset",
         "transformYOffset",
         "masks",
+        "xmpProfile",
         "lensCorrectionMode",
         "lensMaker",
         "lensModel",
@@ -658,6 +659,50 @@ pub fn is_tethering_supported() -> bool {
     cfg!(feature = "tethering")
 }
 
+/// Brings a loaded settings file up to date with the copy/paste keys this build
+/// knows about.
+///
+/// A saved file with no recorded key list predates the mechanism entirely, so it
+/// is seeded with the current defaults. Otherwise, every key this build knows
+/// that the saved file did not is recorded as known, and is added to the user's
+/// included set only when this build includes it by default — so an existing
+/// user gains a newly shipped key automatically, while a user who deliberately
+/// unchecked it keeps it unchecked. Returns whether `settings` changed.
+pub(crate) fn migrate_copy_paste_settings(settings: &mut AppSettings) -> bool {
+    let all_current_keys = all_available_adjustments();
+    let default_included = default_included_adjustments();
+
+    if settings.copy_paste_settings.known_adjustments.is_empty() {
+        settings.copy_paste_settings.included_adjustments = default_included;
+        settings.copy_paste_settings.known_adjustments = all_current_keys;
+        return true;
+    }
+
+    let new_features: Vec<String> = all_current_keys
+        .difference(&settings.copy_paste_settings.known_adjustments)
+        .cloned()
+        .collect();
+
+    if new_features.is_empty() {
+        return false;
+    }
+
+    for feature in new_features {
+        if default_included.contains(&feature) {
+            settings
+                .copy_paste_settings
+                .included_adjustments
+                .insert(feature.clone());
+        }
+        settings
+            .copy_paste_settings
+            .known_adjustments
+            .insert(feature);
+    }
+
+    true
+}
+
 #[tauri::command]
 pub fn load_settings(app_handle: AppHandle) -> Result<AppSettings, String> {
     let path = get_settings_path(&app_handle)?;
@@ -669,8 +714,6 @@ pub fn load_settings(app_handle: AppHandle) -> Result<AppSettings, String> {
         AppSettings::default()
     };
 
-    let all_current_keys = all_available_adjustments();
-    let default_included = default_included_adjustments();
     let mut settings_modified = false;
 
     if settings.root_folders.is_empty()
@@ -689,33 +732,8 @@ pub fn load_settings(app_handle: AppHandle) -> Result<AppSettings, String> {
         settings_modified = true;
     }
 
-    let is_first_migration = settings.copy_paste_settings.known_adjustments.is_empty();
-
-    if is_first_migration {
-        settings.copy_paste_settings.included_adjustments = default_included;
-        settings.copy_paste_settings.known_adjustments = all_current_keys.clone();
+    if migrate_copy_paste_settings(&mut settings) {
         settings_modified = true;
-    } else {
-        let new_features: Vec<String> = all_current_keys
-            .difference(&settings.copy_paste_settings.known_adjustments)
-            .cloned()
-            .collect();
-
-        if !new_features.is_empty() {
-            for feature in new_features {
-                if default_included.contains(&feature) {
-                    settings
-                        .copy_paste_settings
-                        .included_adjustments
-                        .insert(feature.clone());
-                }
-                settings
-                    .copy_paste_settings
-                    .known_adjustments
-                    .insert(feature);
-            }
-            settings_modified = true;
-        }
     }
 
     if settings_modified && let Ok(json_string) = serde_json::to_string_pretty(&settings) {
@@ -779,7 +797,8 @@ mod tests {
         let serialized = serde_json::to_string(&settings).expect("serialize settings");
         assert!(serialized.contains("\"xmpProfileRoots\""));
 
-        let reloaded: AppSettings = serde_json::from_str(&serialized).expect("deserialize settings");
+        let reloaded: AppSettings =
+            serde_json::from_str(&serialized).expect("deserialize settings");
         assert_eq!(reloaded.xmp_profile_roots, roots);
     }
 
@@ -788,7 +807,9 @@ mod tests {
     /// about content rather than about hash order.
     fn normalize_hashed_arrays(value: &mut Value) {
         for key in ["includedAdjustments", "knownAdjustments"] {
-            if let Some(Value::Array(items)) = value.pointer_mut(&format!("/copyPasteSettings/{key}")) {
+            if let Some(Value::Array(items)) =
+                value.pointer_mut(&format!("/copyPasteSettings/{key}"))
+            {
                 items.sort_by_key(|item| item.as_str().map(str::to_string));
             }
         }
@@ -841,6 +862,192 @@ mod tests {
         assert_eq!(
             before, after,
             "saving the root list must leave every other setting untouched"
+        );
+    }
+
+    /// Every copy/paste key this build knows except the 6C4 profile marker: the
+    /// exact key list a settings file written before 6C4 recorded.
+    fn pre_xmp_profile_known_keys() -> Vec<String> {
+        all_available_adjustments()
+            .into_iter()
+            .filter(|key| key != "xmpProfile")
+            .collect()
+    }
+
+    #[test]
+    fn all_available_adjustments_contains_the_xmp_profile_marker() {
+        assert!(
+            all_available_adjustments().contains("xmpProfile"),
+            "the copy/paste profile marker must be a key this build knows"
+        );
+    }
+
+    #[test]
+    fn xmp_profile_marker_is_included_by_default() {
+        assert!(
+            default_included_adjustments().contains("xmpProfile"),
+            "a newly shipped copy/paste category is included unless it is explicitly off by default"
+        );
+    }
+
+    /// The load-bearing migration: an existing user's settings file, whose known
+    /// key list predates the profile marker, must gain the marker on load.
+    #[test]
+    fn an_existing_settings_file_gains_the_xmp_profile_marker_on_load() {
+        let mut settings: AppSettings = serde_json::from_value(json!({
+            "copyPasteSettings": {
+                "mode": "merge",
+                "includedAdjustments": ["exposure", "contrast"],
+                "knownAdjustments": pre_xmp_profile_known_keys(),
+                "autoSync": false,
+            }
+        }))
+        .expect("an older settings file must still deserialize");
+
+        // Precondition: the saved file is exactly the pre-6C4 state.
+        assert!(
+            !settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("xmpProfile")
+        );
+        assert!(
+            !settings
+                .copy_paste_settings
+                .known_adjustments
+                .contains("xmpProfile")
+        );
+
+        assert!(migrate_copy_paste_settings(&mut settings));
+
+        assert!(
+            settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("xmpProfile"),
+            "an existing user gains the profile marker on load: {:?}",
+            settings.copy_paste_settings.included_adjustments
+        );
+        assert!(
+            settings
+                .copy_paste_settings
+                .known_adjustments
+                .contains("xmpProfile"),
+            "the marker is recorded as known so the next load is a no-op"
+        );
+        // The user's own subset survives: what they included stays in, and a key
+        // they never included is not resurrected by the migration.
+        assert!(
+            settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("exposure")
+        );
+        assert!(
+            settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("contrast")
+        );
+        assert!(
+            !settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("masks"),
+            "a key the user deliberately left out must not be added back"
+        );
+    }
+
+    /// Non-vacuity for the test above: the migration's "on by default" filter is
+    /// what adds the marker, so a key that IS off by default is not added.
+    #[test]
+    fn an_off_by_default_key_is_not_auto_included_by_the_migration() {
+        let mut settings: AppSettings = serde_json::from_value(json!({
+            "copyPasteSettings": {
+                "mode": "merge",
+                "includedAdjustments": [],
+                "knownAdjustments": all_available_adjustments()
+                    .into_iter()
+                    .filter(|key| key != "xmpProfile" && key != "guidedPerspective")
+                    .collect::<Vec<String>>(),
+                "autoSync": false,
+            }
+        }))
+        .expect("settings must deserialize");
+
+        assert!(migrate_copy_paste_settings(&mut settings));
+
+        let included = &settings.copy_paste_settings.included_adjustments;
+        assert!(
+            included.contains("xmpProfile"),
+            "the on-by-default marker is added: {included:?}"
+        );
+        assert!(
+            !included.contains("guidedPerspective"),
+            "an off-by-default key is never auto-included by the migration: {included:?}"
+        );
+
+        // Both are recorded as known regardless of the default, so re-running the
+        // migration changes nothing.
+        let known = &settings.copy_paste_settings.known_adjustments;
+        assert!(known.contains("xmpProfile") && known.contains("guidedPerspective"));
+        assert!(
+            !migrate_copy_paste_settings(&mut settings),
+            "a second migration has nothing left to do"
+        );
+    }
+
+    /// 6C4-R2: a marker the user deliberately UNCHECKED is never resurrected.
+    ///
+    /// `xmpProfile` is already KNOWN (so it is not a new feature the migration
+    /// would introduce) but is absent from the user's included set. The migration
+    /// must leave that set exactly as it is.
+    ///
+    /// Non-vacuity: had the migration inserted every key present in
+    /// `known_adjustments`, or matched against `included_adjustments` instead of
+    /// `known_adjustments`, the marker would reappear here and both assertions
+    /// would fail.
+    #[test]
+    fn a_known_but_unchecked_on_by_default_key_is_not_resurrected() {
+        let mut settings: AppSettings = serde_json::from_value(json!({
+            "copyPasteSettings": {
+                "mode": "merge",
+                "includedAdjustments": ["exposure", "contrast", "saturation"],
+                "knownAdjustments": all_available_adjustments(),
+                "autoSync": false,
+            }
+        }))
+        .expect("settings must deserialize");
+
+        // Precondition: the marker is known, on by default, and NOT included.
+        assert!(
+            settings
+                .copy_paste_settings
+                .known_adjustments
+                .contains("xmpProfile")
+        );
+        assert!(
+            !settings
+                .copy_paste_settings
+                .included_adjustments
+                .contains("xmpProfile")
+        );
+
+        let before = settings.copy_paste_settings.included_adjustments.clone();
+
+        assert!(
+            !migrate_copy_paste_settings(&mut settings),
+            "a file that already knows every key has nothing for the migration to do"
+        );
+
+        let after = &settings.copy_paste_settings.included_adjustments;
+        assert!(
+            !after.contains("xmpProfile"),
+            "a deliberately unchecked, on-by-default key must never be resurrected: {after:?}"
+        );
+        assert_eq!(
+            after, &before,
+            "includedAdjustments must be otherwise unchanged: {after:?}"
         );
     }
 }

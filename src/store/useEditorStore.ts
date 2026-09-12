@@ -115,6 +115,12 @@ interface EditorState {
   copiedSectionAdjustments: any | null;
   copiedMask: MaskContainer | null;
   copiedAdjustments: Adjustments | null;
+  /**
+   * The profile half of the clipboard. Kept beside `copiedAdjustments` rather
+   * than folded into it: `'xmpProfile'` is a copy/paste marker, never a key of
+   * `adjustments`, so the profile travels in a side-channel of its own.
+   */
+  copiedDevelopProfile: DevelopProfileProjection | null;
 
   // Actions
   setEditor: (updater: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void;
@@ -170,6 +176,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   copiedMask: null,
   brushSettings: { size: 50, feather: 50, tool: ToolType.Brush },
   copiedAdjustments: null,
+  copiedDevelopProfile: null,
 
   isGeneratingAiMask: false,
   isAIConnectorConnected: false,

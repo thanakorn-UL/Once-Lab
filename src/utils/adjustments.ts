@@ -886,6 +886,12 @@ export const ADJUSTMENT_GROUPS: Record<string, AdjustmentGroup[]> = {
     },
   ],
   masks: [{ label: 'modals.copyPaste.groups.masks', keys: ['masks'] }],
+  // The XMP develop profile is a copy/paste category of its own. `'xmpProfile'`
+  // is a MARKER in this key list — it is never a property of `adjustments`, and
+  // no loop may look for it there. Reusing `ui.xmpProfile.label` keeps the group
+  // label translated without a new i18n key; the section header falls back to the
+  // modal's capitalized section name.
+  profile: [{ label: 'ui.xmpProfile.label', keys: ['xmpProfile'] }],
 };
 
 export const COPYABLE_ADJUSTMENT_KEYS: string[] = Object.values(ADJUSTMENT_GROUPS)

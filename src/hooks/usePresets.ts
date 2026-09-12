@@ -229,7 +229,13 @@ export function usePresets(currentAdjustments: Adjustments) {
         for (const key of COPYABLE_ADJUSTMENT_KEYS) {
           if (!includeMasks && MASK_KEYS.includes(key)) continue;
           if (!includeCropTransform && GEOMETRY_KEYS.includes(key)) continue;
-          if (newAdjustments[key] === undefined) {
+          // Only the keys the defaults actually define are filled in. The
+          // copy/paste key list also carries marker entries (a copy/paste
+          // category that is not stored in `adjustments`), and inventing such a
+          // key here would put it into the editor's `adjustments` when the preset
+          // is applied. Every real adjustment key is present in the defaults, so
+          // this changes nothing else.
+          if (newAdjustments[key] === undefined && Object.prototype.hasOwnProperty.call(INITIAL_ADJUSTMENTS, key)) {
             newAdjustments[key] = INITIAL_ADJUSTMENTS[key as keyof Adjustments];
           }
         }

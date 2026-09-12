@@ -15,6 +15,14 @@ import {
   normalizeLoadedAdjustments,
 } from '../utils/adjustments';
 import { calculateCenteredCrop } from '../utils/cropUtils';
+import {
+  PROFILE_PROJECTION_NONE,
+  developStateFromProfileFields,
+  profileProjectionFromRestore,
+  profileProjectionsEqual,
+  type DevelopProfileProjection,
+  type DevelopProfileRestore,
+} from '../utils/developState';
 import { Invokes } from '../components/ui/AppProperties';
 import { globalImageCache } from '../utils/ImageLRUCache';
 
@@ -247,12 +255,17 @@ export function useEditorActions() {
     const { selectedImage, adjustments } = useEditorStore.getState();
     const { libraryActivePath, multiSelectedPaths } = useLibraryStore.getState();
     let sourceAdjustments: any = null;
+    // The profile half of the clipboard. Copy is read-only, and the include /
+    // exclude decision is a PASTE-time concern exactly as it is for every key.
+    let sourceProfile: DevelopProfileProjection = PROFILE_PROJECTION_NONE;
 
     const pathToCopyFrom =
       pathOverride || (selectedImage ? selectedImage.path : libraryActivePath || multiSelectedPaths[0]);
 
     if (selectedImage && pathToCopyFrom === selectedImage.path) {
       sourceAdjustments = adjustments;
+      // The open image's profile is already in the store; no extra round trip.
+      sourceProfile = useEditorStore.getState().xmpProfile;
     } else if (pathToCopyFrom) {
       try {
         const meta: any = await invoke(Invokes.LoadMetadata, { path: pathToCopyFrom });
@@ -261,6 +274,13 @@ export function useEditorActions() {
         } else {
           sourceAdjustments = INITIAL_ADJUSTMENTS;
         }
+
+        // A source that is not the open image has no store projection, so its
+        // profile comes from the same restore command 6C2's reload resolves with.
+        const restore = await invoke<DevelopProfileRestore>(Invokes.ResolveImageDevelopProfile, {
+          path: pathToCopyFrom,
+        });
+        sourceProfile = profileProjectionFromRestore(restore);
       } catch (err) {
         toast.error(`Failed to load metadata for copying: ${err}`);
         return;
@@ -272,11 +292,14 @@ export function useEditorActions() {
     const adjustmentsToCopy: any = {};
 
     for (const key of COPYABLE_ADJUSTMENT_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(sourceAdjustments, key)) {
+      if (
+        Object.prototype.hasOwnProperty.call(sourceAdjustments, key) &&
+        Object.prototype.hasOwnProperty.call(INITIAL_ADJUSTMENTS, key)
+      ) {
         adjustmentsToCopy[key] = structuredClone(sourceAdjustments[key]);
       }
     }
-    useEditorStore.getState().setEditor({ copiedAdjustments: adjustmentsToCopy });
+    useEditorStore.getState().setEditor({ copiedAdjustments: adjustmentsToCopy, copiedDevelopProfile: sourceProfile });
     useProcessStore.getState().setProcess({ isCopied: true });
   }, []);
 
@@ -311,7 +334,31 @@ export function useEditorActions() {
         }
       }
 
-      if (Object.keys(adjustmentsToApply).length === 0) {
+      // The profile is a copy/paste category of its own: `'xmpProfile'` is a
+      // MARKER in `includedAdjustments` and is never a property of `adjustments`,
+      // so the delta above can never carry it. R5: Merge applies the copied
+      // profile only when something was actually copied (status other than
+      // `none`); Replace always applies, including a clear.
+      const includesProfile = includedAdjustments.includes('xmpProfile');
+      const copiedProfile = useEditorStore.getState().copiedDevelopProfile;
+      const shouldWriteProfile =
+        includesProfile && copiedProfile !== null && (mode !== PasteMode.Merge || copiedProfile.status !== 'none');
+      const profilePayload =
+        shouldWriteProfile && copiedProfile
+          ? developStateFromProfileFields({
+              path: copiedProfile.path,
+              name: copiedProfile.name,
+              uuid: copiedProfile.uuid,
+              amountPercent: copiedProfile.amountPercent,
+            }).profile
+          : undefined; // undefined = do not touch any target's profile
+
+      const hasAdjustmentsDelta = Object.keys(adjustmentsToApply).length > 0;
+
+      // A paste may now change ONLY the profile, so the empty-delta early return
+      // may not skip the profile write. It still means "nothing was written" when
+      // neither half has anything to do.
+      if (!hasAdjustmentsDelta && !shouldWriteProfile) {
         setProcess({ isPasted: true });
         return;
       }
@@ -322,26 +369,60 @@ export function useEditorActions() {
 
       pathsToUpdate.forEach((p) => globalImageCache.delete(p));
 
-      if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
+      // The open image's profile is driven through the transaction owner below,
+      // never by a batch write, so its own call never carries a profile change.
+      // Its adjustments still go through the backend (the lens database resolves
+      // there) and are read back afterwards.
+      const openImagePath = selectedImage && pathsToUpdate.includes(selectedImage.path) ? selectedImage.path : null;
+      const profileTargets = openImagePath ? pathsToUpdate.filter((p) => p !== openImagePath) : pathsToUpdate;
+
+      if (hasAdjustmentsDelta && openImagePath) {
         setAdjustments({ ...adjustments, ...adjustmentsToApply });
       }
 
-      invoke(Invokes.ApplyAdjustmentsToPaths, { paths: pathsToUpdate, adjustments: adjustmentsToApply })
-        .then(() => {
-          if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
-            invoke('load_metadata', { path: selectedImage.path }).then((meta: any) => {
-              if (meta.adjustments) {
-                setAdjustments((prev: any) => ({
-                  ...prev,
-                  lensMaker: meta.adjustments.lensMaker,
-                  lensModel: meta.adjustments.lensModel,
-                  lensDistortionParams: meta.adjustments.lensDistortionParams,
-                }));
-              }
-            });
-          }
+      // The open image's adjustments must go through the backend too (that is where
+      // the lens database resolves `lensDistortionParams`), and the resolved values
+      // are read back into the store below. It is kept in its OWN call so the two
+      // writes never share a path: disjoint sets cannot race, and every target is
+      // still written exactly once.
+      if (hasAdjustmentsDelta && openImagePath) {
+        invoke(Invokes.ApplyDevelopStateToPaths, {
+          paths: [openImagePath],
+          adjustments: adjustmentsToApply,
+          profile: { action: 'keep' },
         })
-        .catch((err) => toast.error(`Failed to paste adjustments: ${err}`));
+          .then(() => {
+            invoke('load_metadata', { path: openImagePath }).then((meta: any) => {
+              if (!meta.adjustments) return;
+              setAdjustments((prev: any) => ({
+                ...prev,
+                lensMaker: meta.adjustments.lensMaker,
+                lensModel: meta.adjustments.lensModel,
+                lensDistortionParams: meta.adjustments.lensDistortionParams,
+              }));
+            });
+          })
+          .catch((err) => toast.error(`Failed to paste adjustments: ${err}`));
+      }
+
+      // The other targets get the adjustments and the profile in ONE write.
+      if (profileTargets.length > 0) {
+        invoke(Invokes.ApplyDevelopStateToPaths, {
+          paths: profileTargets,
+          adjustments: hasAdjustmentsDelta ? adjustmentsToApply : null,
+          profile: shouldWriteProfile ? { action: 'set', profile: profilePayload } : { action: 'keep' },
+        }).catch((err) => console.error('Failed to paste develop state to the selection:', err));
+      }
+
+      if (shouldWriteProfile && openImagePath && copiedProfile) {
+        // Never `setEditor({ xmpProfile })`: the single transaction owner drives
+        // the reload and persists the committed profile once on success. An
+        // unchanged projection needs no reload at all. `copiedProfile` already IS
+        // a `DevelopProfileProjection`, so it is passed straight through.
+        if (!profileProjectionsEqual(useEditorStore.getState().xmpProfile, copiedProfile)) {
+          useEditorStore.getState().requestProfileTransaction(copiedProfile);
+        }
+      }
 
       setProcess({ isPasted: true });
     },
