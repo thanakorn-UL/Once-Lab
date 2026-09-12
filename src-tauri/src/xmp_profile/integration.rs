@@ -4,8 +4,18 @@
 //! [`XmpRgbProfile`] as data. Application happens on the developed
 //! `Intermediate::ThreeColor` buffer, whose values are LINEAR sRGB / D65, which
 //! is exactly the domain of the Adobe RGBTable renderer.
+//!
+//! The stage order is the one the DNG SDK uses (`dng_render.cpp`: HueSatMap ->
+//! **LookTable** -> tone curve -> **RGBTables**):
+//!
+//! ```text
+//! linear sRGB D65
+//!   -> LookTable stage   (only when the profile authors one)
+//!   -> RGBTable stage
+//! ```
 
 use super::apply::RgbTableApplyContext;
+use super::look_table_apply::LookTableApplyContext;
 use crate::xmp_profile::XmpRgbProfile;
 
 /// Resolves the runtime RGBTable amount for `profile`.
@@ -55,7 +65,9 @@ pub(crate) fn effective_profile_amount(
 /// Applies `profile` to every pixel in place, honouring an optional Amount control.
 ///
 /// `ui_percent` is the raw slider value; the authored amount, the table bounds
-/// and the scaling all stay owned by the backend.
+/// and the scaling all stay owned by the backend. The Amount control scales only
+/// the RGBTable amount: a LookTable is always applied at its fixed full strength,
+/// because its version-1 format carries no authored amount.
 pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -63,10 +75,24 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
 ) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
-    let context = RgbTableApplyContext::new(&profile.table, amount)?;
+    // Both stage contexts are built - and therefore fully validated, with the
+    // amount resolved - before the first pixel is touched, so an invalid profile
+    // or amount can never leave the image partially processed.
+    let rgb_context = RgbTableApplyContext::new(&profile.table, amount)?;
+    let look_context = match &profile.look_table {
+        Some(table) => Some(LookTableApplyContext::new(table)?),
+        None => None,
+    };
 
     for pixel in pixels.iter_mut() {
-        *pixel = context.apply(*pixel)?;
+        // LookTable first, then RGBTable, matching `dng_render.cpp`. Without a
+        // LookTable the first stage is a strict no-op.
+        let staged = match &look_context {
+            Some(context) => context.apply(*pixel)?,
+            None => *pixel,
+        };
+
+        *pixel = rgb_context.apply(staged)?;
     }
 
     Ok(())
@@ -111,6 +137,18 @@ mod acceptance {
     /// over a radius of 2 pixels, so clamping one pixel can legitimately shift the
     /// finished render of anything within five pixels of it.
     const ENHANCEMENT_RADIUS: i32 = 5;
+
+    /// Probes for the Fe acceptance render: the same spans the unit-test renderer
+    /// probes use - black, white, mid grey, a saturated warm pixel and a saturated
+    /// cool pixel. They are printed verbatim, so the profile's real per-pixel
+    /// effect becomes durable evidence instead of an inferred claim.
+    const FE_PROBES: [[f32; 3]; 5] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.18, 0.18, 0.18],
+        [0.6, 0.2, 0.1],
+        [0.1, 0.5, 0.9],
+    ];
 
     fn stats(image: &image::DynamicImage) -> (f64, f64, f64, [u8; 3]) {
         let rgb = image.to_rgb8();
@@ -657,13 +695,215 @@ mod acceptance {
             );
         }
     }
+
+    /// Real-profile acceptance for the Fe-class grayscale/LookTable profile
+    /// (`Fe ⛏.xmp`): records its parsed shape, prints representative renderer
+    /// probes, and runs the real NEF through the full loader.
+    ///
+    /// Milestone 5A asks for real-profile acceptance that records the name,
+    /// group, uuid, grayscale flag, table types, dimensions, `supports_amount`,
+    /// representative output probes and a full NEF render when compatible. This
+    /// test is that evidence for Fe; it deliberately mirrors the structure of
+    /// [`real_profile_acceptance`] above, including its untracked-fixture skip.
+    #[test]
+    fn real_fe_profile_acceptance() {
+        // The fixture directory is UNTRACKED, so a clean checkout has to skip
+        // this test instead of failing the suite. Nothing may run before this
+        // guard: canonicalizing the missing directory would panic.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../raw-filewithxmp-profile");
+
+        if !fixture.is_dir() {
+            eprintln!("FE SKIPPED: {} is missing", fixture.display());
+            return;
+        }
+
+        // The directory is known to exist, so canonicalizing it (the usual
+        // `expect`) is safe from here on.
+        let dir = fixture.canonicalize().expect("acceptance directory");
+        let nef = dir.join("TLP_8278.NEF");
+        if !nef.exists() {
+            eprintln!("FE SKIPPED: {} missing", nef.display());
+            return;
+        }
+
+        // The profile lives in the same untracked directory: a partial fixture
+        // has to skip for exactly the same reason a missing NEF does.
+        let profile_file = dir.join("Fe ⛏.xmp");
+        if !profile_file.exists() {
+            eprintln!("FE SKIPPED: {} missing", profile_file.display());
+            return;
+        }
+
+        let profile = crate::xmp_profile::load_xmp_rgb_profile_from_path(&profile_file)
+            .expect("load Fe profile");
+
+        // ----------------------------------------------------------------
+        // 1. Metadata recording. One machine-readable line captures everything
+        // the milestone asks for, and the parsed shape is then pinned with hard
+        // assertions: if the real fixture ever changes, this must FAIL loudly
+        // rather than quietly relax.
+        // ----------------------------------------------------------------
+        assert!(profile.convert_to_grayscale, "Fe is a monochrome profile");
+        assert!(profile.supports_amount, "Fe declares SupportsAmount");
+        assert_eq!(profile.rgb_table_amount, None, "Fe authors no RGBTableAmount");
+
+        let look_table = profile.look_table.as_ref().expect("Fe authors a LookTable");
+
+        println!(
+            "FE|meta|name={}|group={:?}|uuid={}|process_version={:?}|convert_to_grayscale={}|supports_amount={}|rgb_table_amount={:?}|rgb_size={}|rgb_values={}|rgb_color_space={}|rgb_gamma={}|rgb_gamut={}|rgb_min_amount={}|rgb_max_amount={}|look_hue_divisions={}|look_sat_divisions={}|look_val_divisions={}|look_encoding={}|look_entries={}",
+            profile.name,
+            profile.group,
+            profile.uuid,
+            profile.process_version,
+            profile.convert_to_grayscale,
+            profile.supports_amount,
+            profile.rgb_table_amount,
+            profile.table.size,
+            profile.table.values.len(),
+            profile.table.color_space,
+            profile.table.gamma,
+            profile.table.gamut,
+            profile.table.min_amount,
+            profile.table.max_amount,
+            look_table.hue_divisions,
+            look_table.sat_divisions,
+            look_table.val_divisions,
+            look_table.encoding,
+            look_table.entries.len(),
+        );
+
+        // The measured real values, pinned exactly. A silently "loosened"
+        // assertion would hide a parse regression, so a change here is a
+        // failure, never a reason to widen a bound.
+        assert_eq!(look_table.hue_divisions, 36, "Fe LookTable hue divisions");
+        assert_eq!(look_table.sat_divisions, 16, "Fe LookTable sat divisions");
+        assert_eq!(look_table.val_divisions, 16, "Fe LookTable val divisions");
+        assert_eq!(
+            look_table.encoding, 0,
+            "Fe LookTable encoding must be Linear (0)"
+        );
+        assert_eq!(
+            look_table.entries.len(),
+            36 * 16 * 16,
+            "Fe LookTable must carry one entry per 36x16x16 cell"
+        );
+        assert_eq!(profile.table.size, 32, "Fe RGBTable must be 32^3");
+        assert_eq!(
+            profile.table.values.len(),
+            32 * 32 * 32,
+            "Fe RGBTable must carry one entry per 32^3 node"
+        );
+        assert_eq!(
+            profile.table.color_space, 0,
+            "Fe RGBTable color space must be 0 (sRGB)"
+        );
+        assert_eq!(profile.table.gamma, 1, "Fe RGBTable gamma must be 1 (linear)");
+        assert_eq!(profile.table.gamut, 0, "Fe RGBTable gamut must be 0 (sRGB)");
+
+        // ----------------------------------------------------------------
+        // 2. Representative output probes. The renderer runs once over the
+        // fixed probe pixels; every result is printed, must be finite, must
+        // actually differ from its input somewhere (a no-op LookTable+RGBTable
+        // render would prove nothing), and must NOT be forced to neutral grey:
+        // per ruling 5A-R1 `convert_to_grayscale` is deliberately NOT a render
+        // step, so Fe has to render its real colour look.
+        // ----------------------------------------------------------------
+        let mut pixels = FE_PROBES.to_vec();
+        crate::xmp_profile::apply_profile_to_three_color_pixels(&mut pixels, &profile)
+            .expect("render Fe");
+
+        let mut changed = false;
+        let mut stayed_chromatic = false;
+        for (index, (input, output)) in FE_PROBES.iter().zip(pixels.iter()).enumerate() {
+            println!("FE|probe|{index}|in={input:?}|out={output:?}");
+
+            for channel in output {
+                assert!(
+                    channel.is_finite(),
+                    "Fe render produced a non-finite pixel: {output:?}"
+                );
+            }
+
+            let worst_channel = (0..3)
+                .map(|channel| (output[channel] - input[channel]).abs())
+                .fold(0.0f32, f32::max);
+            if worst_channel > MEANINGFUL_DEVIATION {
+                changed = true;
+            }
+
+            let spread = output[0].max(output[1]).max(output[2])
+                - output[0].min(output[1]).min(output[2]);
+            if spread > MEANINGFUL_DEVIATION {
+                stayed_chromatic = true;
+            }
+        }
+
+        assert!(
+            changed,
+            "the Fe render must change at least one probe by more than {MEANINGFUL_DEVIATION}, otherwise the profile is indistinguishable from a no-op"
+        );
+        assert!(
+            stayed_chromatic,
+            "per 5A-R1 the grayscale flag is not a render step: at least one Fe probe must stay chromatic (max channel spread > {MEANINGFUL_DEVIATION})"
+        );
+
+        // ----------------------------------------------------------------
+        // 3. Full NEF render. Fe runs through the real loader end to end,
+        // exactly like the Au/Cu acceptance above, and must visibly change the
+        // picture versus the no-profile baseline. The baseline render is the
+        // only other full render this test performs.
+        // ----------------------------------------------------------------
+        let bytes = std::fs::read(&nef).expect("read NEF");
+        let settings = AppSettings::default();
+        let path_str = nef.to_string_lossy().to_string();
+
+        let baseline = crate::image_loader::load_base_image_from_bytes_with_xmp_profile(
+            &bytes, &path_str, false, &settings, None, None, None,
+        )
+        .expect("baseline develop");
+
+        let start = Instant::now();
+        let rendered = crate::image_loader::load_base_image_from_bytes_with_xmp_profile(
+            &bytes,
+            &path_str,
+            false,
+            &settings,
+            Some(profile_file.as_path()),
+            None,
+            None,
+        )
+        .expect("Fe NEF develop");
+        let elapsed = start.elapsed();
+
+        let (r, g, b, c) = stats(&rendered);
+        let (br, bg, bb, bc) = stats(&baseline);
+        let finite = raw_f32(&rendered)
+            .iter()
+            .all(|pixel| pixel.iter().all(|channel| channel.is_finite()));
+        let delta = max_delta(&rendered, &baseline);
+
+        println!(
+            "FE|nef|ok=true|center={:?}|mean=[{:.6},{:.6},{:.6}]|baseline_center={:?}|baseline_mean=[{:.6},{:.6},{:.6}]|finite={}|ms={}|max_delta_vs_baseline={}",
+            c, r, g, b, bc, br, bg, bb, finite, elapsed.as_millis(), delta
+        );
+
+        assert!(finite, "the Fe NEF render must be finite at every pixel");
+        assert!(
+            delta > MEANINGFUL_DEVIATION,
+            "Fe must actually change the NEF render: max raw-float delta vs the no-profile baseline was only {delta}, not more than {MEANINGFUL_DEVIATION}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::xmp_profile::RgbTable;
     use crate::xmp_profile::apply_rgb_table;
+    use crate::xmp_profile::look_table::LookTable;
+    use crate::xmp_profile::look_table_apply::apply_look_table;
 
     /// Non-identity: every node maps to a constant encoded value.
     const CONSTANT_2X2X2: [[f32; 3]; 8] = [[0.25, 0.5, 0.75]; 8];
@@ -697,6 +937,8 @@ mod tests {
                 min_amount,
                 max_amount,
             },
+            look_table_id: None,
+            look_table: None,
         }
     }
 
@@ -714,6 +956,426 @@ mod tests {
             (actual - expected).abs() <= tolerance,
             "{label}: expected {expected}, got {actual}"
         );
+    }
+
+    /// A deviation large enough to prove two pipelines are genuinely different
+    /// (rather than differing by float noise).
+    const MATERIAL_DIFFERENCE: f32 = 1e-2;
+
+    /// Residual tolerated for an identity LookTable composite: the ProPhoto<->sRGB
+    /// hop and the HSV round trip are not bit-exact.
+    const IDENTITY_LOOK_RESIDUAL: f32 = 1e-4;
+
+    /// Probes spanning neutrals, saturated colours and the corners.
+    const PROBES: [[f32; 3]; 5] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.18, 0.18, 0.18],
+        [0.6, 0.2, 0.1],
+        [0.1, 0.5, 0.9],
+    ];
+
+    fn make_look_table(hue: u32, sat: u32, val: u32, entries: Vec<[f32; 3]>) -> LookTable {
+        LookTable {
+            hue_divisions: hue,
+            sat_divisions: sat,
+            val_divisions: val,
+            entries,
+            encoding: 0,
+            flags: None,
+        }
+    }
+
+    /// A constant LookTable: every cell applies the same modification.
+    fn constant_look_table(entry: [f32; 3]) -> LookTable {
+        make_look_table(1, 2, 1, vec![entry; 2])
+    }
+
+    /// Programmatic identity RGBTable: node (r,g,b) maps to [r,g,b].
+    fn identity_rgb_table() -> RgbTable {
+        let mut values = Vec::with_capacity(8);
+        for r in 0..2 {
+            for g in 0..2 {
+                for b in 0..2 {
+                    values.push([r as f32, g as f32, b as f32]);
+                }
+            }
+        }
+        RgbTable {
+            size: 2,
+            values,
+            color_space: 0,
+            gamma: 1,
+            gamut: 0,
+            min_amount: 0.0,
+            max_amount: 1.0,
+        }
+    }
+
+    /// Channel-swapping RGBTable: node (r,g,b) maps to [b,g,r]. A linear but
+    /// non-trivial map, which does not commute with a hue rotation.
+    fn channel_swap_rgb_table() -> RgbTable {
+        let mut values = Vec::with_capacity(8);
+        for r in 0..2 {
+            for g in 0..2 {
+                for b in 0..2 {
+                    values.push([b as f32, g as f32, r as f32]);
+                }
+            }
+        }
+        RgbTable {
+            size: 2,
+            values,
+            color_space: 0,
+            gamma: 1,
+            gamut: 0,
+            min_amount: 0.0,
+            max_amount: 1.0,
+        }
+    }
+
+    fn profile_with_look_table(table: RgbTable, look_table: LookTable) -> XmpRgbProfile {
+        XmpRgbProfile {
+            name: "Look Profile".to_string(),
+            group: None,
+            uuid: "LOOKUUID".to_string(),
+            process_version: None,
+            supports_amount: true,
+            convert_to_grayscale: false,
+            rgb_table_id: "RGBTABLEID".to_string(),
+            rgb_table_amount: None,
+            table,
+            look_table_id: Some("LOOKTABLEID".to_string()),
+            look_table: Some(look_table),
+        }
+    }
+
+    fn max_channel_delta(a: [f32; 3], b: [f32; 3]) -> f32 {
+        (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0f32, f32::max)
+    }
+
+    // ------------------------------------------------------------ stage order
+
+    /// The single most important test of this milestone: the LookTable stage
+    /// runs BEFORE the RGBTable stage, and the opposite order genuinely differs.
+    #[test]
+    fn look_table_is_applied_before_the_rgb_table() {
+        let look = constant_look_table([60.0, 1.0, 1.0]); // +60 deg hue rotation
+        let rgb = channel_swap_rgb_table();
+        let profile = profile_with_look_table(rgb.clone(), look.clone());
+        let amount = profile.rgb_table_amount.unwrap_or(1.0);
+
+        let input = [0.6f32, 0.2, 0.1];
+
+        let look_context = LookTableApplyContext::new(&look).expect("look context");
+        let rgb_context = RgbTableApplyContext::new(&rgb, amount).expect("rgb context");
+
+        let after_look = look_context.apply(input).expect("look apply");
+        let look_first = rgb_context.apply(after_look).expect("rgb apply");
+
+        let after_rgb = rgb_context.apply(input).expect("rgb apply");
+        let rgb_first = apply_look_table(after_rgb, &look).expect("look apply");
+
+        // Non-vacuity: the two stage orders must differ by a material amount,
+        // otherwise the ordered assertion below would hold for EITHER order.
+        let order_gap = max_channel_delta(look_first, rgb_first);
+        assert!(
+            order_gap > MATERIAL_DIFFERENCE,
+            "the two stage orders must produce materially different results, but the max \
+             channel delta was only {order_gap} (look_first={look_first:?}, rgb_first={rgb_first:?})"
+        );
+
+        // Non-vacuity: each stage must actually change the probe, so the gap is
+        // not simply two different no-ops.
+        assert!(
+            max_channel_delta(after_look, input) > MATERIAL_DIFFERENCE,
+            "the LookTable stage must change the probe, got {after_look:?}"
+        );
+        assert!(
+            max_channel_delta(after_rgb, input) > MATERIAL_DIFFERENCE,
+            "the RGBTable stage must change the probe, got {after_rgb:?}"
+        );
+
+        // The renderer must produce the LookTable-first result...
+        let mut pixels = vec![input];
+        apply_profile_to_three_color_pixels(&mut pixels, &profile).expect("render");
+
+        for channel in 0..3 {
+            assert_close(
+                pixels[0][channel],
+                look_first[channel],
+                1e-7,
+                &format!("look-first channel {channel}"),
+            );
+        }
+
+        // ...and demonstrably NOT the reversed one.
+        assert!(
+            max_channel_delta(pixels[0], rgb_first) > MATERIAL_DIFFERENCE,
+            "the renderer must not produce the RGBTable-before-LookTable result: render={:?} \
+             rgb_first={rgb_first:?}",
+            pixels[0]
+        );
+    }
+
+    #[test]
+    fn identity_look_table_is_a_near_no_op_through_the_renderer() {
+        let profile = profile_with_look_table(
+            identity_rgb_table(),
+            constant_look_table([0.0, 1.0, 1.0]),
+        );
+
+        for probe in PROBES {
+            let mut pixels = vec![probe];
+            apply_profile_to_three_color_pixels(&mut pixels, &profile).expect("render");
+            assert_close(
+                pixels[0][0],
+                probe[0],
+                IDENTITY_LOOK_RESIDUAL,
+                &format!("identity composite {probe:?} red"),
+            );
+            for channel in 0..3 {
+                assert!(
+                    (pixels[0][channel] - probe[channel]).abs() < IDENTITY_LOOK_RESIDUAL,
+                    "identity composite {probe:?} channel {channel} drifted: got {:?}",
+                    pixels[0]
+                );
+            }
+        }
+
+        // Non-vacuity: a non-identity LookTable moves the same probes far more
+        // than the identity residual, so the assertions above are not vacuous.
+        let changed =
+            profile_with_look_table(identity_rgb_table(), constant_look_table([0.0, 1.0, 1.5]));
+        let probe = [0.18f32, 0.18, 0.18];
+        let mut pixels = vec![probe];
+        apply_profile_to_three_color_pixels(&mut pixels, &changed).expect("render");
+        assert!(
+            max_channel_delta(pixels[0], probe) > IDENTITY_LOOK_RESIDUAL,
+            "a valScale=1.5 LookTable must move the neutral probe, got {:?}",
+            pixels[0]
+        );
+    }
+
+    #[test]
+    fn invalid_look_table_does_not_partially_mutate_pixels() {
+        // A valid RGBTable but an unsupported LookTable encoding: the profile must
+        // be rejected before the first pixel is touched, exactly like a bad table.
+        let mut look = constant_look_table([10.0, 1.0, 1.0]);
+        look.encoding = 7;
+        let profile = profile_with_look_table(channel_swap_rgb_table(), look);
+
+        let mut pixels = amount_mutation_pixels();
+        let original = pixels.clone();
+
+        let error = apply_profile_to_three_color_pixels(&mut pixels, &profile)
+            .expect_err("an unsupported LookTable encoding must be rejected");
+        assert_eq!(error, "unsupported LookTable encoding: 7");
+        assert_eq!(
+            pixels, original,
+            "pixels must be untouched when the LookTable is invalid"
+        );
+    }
+
+    #[test]
+    fn amount_scales_only_the_rgb_table_not_the_look_table() {
+        // A LookTable has no authored amount, so the Amount control must not scale
+        // it: at 0% the RGBTable collapses to identity while the look remains.
+        let look = constant_look_table([60.0, 1.0, 1.0]);
+        let profile = profile_with_look_table(identity_rgb_table(), look.clone());
+        let probe = [0.6f32, 0.2, 0.1];
+
+        let look_only =
+            LookTableApplyContext::new(&look).expect("look context").apply(probe).expect("apply");
+
+        let mut pixels = vec![probe];
+        apply_profile_to_three_color_pixels_with_amount(&mut pixels, &profile, Some(0.0))
+            .expect("0% render");
+
+        for channel in 0..3 {
+            assert_close(
+                pixels[0][channel],
+                look_only[channel],
+                1e-5,
+                &format!("look-only channel {channel}"),
+            );
+        }
+
+        // Non-vacuity: the LookTable genuinely moved the probe, so the equality
+        // above is not the trivial "both are the identity".
+        assert!(
+            max_channel_delta(look_only, probe) > MATERIAL_DIFFERENCE,
+            "the LookTable must move the probe, got {look_only:?}"
+        );
+    }
+
+    #[test]
+    fn convert_to_grayscale_does_not_change_the_render() {
+        // Per ruling 5A-R1 the flag is carried, never rendered: a grayscale
+        // profile must render bit-for-bit like its color twin.
+        let rgb = RgbTable {
+            size: 2,
+            values: CONSTANT_2X2X2.to_vec(),
+            color_space: 0,
+            gamma: 1,
+            gamut: 0,
+            min_amount: 0.0,
+            max_amount: 1.0,
+        };
+        let look = constant_look_table([45.0, 1.2, 1.0]);
+
+        let mut grayscale = profile_with_look_table(rgb.clone(), look.clone());
+        grayscale.convert_to_grayscale = true;
+        let mut color = profile_with_look_table(rgb, look);
+        color.convert_to_grayscale = false;
+
+        let mut saw_change = false;
+        for probe in PROBES {
+            let mut gray_pixels = vec![probe];
+            let mut color_pixels = vec![probe];
+
+            apply_profile_to_three_color_pixels(&mut gray_pixels, &grayscale).expect("gray render");
+            apply_profile_to_three_color_pixels(&mut color_pixels, &color).expect("color render");
+
+            for channel in 0..3 {
+                assert!(
+                    gray_pixels[0][channel].is_finite(),
+                    "grayscale render must be finite, got {:?}",
+                    gray_pixels[0]
+                );
+                assert_eq!(
+                    gray_pixels[0][channel], color_pixels[0][channel],
+                    "ConvertToGrayscale must not alter rendering (probe {probe:?} channel {channel})"
+                );
+            }
+
+            if max_channel_delta(gray_pixels[0], probe) > MATERIAL_DIFFERENCE {
+                saw_change = true;
+            }
+        }
+
+        // Non-vacuity: the profile must actually change at least one probe,
+        // otherwise "gray == color" would hold for an inert profile.
+        assert!(
+            saw_change,
+            "the test profile must visibly change at least one probe"
+        );
+    }
+
+    #[test]
+    fn fe_class_profile_defaults_amount_to_one() {
+        // Fe declares SupportsAmount="True" but authors no crs:RGBTableAmount, so
+        // the `unwrap_or(1.0)` default applies and the control stays meaningful.
+        let mut fe = profile_with_look_table(
+            identity_rgb_table(),
+            constant_look_table([0.0, 1.0, 1.0]),
+        );
+        fe.supports_amount = true;
+        fe.rgb_table_amount = None;
+
+        assert_eq!(effective_profile_amount(&fe, None).unwrap(), 1.0);
+        assert_eq!(effective_profile_amount(&fe, Some(100.0)).unwrap(), 1.0);
+        // 200% of 1.0 is clamped to the table maximum (1.0).
+        assert_eq!(effective_profile_amount(&fe, Some(200.0)).unwrap(), 1.0);
+        assert_eq!(effective_profile_amount(&fe, Some(0.0)).unwrap(), 0.0);
+    }
+
+    // ------------------------------------------------ real-profile regression
+
+    fn real_profile_dir() -> Option<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../raw-filewithxmp-profile");
+        dir.is_dir().then_some(dir)
+    }
+
+    /// Au/Cu author no LookTable, so the new first stage must be a strict no-op:
+    /// the integrated renderer must match the untouched RGBTable-only primitive
+    /// to within 1e-7 on pure renderer probes.
+    #[test]
+    fn real_profiles_without_look_table_are_unchanged_by_the_look_stage() {
+        let Some(dir) = real_profile_dir() else {
+            eprintln!("REGRESSION SKIPPED: fixture directory is missing");
+            return;
+        };
+
+        for name in ["Au ⛏️.xmp", "Cu ⛏️.xmp"] {
+            let path = dir.join(name);
+            if !path.exists() {
+                eprintln!("REGRESSION SKIPPED: {} missing", path.display());
+                return;
+            }
+
+            let profile =
+                crate::xmp_profile::load_xmp_rgb_profile_from_path(&path).expect("load real profile");
+            assert!(
+                profile.look_table.is_none(),
+                "{name} must author no LookTable, otherwise this regression is meaningless"
+            );
+
+            let amount = profile.rgb_table_amount.unwrap_or(1.0);
+            let mut rendered = PROBES.to_vec();
+            apply_profile_to_three_color_pixels(&mut rendered, &profile).expect("render");
+
+            let mut max_delta = 0.0f32;
+            let mut saw_change = false;
+            for (index, probe) in PROBES.iter().enumerate() {
+                let reference =
+                    apply_rgb_table(*probe, &profile.table, amount).expect("reference apply");
+                if max_channel_delta(reference, *probe) > 1e-4 {
+                    saw_change = true;
+                }
+                max_delta = max_delta.max(max_channel_delta(rendered[index], reference));
+            }
+
+            eprintln!("REGRESSION|{name}|max_delta={max_delta}");
+
+            assert!(
+                max_delta <= 1e-7,
+                "{name}: the LookTable stage must be a no-op, but the max delta vs the \
+                 RGBTable-only render was {max_delta}"
+            );
+            assert!(
+                saw_change,
+                "{name}: the probes must exercise a visible RGBTable change"
+            );
+        }
+    }
+
+    /// The real Fe-class profile: parses with a LookTable, defaults its amount to
+    /// 1.0, and renders finitely with LookTable-then-RGBTable.
+    #[test]
+    fn real_fe_profile_renders_finitely_with_its_look_table() {
+        let Some(dir) = real_profile_dir() else {
+            eprintln!("FE SKIPPED: fixture directory is missing");
+            return;
+        };
+
+        let path = dir.join("Fe ⛏.xmp");
+        if !path.exists() {
+            eprintln!("FE SKIPPED: {} missing", path.display());
+            return;
+        }
+
+        let profile =
+            crate::xmp_profile::load_xmp_rgb_profile_from_path(&path).expect("load Fe profile");
+
+        assert!(profile.convert_to_grayscale, "Fe is a monochrome profile");
+        assert!(profile.supports_amount, "Fe declares SupportsAmount");
+        assert_eq!(profile.rgb_table_amount, None, "Fe authors no RGBTableAmount");
+        assert!(profile.look_table.is_some(), "Fe authors a LookTable");
+        assert_eq!(
+            effective_profile_amount(&profile, None).unwrap(),
+            1.0,
+            "a missing authored amount must default to 1.0"
+        );
+
+        let mut pixels = PROBES.to_vec();
+        apply_profile_to_three_color_pixels(&mut pixels, &profile).expect("render Fe");
+
+        for probe in &pixels {
+            for channel in probe {
+                assert!(channel.is_finite(), "Fe render produced a non-finite pixel: {probe:?}");
+            }
+        }
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct XmpProfileSummary {
     /// Whether the profile advertises a scalable Amount, i.e. whether the
     /// frontend should offer the control at all.
     pub supports_amount: bool,
+    /// The authored `crs:ConvertToGrayscale` flag, surfaced verbatim. Once-Lab
+    /// does not turn it into a render step, so it is presented as-is.
+    pub convert_to_grayscale: bool,
 }
 
 /// Builds the UI summary from an already-parsed profile.
@@ -28,6 +31,7 @@ pub(crate) fn summarize_xmp_profile(profile: &XmpRgbProfile, path: &Path) -> Xmp
         name: profile.name.clone(),
         path: normalize_path_string(path),
         supports_amount: profile.supports_amount,
+        convert_to_grayscale: profile.convert_to_grayscale,
     }
 }
 
@@ -121,6 +125,31 @@ mod tests {
 
             fs::remove_file(&path).expect("remove temp xmp");
         }
+    }
+
+    #[test]
+    fn profile_summary_exposes_the_monochrome_flag() {
+        let path = unique_temp_path("xmp");
+        let grayscale = named_profile_xmp().replace(
+            "crs:ConvertToGrayscale=\"False\"",
+            "crs:ConvertToGrayscale=\"True\"",
+        );
+        fs::write(&path, grayscale).expect("write temp xmp");
+
+        let summary = inspect_xmp_profile(&path.to_string_lossy()).expect("inspect");
+        assert!(
+            summary.convert_to_grayscale,
+            "a grayscale profile must report the flag through the summary"
+        );
+
+        fs::remove_file(&path).expect("remove temp xmp");
+
+        // Non-vacuity: the untouched fixture reports the flag as false.
+        let path = unique_temp_path("xmp");
+        fs::write(&path, named_profile_xmp()).expect("write temp xmp");
+        let summary = inspect_xmp_profile(&path.to_string_lossy()).expect("inspect");
+        assert!(!summary.convert_to_grayscale);
+        fs::remove_file(&path).expect("remove temp xmp");
     }
 
     #[test]

@@ -21,6 +21,7 @@ export interface XmpProfileEntry {
   uuid: string;
   path: string;
   supports_amount: boolean;
+  convert_to_grayscale: boolean;
 }
 
 /** Where a root of the library came from. */

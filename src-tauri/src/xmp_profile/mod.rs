@@ -7,8 +7,11 @@ mod default_roots;
 mod discovery;
 mod integration;
 mod loader;
+mod look_table;
+mod look_table_apply;
 mod parser;
 mod rgb_table;
+mod srgb_transfer;
 mod summary;
 
 pub(crate) use apply::apply_rgb_table;

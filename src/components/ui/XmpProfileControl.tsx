@@ -14,6 +14,7 @@ interface XmpProfileSummary {
   name: string;
   path: string;
   supports_amount: boolean;
+  convert_to_grayscale: boolean;
 }
 
 /**

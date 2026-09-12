@@ -1,6 +1,8 @@
 use flate2::{Decompress, FlushDecompress, Status};
 
-const ADOBE_BASE85_ALPHABET: &[u8; 85] =
+/// Adobe's Z85-like Base85 alphabet, verbatim from `dng_big_table.cpp`
+/// (`kEncodeTable`). `pub(super)` so the LookTable test fixtures can reuse it.
+pub(super) const ADOBE_BASE85_ALPHABET: &[u8; 85] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?`'|()[]{}@%$#";
 
 const BASE85_LOOKUP: [u8; 256] = build_base85_lookup();
@@ -18,6 +20,11 @@ const MAX_SIZE: u32 = 32;
 
 /// BigTableTypeEnum::btt_RGBTable.
 const RGB_TABLE_TYPE: u32 = 1;
+
+/// Label woven into every RGBTable error string. Kept as a named constant so the
+/// shared framing helper can be called with it and the historical
+/// `embedded RGBTable ...` messages stay byte-identical.
+const RGB_TABLE_LABEL: &str = "RGBTable";
 
 /// dng_rgb_table::kRGBTableVersion.
 const RGB_TABLE_VERSION: u32 = 1;
@@ -58,24 +65,53 @@ pub(crate) struct RgbTable {
 }
 
 pub(crate) fn decode_adobe_rgb_table(encoded: &str) -> Result<RgbTable, String> {
-    let compressed = decode_base85(encoded)?;
+    let block = decode_big_table_payload(encoded, "RGBTable", MIN_BLOCK_BYTES, MAX_BLOCK_BYTES)?;
+
+    parse_uncompressed_block(&block)
+}
+
+/// Decodes one Adobe "big table" payload into its exact decompressed byte block.
+///
+/// `crs:RGBTable` and `crs:LookTable` share byte-identical *outer* framing: the
+/// XMP attribute value is Adobe's Z85-like Base85 (5 chars -> 4 little-endian
+/// bytes) of a `[u32 LE declared length][zlib stream]` blob. Only the bytes
+/// inside the zlib stream differ, so the Base85, the length prefix, the zlib
+/// inflate and the exact-length checks live here once and are parameterised.
+///
+/// `label` is woven into every error string so a caller keeps stable, greppable
+/// messages (RGBTable passes `"RGBTable"` and therefore keeps its historical
+/// `embedded RGBTable ...` strings byte-for-byte). `min_bytes`/`max_bytes` are
+/// the caller's accepted decompressed sizes; both are checked BEFORE the output
+/// buffer is allocated or the stream is inflated, so a hostile length prefix can
+/// never drive a large allocation.
+pub(super) fn decode_big_table_payload(
+    encoded: &str,
+    label: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let compressed = decode_base85(encoded, label)?;
 
     if compressed.len() < 4 {
-        return Err(
-            "embedded RGBTable payload is shorter than its 4-byte length prefix".to_string(),
-        );
+        return Err(format!(
+            "embedded {label} payload is shorter than its 4-byte length prefix"
+        ));
     }
 
     let expected_size =
         u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
     let expected_size = expected_size as usize;
 
-    if expected_size > MAX_BLOCK_BYTES {
-        return Err("embedded RGBTable declared size exceeds supported maximum".to_string());
+    if expected_size > max_bytes {
+        return Err(format!(
+            "embedded {label} declared size exceeds supported maximum"
+        ));
     }
 
-    if expected_size < MIN_BLOCK_BYTES {
-        return Err("embedded RGBTable declared size is below the supported minimum".to_string());
+    if expected_size < min_bytes {
+        return Err(format!(
+            "embedded {label} declared size is below the supported minimum"
+        ));
     }
 
     let stream = &compressed[4..];
@@ -84,29 +120,29 @@ pub(crate) fn decode_adobe_rgb_table(encoded: &str) -> Result<RgbTable, String> 
     let mut decoder = Decompress::new(true);
     let status = decoder
         .decompress(stream, &mut block, FlushDecompress::Finish)
-        .map_err(|error| format!("failed to decompress embedded RGBTable: {error}"))?;
+        .map_err(|error| format!("failed to decompress embedded {label}: {error}"))?;
 
     if status != Status::StreamEnd {
-        return Err("embedded RGBTable zlib stream is incomplete".to_string());
+        return Err(format!("embedded {label} zlib stream is incomplete"));
     }
 
     if decoder.total_out() != expected_size as u64 {
         return Err(format!(
-            "embedded RGBTable size mismatch: length prefix declares {expected_size} bytes, decompressed {} bytes",
+            "embedded {label} size mismatch: length prefix declares {expected_size} bytes, decompressed {} bytes",
             decoder.total_out()
         ));
     }
 
     if decoder.total_in() != stream.len() as u64 {
-        return Err(
-            "embedded RGBTable payload contains trailing bytes after the zlib stream".to_string(),
-        );
+        return Err(format!(
+            "embedded {label} payload contains trailing bytes after the zlib stream"
+        ));
     }
 
-    parse_uncompressed_block(&block)
+    Ok(block)
 }
 
-fn decode_base85(encoded: &str) -> Result<Vec<u8>, String> {
+fn decode_base85(encoded: &str, label: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(encoded.len() / 5 * 4 + 4);
     let mut value: u64 = 0;
     let mut phase = 0usize;
@@ -115,7 +151,7 @@ fn decode_base85(encoded: &str) -> Result<Vec<u8>, String> {
         let digit = BASE85_LOOKUP[byte as usize];
         if digit == INVALID_BASE85_DIGIT {
             return Err(format!(
-                "invalid Adobe Base85 character '{}' in embedded RGBTable",
+                "invalid Adobe Base85 character '{}' in embedded {label}",
                 char::from(byte)
             ));
         }
@@ -148,10 +184,10 @@ fn decode_base85(encoded: &str) -> Result<Vec<u8>, String> {
 }
 
 fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
-    let table_type = read_u32(block, 0)?;
-    let table_version = read_u32(block, 4)?;
-    let dimensions = read_u32(block, 8)?;
-    let size_field = read_u32(block, 12)?;
+    let table_type = read_u32(block, 0, RGB_TABLE_LABEL)?;
+    let table_version = read_u32(block, 4, RGB_TABLE_LABEL)?;
+    let dimensions = read_u32(block, 8, RGB_TABLE_LABEL)?;
+    let size_field = read_u32(block, 12, RGB_TABLE_LABEL)?;
 
     if table_type != RGB_TABLE_TYPE {
         return Err(format!(
@@ -218,9 +254,9 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         let g_index = (index / size) % size;
         let b_index = index % size;
 
-        let red_delta = read_u16(block, offset)?;
-        let green_delta = read_u16(block, offset + 2)?;
-        let blue_delta = read_u16(block, offset + 4)?;
+        let red_delta = read_u16(block, offset, RGB_TABLE_LABEL)?;
+        let green_delta = read_u16(block, offset + 2, RGB_TABLE_LABEL)?;
+        let blue_delta = read_u16(block, offset + 4, RGB_TABLE_LABEL)?;
         offset += BYTES_PER_NODE;
 
         values.push([
@@ -230,13 +266,13 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         ]);
     }
 
-    let color_space = read_u32(block, offset)?;
-    let gamma = read_u32(block, offset + 4)?;
-    let gamut = read_u32(block, offset + 8)?;
+    let color_space = read_u32(block, offset, RGB_TABLE_LABEL)?;
+    let gamma = read_u32(block, offset + 4, RGB_TABLE_LABEL)?;
+    let gamut = read_u32(block, offset + 8, RGB_TABLE_LABEL)?;
     offset += FOOTER_BYTES;
 
-    let min_amount = read_f64(block, offset)?;
-    let max_amount = read_f64(block, offset + 8)?;
+    let min_amount = read_f64(block, offset, RGB_TABLE_LABEL)?;
+    let max_amount = read_f64(block, offset + 8, RGB_TABLE_LABEL)?;
 
     Ok(RgbTable {
         size,
@@ -254,28 +290,40 @@ fn reconstruct_channel(delta: u16, identity: u32) -> f32 {
     decoded as f32 / CHANNEL_MAX as f32
 }
 
-fn read_u16(block: &[u8], offset: usize) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(read_array::<2>(block, offset)?))
+/// Little-endian integer/float readers shared with the LookTable decoder.
+///
+/// `label` only affects the error text; it lets both decoders report truncation
+/// against their own table name.
+pub(super) fn read_u16(block: &[u8], offset: usize, label: &str) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(read_array::<2>(block, offset, label)?))
 }
 
-fn read_u32(block: &[u8], offset: usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(read_array::<4>(block, offset)?))
+pub(super) fn read_u32(block: &[u8], offset: usize, label: &str) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_array::<4>(block, offset, label)?))
 }
 
-fn read_f64(block: &[u8], offset: usize) -> Result<f64, String> {
-    Ok(f64::from_le_bytes(read_array::<8>(block, offset)?))
+pub(super) fn read_f32(block: &[u8], offset: usize, label: &str) -> Result<f32, String> {
+    Ok(f32::from_le_bytes(read_array::<4>(block, offset, label)?))
 }
 
-fn read_array<const N: usize>(block: &[u8], offset: usize) -> Result<[u8; N], String> {
+pub(super) fn read_f64(block: &[u8], offset: usize, label: &str) -> Result<f64, String> {
+    Ok(f64::from_le_bytes(read_array::<8>(block, offset, label)?))
+}
+
+pub(super) fn read_array<const N: usize>(
+    block: &[u8],
+    offset: usize,
+    label: &str,
+) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
-        .ok_or_else(|| "embedded RGBTable offset overflows usize".to_string())?;
+        .ok_or_else(|| format!("embedded {label} offset overflows usize"))?;
 
     block
         .get(offset..end)
-        .ok_or_else(|| format!("embedded RGBTable block is truncated at offset {offset}"))?
+        .ok_or_else(|| format!("embedded {label} block is truncated at offset {offset}"))?
         .try_into()
-        .map_err(|_| format!("embedded RGBTable block is truncated at offset {offset}"))
+        .map_err(|_| format!("embedded {label} block is truncated at offset {offset}"))
 }
 
 #[cfg(test)]

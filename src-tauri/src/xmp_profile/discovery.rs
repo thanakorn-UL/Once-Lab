@@ -29,6 +29,9 @@ pub struct XmpProfileEntry {
     pub uuid: String,
     pub path: String,
     pub supports_amount: bool,
+    /// The authored `crs:ConvertToGrayscale` flag, surfaced verbatim. It is not a
+    /// render step and does not filter discovery.
+    pub convert_to_grayscale: bool,
 }
 
 /// Classifies a single path without ever failing on unsupported content.
@@ -50,8 +53,10 @@ pub(crate) fn classify_xmp_profile_path(path: &Path) -> Result<Option<XmpProfile
 
     match parse_xmp_rgb_profile(&contents) {
         Ok(profile) => Ok(Some(entry_from_profile(&profile, path))),
-        // Presets, RAW sidecars, grayscale profiles and malformed documents all
-        // mean the same thing to a library scan: not a supported profile.
+        // Presets, RAW sidecars and malformed documents all mean the same thing
+        // to a library scan: not a supported profile. Grayscale (`Look`)
+        // profiles parse like any other, so they are discoverable — the
+        // `crs:ConvertToGrayscale` flag is carried, never used to filter.
         Err(error) => {
             log::debug!(
                 "Skipping XMP file that is not a supported RGB profile '{}': {error}",
@@ -139,6 +144,7 @@ fn entry_from_profile(profile: &XmpRgbProfile, path: &Path) -> XmpProfileEntry {
         uuid: profile.uuid.clone(),
         path: normalize_path_string(path),
         supports_amount: profile.supports_amount,
+        convert_to_grayscale: profile.convert_to_grayscale,
     }
 }
 
@@ -225,6 +231,34 @@ mod tests {
         )
     }
 
+    /// Fe-class fixture: a grayscale (`crs:ConvertToGrayscale="True"`) Look
+    /// profile. It must be discovered like any color profile, with the flag
+    /// carried through.
+    fn grayscale_profile_xmp(name: &str, uuid: &str) -> String {
+        format!(
+            r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:PresetType="Look"
+      crs:UUID="{uuid}"
+      crs:SupportsAmount="True"
+      crs:ConvertToGrayscale="True"
+      crs:RGBTable="TESTTABLE"
+      crs:Table_TESTTABLE="{table}">
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{name}</rdf:li>
+        </rdf:Alt>
+      </crs:Name>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+            table = IDENTITY_2X2X2_BASE85
+        )
+    }
+
     /// Valid XMP that is a develop preset, not a profile.
     fn preset_xmp() -> String {
         r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -303,7 +337,36 @@ mod tests {
                 uuid: "UUID-A".to_string(),
                 path: dir.join("sample.xmp").to_string_lossy().to_string(),
                 supports_amount: true,
+                convert_to_grayscale: false,
             }
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discovers_grayscale_profile_without_special_casing() {
+        let dir = unique_temp_dir();
+        // The file name deliberately gives no hint about the profile, so any
+        // filename-based exemption or skip would be visible here.
+        write_file(
+            &dir,
+            "some-arbitrary-name.xmp",
+            &grayscale_profile_xmp("Mono ⛏️", "UUID-MONO"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "a grayscale (ConvertToGrayscale=True) profile must be discovered, not skipped"
+        );
+        assert_eq!(entries[0].name, "Mono ⛏️");
+        assert_eq!(entries[0].uuid, "UUID-MONO");
+        assert!(
+            entries[0].convert_to_grayscale,
+            "the monochrome flag must survive discovery"
         );
 
         fs::remove_dir_all(&dir).expect("remove temp dir");
@@ -668,14 +731,32 @@ mod tests {
         eprintln!("ACCEPTANCE: discovered {} entries", entries.len());
         for entry in &entries {
             eprintln!(
-                "  name={:?} group={:?} uuid={} supports_amount={} path={}",
-                entry.name, entry.group, entry.uuid, entry.supports_amount, entry.path
+                "  name={:?} group={:?} uuid={} supports_amount={} convert_to_grayscale={} path={}",
+                entry.name,
+                entry.group,
+                entry.uuid,
+                entry.supports_amount,
+                entry.convert_to_grayscale,
+                entry.path
             );
         }
 
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"Au ⛏️"), "Au must be discovered: {names:?}");
         assert!(names.contains(&"Cu ⛏️"), "Cu must be discovered: {names:?}");
+        // The Fe-class grayscale profile must now be returned like any other.
+        assert!(
+            names.contains(&"Fe ⛏"),
+            "the grayscale Fe profile must be discovered: {names:?}"
+        );
+        let fe = entries
+            .iter()
+            .find(|entry| entry.name == "Fe ⛏")
+            .expect("Fe entry");
+        assert!(
+            fe.convert_to_grayscale,
+            "Fe must report its monochrome flag through discovery"
+        );
 
         // The RAW file and the unrelated sidecar artifacts in the same folder
         // must never surface as profiles.

@@ -18,6 +18,7 @@
 //! ```
 
 use crate::xmp_profile::rgb_table::RgbTable;
+use crate::xmp_profile::srgb_transfer::{srgb_decode, srgb_encode};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -201,26 +202,6 @@ fn validate_table_structure(table: &RgbTable) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// sRGB transfer encode (linear -> encoded). The input is expected to already
-/// be clamped to [0,1].
-fn srgb_encode(linear: f32) -> f32 {
-    if linear <= 0.0031308 {
-        linear * 12.92
-    } else {
-        1.055 * linear.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-/// sRGB transfer decode (encoded -> linear). The input is expected to already
-/// be clamped to [0,1].
-fn srgb_decode(encoded: f32) -> f32 {
-    if encoded <= 0.04045 {
-        encoded / 12.92
-    } else {
-        ((encoded + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 /// Linear node index for a corner of the table.
