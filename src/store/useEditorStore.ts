@@ -5,6 +5,7 @@ import { ChannelConfig } from '../components/adjustments/Curves';
 import { ImageDimensions } from '../hooks/useImageRenderSize';
 import { ToolType } from '../components/panel/right/Masks';
 import { OverlayMode } from '../components/panel/right/CropPanel';
+import { PROFILE_PROJECTION_NONE, type DevelopProfileProjection } from '../utils/developState';
 
 interface InteractivePatch {
   url: string;
@@ -26,17 +27,12 @@ interface BaseRenderSize extends ImageDimensions {
  * failed reload can put the previously rendered profile back.
  */
 export interface XmpProfileRollback {
-  path: string | null;
-  name: string | null;
-  amountPercent: number;
-  supportsAmount: boolean;
-  // Identifies ONE profile transaction, so a superseded reload can never clear
-  // or restore a newer transaction's rollback that reused the same fields.
+  /** The last successfully rendered profile view, restored if the reload fails. */
+  profile: DevelopProfileProjection;
   id: number;
 }
 
-/** Default Profile Amount, which renders a profile exactly as authored. */
-export const DEFAULT_XMP_PROFILE_AMOUNT_PERCENT = 100;
+export { DEFAULT_XMP_PROFILE_AMOUNT_PERCENT } from '../utils/developState';
 
 // Monotonic source of profile transaction ids; module-level so the store keeps
 // no counter field of its own.
@@ -54,10 +50,9 @@ interface EditorState {
   previewOverride: Adjustments | null;
 
   // XMP Profile (session only, never persisted)
-  xmpProfilePath: string | null;
-  xmpProfileName: string | null;
-  xmpProfileAmountPercent: number;
-  xmpProfileSupportsAmount: boolean;
+  xmpProfile: DevelopProfileProjection;
+  /** Bumped ONLY when a profile transaction is requested. Drives the reload effect. */
+  xmpProfileRevision: number;
   xmpProfileRollback: XmpProfileRollback | null;
 
   // History State
@@ -125,10 +120,8 @@ export const useEditorStore = create<EditorState>((set) => ({
   selectedImage: null,
   adjustments: INITIAL_ADJUSTMENTS,
   previewOverride: null,
-  xmpProfilePath: null,
-  xmpProfileName: null,
-  xmpProfileAmountPercent: DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
-  xmpProfileSupportsAmount: false,
+  xmpProfile: PROFILE_PROJECTION_NONE,
+  xmpProfileRevision: 0,
   xmpProfileRollback: null,
   history: [INITIAL_ADJUSTMENTS],
   historyIndex: 0,

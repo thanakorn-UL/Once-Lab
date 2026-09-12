@@ -87,6 +87,8 @@ export enum Invokes {
   RenameFiles = 'rename_files',
   RenameFolder = 'rename_folder',
   ResetAdjustmentsForPaths = 'reset_adjustments_for_paths',
+  ResolveImageDevelopProfile = 'resolve_image_develop_profile',
+  SaveImageDevelopProfile = 'save_image_develop_profile',
   SaveMetadataAndUpdateThumbnail = 'save_metadata_and_update_thumbnail',
   SaveCollage = 'save_collage',
   SaveDenoisedImage = 'save_denoised_image',

@@ -4,12 +4,19 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { homeDir } from '@tauri-apps/api/path';
 import { toast } from 'react-toastify';
 import { useLibraryStore } from '../store/useLibraryStore';
-import { useEditorStore, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT } from '../store/useEditorStore';
+import { useEditorStore } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, LibraryViewMode, ImageFile } from '../components/ui/AppProperties';
 import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import {
+  PROFILE_PROJECTION_NONE,
+  activeProfilePath,
+  profileProjectionFromRestore,
+  profileProjectionsEqual,
+  type DevelopProfileRestore,
+} from '../utils/developState';
 import { globalImageCache } from '../utils/ImageLRUCache';
 import { debouncedSave, debouncedSetHistory } from './useEditorActions';
 
@@ -202,12 +209,11 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         activeAiSubMaskId: null,
         isWbPickerActive: false,
         previewOverride: null,
-        // XMP profile selection is per-image and session only: it never follows
-        // the user to another image and is never restored from cache.
-        xmpProfilePath: null,
-        xmpProfileName: null,
-        xmpProfileAmountPercent: DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
-        xmpProfileSupportsAmount: false,
+        // The profile is a projection of the image's own develop state: it never
+        // follows the user to another image and is never restored from a stale
+        // session.
+        xmpProfile: PROFILE_PROJECTION_NONE,
+        xmpProfileRevision: 0,
         xmpProfileRollback: null,
       });
 
@@ -217,6 +223,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       });
 
       if (isFrontendCached) {
+        const cachedProfile = cached?.developProfile;
+
         setEditor({
           selectedImage: {
             ...cached.selectedImage,
@@ -231,6 +239,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         });
 
         setEditor({ adjustments: cached.adjustments });
+        setEditor({ xmpProfile: cachedProfile ?? PROFILE_PROJECTION_NONE });
         resetHistory(cached.adjustments);
         prevAdjustmentsRef.current = { path, adjustments: cached.adjustments };
 
@@ -240,7 +249,16 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         isBackendReadyRef.current = false;
         currentResRef.current = Infinity;
 
-        invoke(Invokes.LoadImage, { path })
+        const cachedProfilePath = activeProfilePath(cachedProfile);
+
+        (cachedProfilePath
+          ? invoke(Invokes.LoadImageWithXmpProfile, {
+              path,
+              xmpProfilePath: cachedProfilePath,
+              profileAmountPercent: cachedProfile?.supportsAmount ? cachedProfile.amountPercent : null,
+            })
+          : invoke(Invokes.LoadImage, { path })
+        )
           .then((_result: any) => {
             if (selectedImagePathRef.current !== path) return;
             isBackendReadyRef.current = true;
@@ -272,6 +290,17 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
               prevAdjustmentsRef.current = { path, adjustments: freshAdjustments };
               globalImageCache.set(path, { ...cached, adjustments: freshAdjustments });
             }
+
+            invoke<DevelopProfileRestore>(Invokes.ResolveImageDevelopProfile, { path })
+              .then((restore) => {
+                if (selectedImagePathRef.current !== path) return;
+                const restored = profileProjectionFromRestore(restore);
+                if (!isSliderDragging && !profileProjectionsEqual(restored, cachedProfile ?? PROFILE_PROJECTION_NONE)) {
+                  console.log(`Develop profile changed on disk for ${path}; reloading authoritatively`);
+                  setEditor({ selectedImage: { ...cached?.selectedImage, isReady: false } });
+                }
+              })
+              .catch((err) => console.error('Failed background develop profile sync on cache hit:', err));
           })
           .catch((err) => console.error('Failed background metadata sync on cache hit:', err));
 

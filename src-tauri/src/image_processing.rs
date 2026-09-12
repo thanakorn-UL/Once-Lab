@@ -77,7 +77,6 @@ impl Default for ImageMetadata {
     }
 }
 
-#[allow(dead_code)]
 impl ImageMetadata {
     /// The image's develop state, defaulting when the sidecar carries none
     /// (an older sidecar, or an image that has never had a profile).

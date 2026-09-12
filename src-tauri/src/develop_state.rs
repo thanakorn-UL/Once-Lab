@@ -64,7 +64,6 @@ impl Default for DevelopState {
     }
 }
 
-#[allow(dead_code)]
 impl DevelopState {
     /// Whether this build may interpret the record. A record written by a newer
     /// build is preserved but never applied.
@@ -74,7 +73,6 @@ impl DevelopState {
 }
 
 /// One currently visible profile, as the app can see it right now.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveredProfile {
     pub uuid: String,
@@ -83,7 +81,6 @@ pub struct DiscoveredProfile {
 }
 
 /// Outcome of resolving a saved reference against what is currently visible.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProfileResolution {
     /// The referenced profile is available; apply it at `amount_percent`.
@@ -96,7 +93,6 @@ pub enum ProfileResolution {
     Missing { reference: DevelopProfileReference },
 }
 
-#[allow(dead_code)]
 pub fn resolve_profile_reference(
     reference: &DevelopProfileReference,
     candidates: &[DiscoveredProfile],
@@ -281,7 +277,10 @@ mod tests {
         let metadata: ImageMetadata = serde_json::from_str(document)
             .expect("a sidecar with an empty develop_state object still parses");
 
-        assert_eq!(metadata.rating, 4, "rating survives a version-less develop_state");
+        assert_eq!(
+            metadata.rating, 4,
+            "rating survives a version-less develop_state"
+        );
         assert_eq!(
             metadata.adjustments,
             json!({ "exposure": 0.5 }),

@@ -1,4 +1,5 @@
-import { DEFAULT_XMP_PROFILE_AMOUNT_PERCENT } from '../store/useEditorStore';
+/** Default Profile Amount, which renders a profile exactly as authored. */
+export const DEFAULT_XMP_PROFILE_AMOUNT_PERCENT = 100;
 
 /** Schema version of the persisted develop state; mirrors DEVELOP_STATE_VERSION in Rust. */
 export const DEVELOP_STATE_VERSION = 1;
@@ -17,12 +18,133 @@ export interface DevelopState {
   profile: DevelopProfileReference | null;
 }
 
+/** Runtime status of the open image's profile. */
+export type XmpProfileStatus = 'none' | 'resolved' | 'missing';
+
+/** The editor's whole view of the open image's profile: a projection of its develop state. */
+export interface DevelopProfileProjection {
+  status: XmpProfileStatus;
+  path: string | null;
+  name: string | null;
+  uuid: string | null;
+  amountPercent: number;
+  supportsAmount: boolean;
+}
+
+/** Wire shape of `resolve_image_develop_profile`; mirrors Rust `DevelopProfileRestore`. */
+export type DevelopProfileRestore =
+  | { status: 'none' }
+  | { status: 'resolved'; reference: DevelopProfileReference; summary: XmpProfileSummary }
+  | { status: 'missing'; reference: DevelopProfileReference };
+
+export interface XmpProfileSummary {
+  name: string;
+  path: string;
+  uuid: string;
+  supports_amount: boolean;
+  convert_to_grayscale: boolean;
+}
+
 /** The flat editor fields the profile part of a develop state is projected onto. */
 export interface DevelopProfileFields {
   path: string | null;
   name: string | null;
   uuid: string | null;
   amountPercent: number;
+}
+
+/** The projection of an image that has no profile. */
+export const PROFILE_PROJECTION_NONE: DevelopProfileProjection = {
+  status: 'none',
+  path: null,
+  name: null,
+  uuid: null,
+  amountPercent: DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+  supportsAmount: false,
+};
+
+/** Projects a restore outcome onto the editor's profile view. */
+export function profileProjectionFromRestore(
+  restore: DevelopProfileRestore | null | undefined,
+): DevelopProfileProjection {
+  if (!restore) return PROFILE_PROJECTION_NONE;
+
+  if (restore.status === 'resolved') {
+    const { reference, summary } = restore;
+
+    return {
+      status: 'resolved',
+      path: summary.path,
+      name: summary.name,
+      uuid: reference.uuid ?? summary.uuid,
+      amountPercent: Number.isFinite(reference.amount_percent)
+        ? reference.amount_percent
+        : DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+      supportsAmount: summary.supports_amount,
+    };
+  }
+
+  if (restore.status === 'missing') {
+    const { reference } = restore;
+
+    return {
+      status: 'missing',
+      path: reference.path ?? null,
+      name: reference.name ?? null,
+      uuid: reference.uuid ?? null,
+      amountPercent: Number.isFinite(reference.amount_percent)
+        ? reference.amount_percent
+        : DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+      supportsAmount: false,
+    };
+  }
+
+  return PROFILE_PROJECTION_NONE;
+}
+
+/** Projects a freshly requested transaction target (a profile the user just picked or a clear). */
+export function profileProjectionFromSelection(
+  path: string | null,
+  name: string | null,
+  uuid: string | null,
+  amountPercent: number,
+  supportsAmount: boolean,
+): DevelopProfileProjection {
+  if (!path) return PROFILE_PROJECTION_NONE;
+
+  return {
+    status: 'resolved',
+    path,
+    name: name ?? null,
+    uuid: uuid ?? null,
+    amountPercent: Number.isFinite(amountPercent) ? amountPercent : DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+    supportsAmount,
+  };
+}
+
+/** The path the backend should develop with, or null when nothing may be applied. */
+export function activeProfilePath(projection: DevelopProfileProjection | null | undefined): string | null {
+  if (!projection || projection.status !== 'resolved') return null;
+
+  return projection.path;
+}
+
+/** Field-wise equality, for deciding whether the cached view still matches disk. */
+export function profileProjectionsEqual(
+  a: DevelopProfileProjection | null | undefined,
+  b: DevelopProfileProjection | null | undefined,
+): boolean {
+  const left = a ?? PROFILE_PROJECTION_NONE;
+  const right = b ?? PROFILE_PROJECTION_NONE;
+
+  return (
+    left.status === right.status &&
+    left.path === right.path &&
+    left.name === right.name &&
+    left.uuid === right.uuid &&
+    left.amountPercent === right.amountPercent &&
+    left.supportsAmount === right.supportsAmount
+  );
 }
 
 /** Projects the editor's flat profile fields onto the persisted record. */

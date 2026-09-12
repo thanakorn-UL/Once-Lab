@@ -4,15 +4,21 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'react-toastify';
 import debounce from 'lodash.debounce';
-import { FileText, X } from 'lucide-react';
+import { AlertTriangle, FileText, X } from 'lucide-react';
 import { Invokes } from './AppProperties';
 import Slider from './Slider';
 import XmpProfileBrowser, { type XmpProfileEntry } from './XmpProfileBrowser';
-import { useEditorStore, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, nextXmpProfileTransactionId } from '../../store/useEditorStore';
+import {
+  useEditorStore,
+  DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+  nextXmpProfileTransactionId,
+} from '../../store/useEditorStore';
+import { profileProjectionFromSelection } from '../../utils/developState';
 
 interface XmpProfileSummary {
   name: string;
   path: string;
+  uuid: string;
   supports_amount: boolean;
   convert_to_grayscale: boolean;
 }
@@ -26,24 +32,21 @@ interface XmpProfileSummary {
 export default function XmpProfileControl() {
   const { t } = useTranslation();
   const selectedImage = useEditorStore((s) => s.selectedImage);
-  const xmpProfilePath = useEditorStore((s) => s.xmpProfilePath);
-  const xmpProfileName = useEditorStore((s) => s.xmpProfileName);
-  const xmpProfileAmountPercent = useEditorStore((s) => s.xmpProfileAmountPercent);
-  const xmpProfileSupportsAmount = useEditorStore((s) => s.xmpProfileSupportsAmount);
+  const xmpProfile = useEditorStore((s) => s.xmpProfile);
   const setEditor = useEditorStore((s) => s.setEditor);
   const [isInspecting, setIsInspecting] = useState(false);
 
   // The slider is visually live while dragging, but only the released value is
   // committed, because committing re-develops the RAW file.
-  const [draggedAmount, setDraggedAmount] = useState(xmpProfileAmountPercent);
-  const draggedAmountRef = useRef(xmpProfileAmountPercent);
+  const [draggedAmount, setDraggedAmount] = useState(xmpProfile.amountPercent);
+  const draggedAmountRef = useRef(xmpProfile.amountPercent);
   const isDraggingRef = useRef(false);
   const isEditingRef = useRef(false);
 
   useEffect(() => {
-    draggedAmountRef.current = xmpProfileAmountPercent;
-    setDraggedAmount(xmpProfileAmountPercent);
-  }, [xmpProfileAmountPercent]);
+    draggedAmountRef.current = xmpProfile.amountPercent;
+    setDraggedAmount(xmpProfile.amountPercent);
+  }, [xmpProfile.amountPercent]);
 
   const isRaw = Boolean(selectedImage?.isRaw);
   const isDisabled = !selectedImage || !isRaw || isInspecting;
@@ -53,14 +56,12 @@ export default function XmpProfileControl() {
   const commitProfile = (
     path: string | null,
     name: string | null,
+    uuid: string | null,
     amountPercent: number = DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
     supportsAmount: boolean = false,
   ) => {
     const {
-      xmpProfilePath,
-      xmpProfileName: currentName,
-      xmpProfileAmountPercent: currentAmount,
-      xmpProfileSupportsAmount: currentSupportsAmount,
+      xmpProfile: currentProjection,
       xmpProfileRollback: pendingRollback,
       selectedImage: image,
     } = useEditorStore.getState();
@@ -72,10 +73,11 @@ export default function XmpProfileControl() {
     // orphan that rollback, so the next failure would restore stale fields.
     if (
       image?.isReady === false &&
-      path === xmpProfilePath &&
-      name === currentName &&
-      amountPercent === currentAmount &&
-      supportsAmount === currentSupportsAmount
+      path === currentProjection.path &&
+      name === currentProjection.name &&
+      uuid === currentProjection.uuid &&
+      amountPercent === currentProjection.amountPercent &&
+      supportsAmount === currentProjection.supportsAmount
     ) {
       return;
     }
@@ -84,19 +86,14 @@ export default function XmpProfileControl() {
     // state, so reuse its fields rather than snapshotting a not-yet-rendered
     // amount; a fresh object with a new id keeps each transaction's rollback
     // distinct so a superseded reload cannot clear this one.
-    const base = pendingRollback ?? {
-      path: xmpProfilePath,
-      name: currentName,
-      amountPercent: currentAmount,
-      supportsAmount: currentSupportsAmount,
-    };
+    const base = pendingRollback ?? { profile: currentProjection };
+
+    const id = nextXmpProfileTransactionId();
 
     setEditor({
-      xmpProfilePath: path,
-      xmpProfileName: name,
-      xmpProfileAmountPercent: amountPercent,
-      xmpProfileSupportsAmount: supportsAmount,
-      xmpProfileRollback: { ...base, id: nextXmpProfileTransactionId() },
+      xmpProfile: profileProjectionFromSelection(path, name, uuid, amountPercent, supportsAmount),
+      xmpProfileRollback: { ...base, id },
+      xmpProfileRevision: id,
       selectedImage: image ? { ...image, isReady: false } : image,
     });
   };
@@ -125,7 +122,7 @@ export default function XmpProfileControl() {
       // A different profile always starts from its authored strength, so any
       // pending amount commit must not leak onto the newly chosen profile.
       debouncedAmountCommit.cancel();
-      commitProfile(selection, summary.name, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, summary.supports_amount);
+      commitProfile(selection, summary.name, summary.uuid, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, summary.supports_amount);
     } catch (err) {
       console.error('Failed to choose XMP profile:', err);
       toast.error(`${t('ui.xmpProfile.applyFailed')}: ${err}`);
@@ -137,7 +134,7 @@ export default function XmpProfileControl() {
   const handleClear = () => {
     // Clearing picks a new (empty) profile, so cancel any pending amount commit.
     debouncedAmountCommit.cancel();
-    commitProfile(null, null);
+    commitProfile(null, null, null);
   };
 
   // A discovered entry already carries the metadata the backend parsed out of
@@ -145,21 +142,17 @@ export default function XmpProfileControl() {
   // and never needs a second inspect round trip.
   const handleSelectDiscoveredProfile = (entry: XmpProfileEntry) => {
     debouncedAmountCommit.cancel();
-    commitProfile(entry.path, entry.name, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, entry.supports_amount);
+    commitProfile(entry.path, entry.name, entry.uuid, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, entry.supports_amount);
   };
 
   const handleAmountCommit = () => {
     const percent = draggedAmountRef.current;
-    const {
-      xmpProfilePath: path,
-      xmpProfileName: name,
-      xmpProfileAmountPercent: currentAmount,
-    } = useEditorStore.getState();
+    const { xmpProfile: projection } = useEditorStore.getState();
 
     // The control only exists for an active profile that supports it.
-    if (!path || percent === currentAmount) return;
+    if (projection.status !== 'resolved' || !projection.path || percent === projection.amountPercent) return;
 
-    commitProfile(path, name, percent, true);
+    commitProfile(projection.path, projection.name, projection.uuid, percent, true);
   };
 
   // Wheel and keyboard changes reach the control only through onChange, so they
@@ -175,9 +168,19 @@ export default function XmpProfileControl() {
     <div className="mb-2">
       <div className="flex justify-between items-center">
         <span className="text-sm font-medium text-text-secondary select-none">{t('ui.xmpProfile.label')}</span>
-        {xmpProfileName && (
-          <span className="truncate max-w-35 text-sm text-text-primary" data-tooltip={xmpProfileName}>
-            {xmpProfileName}
+        {xmpProfile.name && (
+          <span className="flex min-w-0 items-center gap-1">
+            {xmpProfile.status === 'missing' && (
+              <AlertTriangle
+                size={14}
+                className="shrink-0"
+                data-tooltip={t('ui.xmpProfile.unavailableRoot')}
+                aria-label={t('ui.xmpProfile.unavailableRoot')}
+              />
+            )}
+            <span className="truncate max-w-35 text-sm text-text-primary" data-tooltip={xmpProfile.name}>
+              {xmpProfile.name}
+            </span>
           </span>
         )}
       </div>
@@ -187,13 +190,13 @@ export default function XmpProfileControl() {
           onClick={handleChoose}
           disabled={isDisabled}
           className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md bg-bg-tertiary hover:bg-surface border border-surface text-sm text-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          data-tooltip={xmpProfileName || t('ui.xmpProfile.choose')}
+          data-tooltip={xmpProfile.name || t('ui.xmpProfile.choose')}
         >
           <FileText size={14} />
-          {xmpProfileName ? t('ui.xmpProfile.change') : t('ui.xmpProfile.choose')}
+          {xmpProfile.name ? t('ui.xmpProfile.change') : t('ui.xmpProfile.choose')}
         </button>
 
-        {xmpProfileName && (
+        {xmpProfile.name && (
           <button
             onClick={handleClear}
             disabled={isInspecting}
@@ -207,12 +210,12 @@ export default function XmpProfileControl() {
       </div>
 
       <XmpProfileBrowser
-        activePath={xmpProfilePath}
+        activePath={xmpProfile.path}
         applyDisabled={isDisabled}
         onSelectProfile={handleSelectDiscoveredProfile}
       />
 
-      {xmpProfileName && xmpProfileSupportsAmount && (
+      {xmpProfile.name && xmpProfile.supportsAmount && (
         <Slider
           label={t('ui.xmpProfile.amount')}
           min={0}

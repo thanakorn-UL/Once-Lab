@@ -4,8 +4,8 @@ use tauri::{AppHandle, Manager};
 
 mod apply;
 mod color_space;
-mod default_roots;
-mod discovery;
+pub(crate) mod default_roots;
+pub(crate) mod discovery;
 mod integration;
 mod linear_rgb;
 mod loader;
@@ -14,7 +14,7 @@ mod look_table_apply;
 mod parser;
 mod rgb_table;
 mod srgb_transfer;
-mod summary;
+pub(crate) mod summary;
 
 pub(crate) use apply::apply_rgb_table;
 pub(crate) use integration::{

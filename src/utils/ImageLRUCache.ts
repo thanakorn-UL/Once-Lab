@@ -1,4 +1,5 @@
 import type { Adjustments } from './adjustments';
+import type { DevelopProfileProjection } from './developState';
 
 interface ImageCacheEntry {
   adjustments: Adjustments;
@@ -9,6 +10,7 @@ interface ImageCacheEntry {
   selectedImage: any;
   originalSize: { width: number; height: number };
   previewSize: { width: number; height: number };
+  developProfile: DevelopProfileProjection;
 }
 
 class ImageLRUCache {

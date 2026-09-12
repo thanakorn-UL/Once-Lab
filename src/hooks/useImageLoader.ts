@@ -1,11 +1,19 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
+import { useTranslation } from 'react-i18next';
 import { useEditorStore } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes } from '../components/ui/AppProperties';
 import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import {
+  PROFILE_PROJECTION_NONE,
+  activeProfilePath,
+  developStateFromProfileFields,
+  profileProjectionFromRestore,
+  type DevelopProfileRestore,
+} from '../utils/developState';
 
 export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const selectedImage = useEditorStore((s) => s.selectedImage);
@@ -22,12 +30,8 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const resetHistory = useEditorStore((s) => s.resetHistory);
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
-  const xmpProfilePath = useEditorStore((s) => s.xmpProfilePath);
-  const xmpProfileAmountPercent = useEditorStore((s) => s.xmpProfileAmountPercent);
-
-  // Tracks the image whose sidecar metadata has already been applied, so that a
-  // profile-triggered reload of the same image keeps the user's adjustments.
-  const loadedMetadataPathRef = useRef<string | null>(null);
+  const xmpProfileRevision = useEditorStore((s) => s.xmpProfileRevision);
+  const { t } = useTranslation();
 
   const isWgpuActive = appSettings?.useWgpuRenderer !== false && selectedImage?.isReady && hasRenderedFirstFrame;
 
@@ -46,9 +50,12 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
           useEditorStore.getState().patchesSentToBackend.clear();
           await invoke('clear_session_caches').catch((e) => console.warn('Cache clear failed:', e));
 
-          // Reloading the same image to change its XMP profile must not reset
-          // the current adjustments or the undo history.
-          if (loadedMetadataPathRef.current === selectedImage.path) return;
+          // Reloading the still-open image to change its XMP profile must not reset the
+          // current adjustments or the undo history. A pending profile transaction is the
+          // exact signal: it is set together with isReady=false and cleared once the reload
+          // resolves. A reload with no transaction (a freshly opened image, or a cache entry
+          // that disk has since contradicted) must always re-apply the sidecar metadata.
+          if (useEditorStore.getState().xmpProfileRollback !== null) return;
 
           const metadata: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
           if (!isEffectActive) return;
@@ -62,7 +69,17 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
           setEditor({ adjustments: initialAdjusts });
           resetHistory(initialAdjusts);
-          loadedMetadataPathRef.current = selectedImage.path;
+
+          try {
+            const restore = await invoke<DevelopProfileRestore>(Invokes.ResolveImageDevelopProfile, {
+              path: selectedImage.path,
+            });
+            if (!isEffectActive) return;
+            setEditor({ xmpProfile: profileProjectionFromRestore(restore) });
+          } catch (err) {
+            console.error('Failed to restore develop profile:', err);
+            setEditor({ xmpProfile: PROFILE_PROJECTION_NONE });
+          }
         } catch (err) {
           console.error('Failed to load metadata early:', err);
         }
@@ -70,18 +87,15 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
 
       const loadFullImageData = async () => {
         try {
-          const {
-            xmpProfilePath: profilePath,
-            xmpProfileAmountPercent,
-            xmpProfileSupportsAmount,
-          } = useEditorStore.getState();
+          const { xmpProfile } = useEditorStore.getState();
+          const profilePath = activeProfilePath(xmpProfile);
           const loadImageResult: any = profilePath
             ? await invoke(Invokes.LoadImageWithXmpProfile, {
                 path: selectedImage.path,
                 xmpProfilePath: profilePath,
                 // A profile that does not support an amount hard-rejects any
                 // override, so only the raw percent of a supporting profile is sent.
-                profileAmountPercent: xmpProfileSupportsAmount ? xmpProfileAmountPercent : null,
+                profileAmountPercent: xmpProfile.supportsAmount ? xmpProfile.amountPercent : null,
               })
             : await invoke(Invokes.LoadImage, { path: selectedImage.path });
           if (!isEffectActive) return;
@@ -137,6 +151,22 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
           // guarded by the transaction id so a superseded request cannot wipe the
           // rollback a newer reload is relying on.
           if (profileRollback) {
+            const shouldPersist = useEditorStore.getState().xmpProfileRollback?.id === profileRollback.id;
+            if (shouldPersist) {
+              const profile = useEditorStore.getState().xmpProfile;
+              invoke(Invokes.SaveImageDevelopProfile, {
+                path: selectedImage.path,
+                profile: developStateFromProfileFields({
+                  path: profile.path,
+                  name: profile.name,
+                  uuid: profile.uuid,
+                  amountPercent: profile.amountPercent,
+                }).profile,
+              }).catch((err) => {
+                console.error('Failed to save develop profile:', err);
+                toast.error(`${t('ui.xmpProfile.applyFailed')}: ${err}`);
+              });
+            }
             setEditor((state) =>
               state.xmpProfileRollback?.id === profileRollback.id ? { ...state, xmpProfileRollback: null } : state,
             );
@@ -156,13 +186,8 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
               setEditor((state) => {
                 if (state.xmpProfileRollback?.id !== profileRollback.id) return state;
                 return {
-                  selectedImage: state.selectedImage
-                    ? { ...state.selectedImage, isReady: true }
-                    : state.selectedImage,
-                  xmpProfilePath: profileRollback.path,
-                  xmpProfileName: profileRollback.name,
-                  xmpProfileAmountPercent: profileRollback.amountPercent,
-                  xmpProfileSupportsAmount: profileRollback.supportsAmount,
+                  selectedImage: state.selectedImage ? { ...state.selectedImage, isReady: true } : state.selectedImage,
+                  xmpProfile: profileRollback.profile,
                   xmpProfileRollback: null,
                 };
               });
@@ -193,8 +218,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   }, [
     selectedImage?.path,
     selectedImage?.isReady,
-    xmpProfilePath,
-    xmpProfileAmountPercent,
+    xmpProfileRevision,
     appSettings?.editorPreviewResolution,
     resetHistory,
     setEditor,
@@ -212,6 +236,7 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
         selectedImage,
         originalSize,
         previewSize,
+        developProfile: useEditorStore.getState().xmpProfile,
       };
     } else {
       cachedEditStateRef.current = null;
