@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 mod apply;
+mod color_space;
 mod default_roots;
 mod discovery;
 mod integration;

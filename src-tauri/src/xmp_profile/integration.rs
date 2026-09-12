@@ -1635,8 +1635,10 @@ mod tests {
 
     #[test]
     fn invalid_profile_does_not_partially_mutate_pixels() {
+        // 5B supports gamma 0 (Linear) through 4 (Rec2020); 5 is the first
+        // genuinely unsupported value, so it is the invalid sentinel here.
         let mut profile = make_profile(CONSTANT_2X2X2, Some(1.0));
-        profile.table.gamma = 0;
+        profile.table.gamma = 5;
 
         let mut pixels = vec![[0.18f32, 0.5, 0.9], [0.9, 0.4, 0.1], [0.25, 0.25, 0.25]];
         let original = pixels.clone();
@@ -1644,7 +1646,7 @@ mod tests {
         let error = apply_profile_to_three_color_pixels(&mut pixels, &profile)
             .expect_err("invalid profile must be rejected");
 
-        assert_eq!(error, "unsupported RGBTable gamma: 0");
+        assert_eq!(error, "unsupported RGBTable gamma: 5");
         assert_eq!(pixels, original, "pixels must be untouched on error");
     }
 
@@ -1707,8 +1709,10 @@ mod tests {
             "valid profile with no pixels should succeed"
         );
 
+        // 5B supports gamut 0 (clip) and 1 (extend); 2 is the first genuinely
+        // unsupported value, so it is the invalid sentinel here.
         let mut invalid = make_profile(CONSTANT_2X2X2, Some(1.0));
-        invalid.table.gamut = 1;
+        invalid.table.gamut = 2;
 
         assert!(
             apply_profile_to_three_color_pixels(&mut empty, &invalid).is_err(),

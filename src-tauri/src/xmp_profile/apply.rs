@@ -1,36 +1,41 @@
 //! Standalone renderer for Adobe `dng_rgb_table` look profiles.
 //!
-//! Scope of this milestone: the surrounding working representation is LINEAR
-//! sRGB / D65, and only the Au/Cu metadata combination is supported
-//! (`primaries_sRGB` / `gamma_sRGB` / `gamut_clip`). The processing sequence is
-//! fixed by the architecture decision:
+//! The surrounding working representation is LINEAR sRGB / D65. Every legal
+//! `(primaries, gamma, gamut)` combination is supported; the exact processing
+//! sequence is the one proven from `dng_reference.cpp:3476-3860`
+//! (`RefRGBtoRGBTable3D`):
 //!
 //! ```text
-//! linear sRGB
+//! linear sRGB (working space)
+//!   -> matrix: working -> table primaries    (SKIPPED for primaries_sRGB)
 //!   -> clamp to [0,1]
-//!   -> sRGB transfer encode
+//!   -> if gamut_extend: record delta = unclamped - clamped (linear table primaries)
+//!   -> gamma ENCODE
 //!   -> tetrahedral 3D RGBTable interpolation
+//!   -> AMOUNT BLEND (encoded domain, BEFORE the decode)
 //!   -> clamp to [0,1]
-//!   -> amount blend in encoded space
+//!   -> gamma DECODE
+//!   -> if gamut_extend: add delta back
+//!   -> matrix: table primaries -> working    (SKIPPED for primaries_sRGB)
 //!   -> clamp to [0,1]
-//!   -> sRGB transfer decode
-//!   -> linear sRGB
 //! ```
+//!
+//! The pure color-space math lives in [`super::color_space`]; this module owns
+//! the validated per-profile context, the table validation and the per-pixel
+//! pipeline.
+//!
+//! `primaries_sRGB / gamma_sRGB / gamut_clip` stays BIT-IDENTICAL to the 5A
+//! renderer: the sRGB primaries hop is an identity shortcut that **skips the
+//! matrix multiply entirely** (it never multiplies by a computed near-identity
+//! matrix), and the sRGB transfer pair is the shared [`super::srgb_transfer`]
+//! one. The trailing clamp is a provable no-op there (see [`Self::apply`]).
 
 use crate::xmp_profile::rgb_table::RgbTable;
-use crate::xmp_profile::srgb_transfer::{srgb_decode, srgb_encode};
+
+use super::color_space::{self, Gamma, Gamut, Primaries, PrimariesTransform};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Supported `primaries_enum` value: `primaries_sRGB`.
-const SUPPORTED_PRIMARIES: u32 = 0;
-
-/// Supported `gamma_enum` value: `gamma_sRGB`.
-const SUPPORTED_GAMMA: u32 = 1;
-
-/// Supported `gamut_enum` value: `gamut_clip`.
-const SUPPORTED_GAMUT: u32 = 0;
 
 const MIN_SIZE: usize = 2;
 const MAX_SIZE: usize = 32;
@@ -68,21 +73,30 @@ fn full_table_validations() -> usize {
 /// A validated rendering context for a single Adobe RGBTable.
 ///
 /// All expensive, profile-level work happens exactly once in
-/// [`RgbTableApplyContext::new`]: metadata support, amount finiteness and
-/// bounds, amount clamping, table size, checked node count, exact LUT length
-/// and full LUT finiteness. [`RgbTableApplyContext::apply`] then performs only
-/// per-pixel work, so rendering a whole image does not repeat the O(size^3)
+/// [`RgbTableApplyContext::new`]: metadata support (the three enums are parsed
+/// here, with no fallback), amount finiteness and bounds, amount clamping, the
+/// derived primaries transform, table size, checked node count, exact LUT
+/// length and full LUT finiteness. [`RgbTableApplyContext::apply`] then performs
+/// only per-pixel work, so rendering a whole image does not repeat the O(size^3)
 /// validation for every pixel.
 ///
 /// The table is borrowed, never copied.
 pub(crate) struct RgbTableApplyContext<'a> {
     table: &'a RgbTable,
     effective_amount: f32,
+    primaries: PrimariesTransform,
+    gamma: Gamma,
+    gamut: Gamut,
 }
 
 impl<'a> RgbTableApplyContext<'a> {
     pub(crate) fn new(table: &'a RgbTable, amount: f32) -> Result<Self, String> {
-        validate_render_metadata(table)?;
+        // Unsupported enums fail loudly, BEFORE any other work: this mirrors the
+        // 5A ordering (metadata first) so a bad metadata value never reaches the
+        // O(size^3) full-table scan.
+        let primaries = Primaries::from_enum(table.color_space)?;
+        let gamma = Gamma::from_enum(table.gamma)?;
+        let gamut = Gamut::from_enum(table.gamut)?;
 
         if !amount.is_finite() {
             return Err("invalid RGBTable amount".to_string());
@@ -103,38 +117,74 @@ impl<'a> RgbTableApplyContext<'a> {
         Ok(Self {
             table,
             effective_amount,
+            primaries: PrimariesTransform::new(primaries),
+            gamma,
+            gamut,
         })
     }
 
     /// Renders one pixel. Performs no profile-level validation.
     pub(crate) fn apply(&self, rgb: [f32; 3]) -> Result<[f32; 3], String> {
-        // gamut_clip: any excursion outside [0,1] is discarded before the table.
-        let mut encoded = [0.0f32; 3];
-
-        for channel in 0..3 {
-            let value = rgb[channel];
-
+        for value in rgb {
             if !value.is_finite() {
                 return Err("RGBTable input contains non-finite value".to_string());
             }
-
-            encoded[channel] = srgb_encode(value.clamp(0.0, 1.0));
         }
 
+        // (a) matrix: working space -> linear table primaries. For primaries_sRGB
+        // this is the identity shortcut, so the multiply is skipped outright.
+        let linear = self.primaries.encode(rgb);
+
+        // (b) clamp to [0,1] (BOTH gamut modes) and (b') the extend-mode delta,
+        // recorded in linear table primaries.
+        let (clamped, delta) = color_space::gamut_clamp(linear, self.gamut);
+
+        // (c) gamma ENCODE.
+        let mut encoded = [0.0f32; 3];
+        for channel in 0..3 {
+            encoded[channel] = self.gamma.encode(clamped[channel]);
+        }
+
+        // (d) tetrahedral 3D LUT.
         let lut = interpolate(self.table, encoded)?;
 
-        let mut out = [0.0f32; 3];
-
+        // (e) AMOUNT BLEND in the ENCODED domain (BEFORE the decode), then
+        // (f) clamp to [0,1].
+        let mut blended = [0.0f32; 3];
         for channel in 0..3 {
             let lut_value = lut[channel].clamp(0.0, 1.0);
             let input = encoded[channel];
-
-            let blended = (input + self.effective_amount * (lut_value - input)).clamp(0.0, 1.0);
-
-            out[channel] = srgb_decode(blended);
+            blended[channel] =
+                (input + self.effective_amount * (lut_value - input)).clamp(0.0, 1.0);
         }
 
-        Ok(out)
+        // (g) gamma DECODE.
+        let mut decoded = [
+            self.gamma.decode(blended[0]),
+            self.gamma.decode(blended[1]),
+            self.gamma.decode(blended[2]),
+        ];
+
+        // (h) gamut_extend re-adds the recorded excursion (in linear table
+        // primaries). gamut_clip discards it, so nothing is added.
+        if self.gamut == Gamut::Extend {
+            decoded[0] += delta[0];
+            decoded[1] += delta[1];
+            decoded[2] += delta[2];
+        }
+
+        // (i) matrix: table primaries -> working space (identity shortcut for sRGB).
+        let out = self.primaries.decode(decoded);
+
+        // Final SDR clip. For the sRGB/sRGB/clip path this is a NO-OP on the bits:
+        // the input to `srgb_decode` was clamped to [0,1], and `srgb_decode` is
+        // monotone with `decode(0) = 0`, `decode(1) = 1`, so every decoded channel
+        // already lies in [0,1] and `clamp` returns it unchanged.
+        Ok([
+            out[0].clamp(0.0, 1.0),
+            out[1].clamp(0.0, 1.0),
+            out[2].clamp(0.0, 1.0),
+        ])
     }
 }
 
@@ -148,25 +198,6 @@ pub(crate) fn apply_rgb_table(
     amount: f32,
 ) -> Result<[f32; 3], String> {
     RgbTableApplyContext::new(table, amount)?.apply(rgb)
-}
-
-fn validate_render_metadata(table: &RgbTable) -> Result<(), String> {
-    if table.color_space != SUPPORTED_PRIMARIES {
-        return Err(format!(
-            "unsupported RGBTable primaries: {}",
-            table.color_space
-        ));
-    }
-
-    if table.gamma != SUPPORTED_GAMMA {
-        return Err(format!("unsupported RGBTable gamma: {}", table.gamma));
-    }
-
-    if table.gamut != SUPPORTED_GAMUT {
-        return Err(format!("unsupported RGBTable gamut: {}", table.gamut));
-    }
-
-    Ok(())
 }
 
 fn validate_table_structure(table: &RgbTable) -> Result<(), String> {
@@ -283,6 +314,8 @@ fn interpolate(table: &RgbTable, encoded: [f32; 3]) -> Result<[f32; 3], String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xmp_profile::color_space::{ALL_GAMMAS, ALL_GAMUTS, ALL_PRIMARIES};
+    use crate::xmp_profile::srgb_transfer::{srgb_decode, srgb_encode};
 
     const IDENTITY_2X2X2: [[f32; 3]; 8] = [
         [0.0, 0.0, 0.0],
@@ -296,6 +329,15 @@ mod tests {
     ];
 
     const CONSTANT_2X2X2: [[f32; 3]; 8] = [[0.25, 0.5, 0.75]; 8];
+
+    /// Residual tolerated for an identity RGBTable rendered under ANY supported
+    /// (primaries, gamma, gamut) combination: the transfer round trip and the
+    /// 3x3 inverse product are not bit-exact in f32.
+    const IDENTITY_COMBINATION_TOLERANCE: f32 = 1e-4;
+
+    /// A change big enough to prove a synthetic profile genuinely altered a
+    /// probe (rather than differing by float noise).
+    const MATERIAL_DIFFERENCE: f32 = 1e-3;
 
     fn make_table(
         size: usize,
@@ -316,6 +358,24 @@ mod tests {
 
     fn table_2x2x2(values: [[f32; 3]; 8], min_amount: f64, max_amount: f64) -> RgbTable {
         make_table(2, values.to_vec(), min_amount, max_amount)
+    }
+
+    /// A 2x2x2 table with explicit metadata enums, for the exhaustive tests.
+    fn table_with_enums(
+        values: [[f32; 3]; 8],
+        color_space: u32,
+        gamma: u32,
+        gamut: u32,
+    ) -> RgbTable {
+        RgbTable {
+            size: 2,
+            values: values.to_vec(),
+            color_space,
+            gamma,
+            gamut,
+            min_amount: 0.0,
+            max_amount: 1.0,
+        }
     }
 
     fn assert_close(actual: f32, expected: f32, epsilon: f32, context: &str) {
@@ -578,32 +638,62 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_primaries() {
+        // `primaries_enum` 5 is out of range (0..=4 are supported). It must fail
+        // with a clear, contextual error and NEVER fall back to sRGB.
         let mut table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
-        table.color_space = 2;
+        table.color_space = 5;
 
         let error = apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0)
             .expect_err("unsupported primaries must be rejected");
-        assert_eq!(error, "unsupported RGBTable primaries: 2");
+        assert_eq!(error, "unsupported RGBTable primaries: 5");
+
+        // Non-vacuity: value 2 (ProPhoto) is the wide-gamut primaries that 5B
+        // newly supports, so it must be ACCEPTED - proving this test fails for
+        // the enum bound and not for some unrelated table problem.
+        let mut prophoto = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+        prophoto.color_space = 2;
+        assert!(
+            apply_rgb_table([0.5, 0.5, 0.5], &prophoto, 1.0).is_ok(),
+            "ProPhoto primaries must now be supported"
+        );
     }
 
     #[test]
     fn rejects_unsupported_gamma() {
+        // `gamma_enum` 9 is out of range (0..=4 are supported).
         let mut table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
-        table.gamma = 0;
+        table.gamma = 9;
 
         let error = apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0)
             .expect_err("unsupported gamma must be rejected");
-        assert_eq!(error, "unsupported RGBTable gamma: 0");
+        assert_eq!(error, "unsupported RGBTable gamma: 9");
+
+        // Non-vacuity: gamma 0 (Linear) is now supported and must be accepted.
+        let mut linear = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+        linear.gamma = 0;
+        assert!(
+            apply_rgb_table([0.5, 0.5, 0.5], &linear, 1.0).is_ok(),
+            "Linear gamma must now be supported"
+        );
     }
 
     #[test]
     fn rejects_unsupported_gamut() {
+        // `gamut_enum` 7 is out of range (0..=1 are supported).
         let mut table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
-        table.gamut = 1;
+        table.gamut = 7;
 
         let error = apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0)
             .expect_err("unsupported gamut must be rejected");
-        assert_eq!(error, "unsupported RGBTable gamut: 1");
+        assert_eq!(error, "unsupported RGBTable gamut: 7");
+
+        // Non-vacuity: gamut 1 (extend) is now supported and must be accepted.
+        let mut extend = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+        extend.gamut = 1;
+        assert!(
+            apply_rgb_table([0.5, 0.5, 0.5], &extend, 1.0).is_ok(),
+            "gamut_extend must now be supported"
+        );
     }
 
     #[test]
@@ -812,12 +902,12 @@ mod tests {
         reset_full_table_validations();
 
         let mut table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
-        table.color_space = 2;
+        table.color_space = 5;
 
         let result = RgbTableApplyContext::new(&table, 1.0);
         assert_eq!(
             result.err().expect("unsupported primaries"),
-            "unsupported RGBTable primaries: 2"
+            "unsupported RGBTable primaries: 5"
         );
 
         // A rejected table must not even reach the full-table scan.
@@ -825,6 +915,412 @@ mod tests {
             full_table_validations(),
             0,
             "invalid metadata should be rejected before the full table scan"
+        );
+    }
+
+    // ----------------------------------- full pipeline: every metadata combination
+
+    fn max_channel_delta(a: [f32; 3], b: [f32; 3]) -> f32 {
+        (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0f32, f32::max)
+    }
+
+    /// The pre-5B (5A) per-pixel renderer, reproduced verbatim as an INDEPENDENT
+    /// reference: clamp -> sRGB encode -> tetrahedral LUT -> clamp -> amount blend
+    /// in the encoded domain -> clamp -> sRGB decode. No matrix, no gamut delta.
+    fn reference_5a(table: &RgbTable, effective_amount: f32, rgb: [f32; 3]) -> [f32; 3] {
+        let mut encoded = [0.0f32; 3];
+        for channel in 0..3 {
+            encoded[channel] = srgb_encode(rgb[channel].clamp(0.0, 1.0));
+        }
+
+        let lut = interpolate(table, encoded).expect("reference LUT");
+
+        let mut out = [0.0f32; 3];
+        for channel in 0..3 {
+            let lut_value = lut[channel].clamp(0.0, 1.0);
+            let input = encoded[channel];
+            let blended = (input + effective_amount * (lut_value - input)).clamp(0.0, 1.0);
+            out[channel] = srgb_decode(blended);
+        }
+        out
+    }
+
+    #[test]
+    fn srgb_srgb_clip_is_bit_identical_to_the_5a_primitive() {
+        let tables = [
+            table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0),
+            table_2x2x2(CONSTANT_2X2X2, 0.0, 1.5),
+            table_2x2x2(
+                [
+                    [0.00, 0.00, 0.00],
+                    [0.20, 0.30, 0.70],
+                    [0.10, 0.80, 0.30],
+                    [0.40, 0.10, 0.90],
+                    [0.90, 0.20, 0.10],
+                    [0.30, 0.90, 0.20],
+                    [0.70, 0.60, 0.40],
+                    [0.60, 0.50, 1.00],
+                ],
+                0.0,
+                1.5,
+            ),
+        ];
+
+        let inputs = [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.18, 0.5, 0.9],
+            [0.02, 0.75, 0.33],
+            [-0.5, 0.25, 1.5],
+            [0.5, 0.5, 0.5],
+            [0.9, 0.4, 0.1],
+            [0.0, 1.0, 0.5],
+        ];
+
+        let mut saw_material_change = false;
+
+        for table in &tables {
+            for amount in [0.0f32, 0.6, 1.0, 1.5] {
+                let effective_amount =
+                    f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
+
+                let context = RgbTableApplyContext::new(table, amount).expect("valid metadata");
+
+                for input in inputs {
+                    let actual = context.apply(input).expect("apply");
+                    let expected = reference_5a(table, effective_amount, input);
+
+                    for channel in 0..3 {
+                        assert_eq!(
+                            actual[channel].to_bits(),
+                            expected[channel].to_bits(),
+                            "sRGB/sRGB/clip must be BIT-IDENTICAL to the 5A primitive for input \
+                             {input:?} (amount {amount}) channel {channel}: {actual:?} vs {expected:?}"
+                        );
+                    }
+
+                    if max_channel_delta(actual, input) > MATERIAL_DIFFERENCE {
+                        saw_material_change = true;
+                    }
+                }
+            }
+        }
+
+        // Non-vacuity: at least one probe must be materially changed, otherwise the
+        // bit-identity above would hold for a renderer that just returns its input.
+        assert!(
+            saw_material_change,
+            "the sRGB/sRGB/clip cases must include a material change, else bit-identity is vacuous"
+        );
+    }
+
+    #[test]
+    fn identity_rgb_table_renders_near_identity_under_every_metadata_combination() {
+        // In-gamut probes: neutrals map to themselves through EVERY primaries hop
+        // (the PCS normalisation exists for exactly that), so an identity LUT must
+        // be a near no-op for all 50 combinations.
+        let probes = [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.5, 0.5, 0.5],
+            [0.75, 0.75, 0.75],
+        ];
+
+        let mut combinations = 0;
+
+        for primaries in ALL_PRIMARIES {
+            for gamma in ALL_GAMMAS {
+                for gamut in ALL_GAMUTS {
+                    combinations += 1;
+
+                    let table = table_with_enums(
+                        IDENTITY_2X2X2,
+                        primaries.wire_value(),
+                        gamma.wire_value(),
+                        gamut.wire_value(),
+                    );
+                    let context = RgbTableApplyContext::new(&table, 1.0).expect("context");
+
+                    for probe in probes {
+                        let out = context.apply(probe).expect("apply");
+                        assert_rgb_close(
+                            out,
+                            probe,
+                            IDENTITY_COMBINATION_TOLERANCE,
+                            &format!("{primaries:?}/{gamma:?}/{gamut:?} identity {probe:?}"),
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            combinations, 50,
+            "every 5 primaries x 5 gammas x 2 gamuts combination must be exercised"
+        );
+    }
+
+    #[test]
+    fn synthetic_profile_exercises_every_primaries_enum() {
+        // A constant, non-identity profile: every encoded coordinate maps to
+        // (0.25, 0.5, 0.75). At amount 1.0 the result is the decoded constant
+        // pushed back through the primaries decode matrix, so it depends on the
+        // primaries enum.
+        const PROBE: [f32; 3] = [0.4, 0.6, 0.2];
+
+        let mut srgb_reference: Option<[f32; 3]> = None;
+        let mut seen = 0;
+
+        for primaries in ALL_PRIMARIES {
+            let table = table_with_enums(CONSTANT_2X2X2, primaries.wire_value(), 1, 0);
+            let out = RgbTableApplyContext::new(&table, 1.0)
+                .expect("context")
+                .apply(PROBE)
+                .expect("apply");
+
+            assert!(
+                out.iter().all(|channel| channel.is_finite()),
+                "{primaries:?} must render finitely, got {out:?}"
+            );
+
+            match srgb_reference {
+                None => {
+                    assert_eq!(primaries.wire_value(), 0, "sRGB must be first in wire order");
+                    srgb_reference = Some(out);
+                }
+                Some(reference) => assert!(
+                    max_channel_delta(out, reference) > MATERIAL_DIFFERENCE,
+                    "{primaries:?} must render differently from sRGB, got {out:?} vs {reference:?}"
+                ),
+            }
+
+            seen += 1;
+        }
+
+        assert_eq!(seen, 5, "all five primaries enums must be exercised");
+    }
+
+    #[test]
+    fn synthetic_profile_exercises_every_gamma_enum() {
+        // Constant profile (0.25, 0.5, 0.75) with sRGB identity primaries and
+        // amount 1.0: the result is exactly the constant decoded by the gamma, so
+        // every gamma enum must render distinctly from Linear.
+        const PROBE: [f32; 3] = [0.3, 0.3, 0.3];
+
+        let mut linear_reference: Option<[f32; 3]> = None;
+        let mut seen = 0;
+
+        for gamma in ALL_GAMMAS {
+            let table = table_with_enums(CONSTANT_2X2X2, 0, gamma.wire_value(), 0);
+            let out = RgbTableApplyContext::new(&table, 1.0)
+                .expect("context")
+                .apply(PROBE)
+                .expect("apply");
+
+            assert!(
+                out.iter().all(|channel| channel.is_finite()),
+                "{gamma:?} must render finitely, got {out:?}"
+            );
+
+            match linear_reference {
+                None => {
+                    assert_eq!(gamma.wire_value(), 0, "Linear must be first in wire order");
+                    linear_reference = Some(out);
+                }
+                Some(reference) => assert!(
+                    max_channel_delta(out, reference) > MATERIAL_DIFFERENCE,
+                    "{gamma:?} must render differently from Linear, got {out:?} vs {reference:?}"
+                ),
+            }
+
+            seen += 1;
+        }
+
+        assert_eq!(seen, 5, "all five gamma enums must be exercised");
+    }
+
+    #[test]
+    fn gamut_extend_re_adds_the_excursion_after_the_decode() {
+        // sRGB primaries keep the hop an identity, so the "linear table primaries"
+        // domain IS the pipeline domain and the recorded delta is exactly
+        // `(input - clamp(input))`.
+        const INPUT: [f32; 3] = [-0.25, 0.5, 1.75];
+
+        let clip = RgbTableApplyContext::new(&table_with_enums(CONSTANT_2X2X2, 0, 1, 0), 1.0)
+            .expect("clip context")
+            .apply(INPUT)
+            .expect("clip apply");
+
+        let extend = RgbTableApplyContext::new(&table_with_enums(CONSTANT_2X2X2, 0, 1, 1), 1.0)
+            .expect("extend context")
+            .apply(INPUT)
+            .expect("extend apply");
+
+        // Common path: the clamped input is gamma-encoded, the constant LUT is
+        // blended at amount 1.0, and the result is gamma-decoded.
+        let clamped_linear = [0.0f32, 0.5, 1.0];
+        let base = [
+            srgb_decode(0.25),
+            srgb_decode(0.5),
+            srgb_decode(0.75),
+        ];
+        let delta = [
+            INPUT[0] - clamped_linear[0],
+            INPUT[1] - clamped_linear[1],
+            INPUT[2] - clamped_linear[2],
+        ];
+
+        for channel in 0..3 {
+            // Clip discards the excursion...
+            assert_close(
+                clip[channel],
+                base[channel],
+                1e-7,
+                &format!("gamut_clip channel {channel}"),
+            );
+            // ...extend re-adds it AFTER the decode, then the final clamp applies.
+            assert_close(
+                extend[channel],
+                (base[channel] + delta[channel]).clamp(0.0, 1.0),
+                1e-6,
+                &format!("gamut_extend channel {channel}"),
+            );
+        }
+
+        // The channels that left [0,1] did so exactly: clip keeps the decoded
+        // base, extend moves it by the recorded excursion.
+        assert_eq!(clip[0], base[0], "clip discards the below-zero excursion");
+        assert_eq!(clip[2], base[2], "clip discards the above-one excursion");
+        assert_close(extend[0], 0.0, 1e-6, "extend re-adds a -0.25 excursion");
+        assert_close(extend[2], 1.0, 1e-6, "extend re-adds a +0.75 excursion");
+
+        // Non-vacuity: the two modes must differ on the out-of-range channels,
+        // otherwise the assertions above are indistinguishable. (The below-zero
+        // channel only moves by `srgb_decode(0.25) = 0.0509`, hence the smaller
+        // but still material threshold.)
+        assert!(
+            (extend[0] - clip[0]).abs() > 0.01,
+            "extend and clip must differ on the below-zero channel, got {} vs {}",
+            extend[0],
+            clip[0]
+        );
+        assert!(
+            (extend[2] - clip[2]).abs() > 0.1,
+            "extend and clip must differ on the above-one channel, got {} vs {}",
+            extend[2],
+            clip[2]
+        );
+    }
+
+    /// Tolerance for the `gamut_extend` order pin. The reference rebuilds the
+    /// production pipeline with the same f32 primitives and only the ordering of
+    /// the delta re-add and the decode matrix differs, so a tight bound applies.
+    const EXTEND_ORDER_TOLERANCE: f32 = 1e-6;
+
+    fn clamp_vec(v: [f32; 3]) -> [f32; 3] {
+        [
+            v[0].clamp(0.0, 1.0),
+            v[1].clamp(0.0, 1.0),
+            v[2].clamp(0.0, 1.0),
+        ]
+    }
+
+    #[test]
+    fn gamut_extend_adds_the_delta_before_the_decode_matrix_for_non_srgb_primaries() {
+        // The sRGB `gamut_extend` test cannot distinguish the SDK order
+        // (`decode matrix -> add delta`) from the reversed order
+        // (`add delta -> decode matrix`): for the sRGB primaries the hop is the
+        // identity, so the two commute. A NON-sRGB hop whose decode matrix has
+        // negative off-diagonal coefficients (DisplayP3) makes the two orders
+        // genuinely differ. `dng_reference.cpp:3800-3821` fixes the order as
+        // add-delta (h) THEN the decode matrix (i).
+        const PRIMARIES: Primaries = Primaries::DisplayP3;
+        // Out of range in the working space, so `gamut_extend` records a
+        // non-zero excursion in the linear table-primaries domain.
+        const INPUT: [f32; 3] = [1.4, 0.4, -0.1];
+
+        let transform = PrimariesTransform::new(PRIMARIES);
+        assert!(
+            !transform.is_identity_shortcut(),
+            "this test must use a non-identity primaries hop"
+        );
+
+        // Rebuild steps (a)-(g) of the pipeline exactly, at amount 1.0 with the
+        // constant LUT (so the gamma encode of the clamped input is irrelevant to
+        // the LUT result and only the delta and the decode matrix matter).
+        let linear = transform.encode(INPUT); // (a)
+        let (clamped, delta) = color_space::gamut_clamp(linear, Gamut::Extend); // (b)+(b')
+        let encoded_input = [
+            srgb_encode(clamped[0]),
+            srgb_encode(clamped[1]),
+            srgb_encode(clamped[2]),
+        ]; // (c)
+
+        // (d)-(f): constant encoded LUT blended at amount 1.0, then clamped.
+        const LUT: [f32; 3] = [0.25, 0.5, 0.75];
+        let mut blended = [0.0f32; 3];
+        for channel in 0..3 {
+            let lut_value = LUT[channel].clamp(0.0, 1.0);
+            let input = encoded_input[channel];
+            blended[channel] = (input + 1.0 * (lut_value - input)).clamp(0.0, 1.0);
+        }
+
+        // (g): gamma decode.
+        let base = [
+            srgb_decode(blended[0]),
+            srgb_decode(blended[1]),
+            srgb_decode(blended[2]),
+        ];
+
+        // SDK ORDER: add delta (h) THEN the decode matrix (i) THEN final clamp.
+        let sdk_order = clamp_vec(transform.decode([
+            base[0] + delta[0],
+            base[1] + delta[1],
+            base[2] + delta[2],
+        ]));
+
+        // REVERSED ORDER: decode matrix before the delta re-add.
+        let decoded_base = transform.decode(base);
+        let reversed_order = clamp_vec([
+            decoded_base[0] + delta[0],
+            decoded_base[1] + delta[1],
+            decoded_base[2] + delta[2],
+        ]);
+
+        // Non-vacuity: the two candidate orders MUST diverge materially for this
+        // input, otherwise the test could not tell them apart.
+        let order_gap = max_channel_delta(sdk_order, reversed_order);
+        assert!(
+            order_gap > MATERIAL_DIFFERENCE,
+            "the two candidate orders must differ materially, got a gap of {order_gap}"
+        );
+
+        // Production must match the SDK order and must NOT match the reversed one.
+        let actual = RgbTableApplyContext::new(
+            &table_with_enums(CONSTANT_2X2X2, PRIMARIES.wire_value(), 1, 1),
+            1.0,
+        )
+        .expect("extend context")
+        .apply(INPUT)
+        .expect("extend apply");
+
+        assert_rgb_close(
+            actual,
+            sdk_order,
+            EXTEND_ORDER_TOLERANCE,
+            "gamut_extend must add the delta before the decode matrix",
+        );
+        assert!(
+            max_channel_delta(actual, reversed_order) > MATERIAL_DIFFERENCE,
+            "production must reject the reversed order, got {actual:?} vs {reversed_order:?}"
+        );
+
+        // The excursion is real (delta non-zero), so "extend == clip" could not
+        // have produced this result.
+        assert!(
+            delta.iter().any(|d| *d != 0.0),
+            "the input must leave [0,1] in the linear table-primaries domain"
         );
     }
 }
