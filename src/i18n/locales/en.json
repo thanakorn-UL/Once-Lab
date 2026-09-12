@@ -1992,12 +1992,21 @@
     "xmpProfile": {
       "amount": "Amount",
       "applyFailed": "Failed to apply XMP profile",
+      "browse": "Browse Profiles",
+      "browseFailed": "Failed to load XMP profiles",
       "change": "Change",
+      "changeFolder": "Change Profile Folder",
       "choose": "Choose XMP Profile",
+      "chooseFolder": "Choose Profile Folder",
       "clear": "Clear",
+      "empty": "No supported XMP profiles found",
       "filterLabel": "XMP Profile",
       "label": "XMP Profile",
-      "rawOnly": "XMP RGB profiles are available for RAW images only"
+      "loading": "Loading profiles…",
+      "profileLibrary": "Profile Library",
+      "rawOnly": "XMP RGB profiles are available for RAW images only",
+      "refresh": "Refresh",
+      "ungrouped": "Ungrouped"
     }
   }
 }

@@ -7,6 +7,7 @@ import debounce from 'lodash.debounce';
 import { FileText, X } from 'lucide-react';
 import { Invokes } from './AppProperties';
 import Slider from './Slider';
+import XmpProfileBrowser, { type XmpProfileEntry } from './XmpProfileBrowser';
 import { useEditorStore, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, nextXmpProfileTransactionId } from '../../store/useEditorStore';
 
 interface XmpProfileSummary {
@@ -24,6 +25,7 @@ interface XmpProfileSummary {
 export default function XmpProfileControl() {
   const { t } = useTranslation();
   const selectedImage = useEditorStore((s) => s.selectedImage);
+  const xmpProfilePath = useEditorStore((s) => s.xmpProfilePath);
   const xmpProfileName = useEditorStore((s) => s.xmpProfileName);
   const xmpProfileAmountPercent = useEditorStore((s) => s.xmpProfileAmountPercent);
   const xmpProfileSupportsAmount = useEditorStore((s) => s.xmpProfileSupportsAmount);
@@ -137,6 +139,14 @@ export default function XmpProfileControl() {
     commitProfile(null, null);
   };
 
+  // A discovered entry already carries the metadata the backend parsed out of
+  // the profile, so it feeds the very same transaction the manual picker uses
+  // and never needs a second inspect round trip.
+  const handleSelectDiscoveredProfile = (entry: XmpProfileEntry) => {
+    debouncedAmountCommit.cancel();
+    commitProfile(entry.path, entry.name, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, entry.supports_amount);
+  };
+
   const handleAmountCommit = () => {
     const percent = draggedAmountRef.current;
     const {
@@ -194,6 +204,12 @@ export default function XmpProfileControl() {
           </button>
         )}
       </div>
+
+      <XmpProfileBrowser
+        activePath={xmpProfilePath}
+        applyDisabled={isDisabled}
+        onSelectProfile={handleSelectDiscoveredProfile}
+      />
 
       {xmpProfileName && xmpProfileSupportsAmount && (
         <Slider
