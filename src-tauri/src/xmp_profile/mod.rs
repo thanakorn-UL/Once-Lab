@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
+use tauri::{AppHandle, Manager};
+
 mod apply;
+mod default_roots;
 mod discovery;
 mod integration;
 mod loader;
@@ -32,4 +35,23 @@ pub fn discover_xmp_profiles(
 ) -> Result<Vec<discovery::XmpProfileEntry>, String> {
     let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     discovery::discover_xmp_profiles(&roots)
+}
+
+/// Detects the Adobe Camera Raw profile folders that already exist on this
+/// machine.
+///
+/// Read-only: only existing directories are returned, nothing is created and no
+/// profile is scanned here. A returned root is meant to be handed to
+/// [`discover_xmp_profiles`] like any other root, which keeps discovery in one
+/// place.
+#[tauri::command]
+pub fn discover_default_xmp_profile_roots(
+    app_handle: AppHandle,
+) -> Result<Vec<default_roots::XmpProfileRootDescriptor>, String> {
+    let home = app_handle
+        .path()
+        .home_dir()
+        .map_err(|error| error.to_string())?;
+
+    Ok(default_roots::existing_default_xmp_profile_roots(&home))
 }

@@ -15,7 +15,7 @@ interface SettingsState {
   setAppSettings: (settings: AppSettings | null) => void;
   setTheme: (theme: string) => void;
   setSupportedTypes: (types: SupportedTypes | null) => void;
-  handleSettingsChange: (newSettings: AppSettings) => Promise<void>;
+  handleSettingsChange: (newSettings: AppSettings) => Promise<boolean>;
 }
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
@@ -41,7 +41,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   handleSettingsChange: async (newSettings: AppSettings) => {
     if (!newSettings) {
       console.error('handleSettingsChange was called with null settings. Aborting save operation.');
-      return;
+      return false;
     }
 
     if (newSettings.theme && newSettings.theme !== get().theme) {
@@ -53,8 +53,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
     try {
       await invoke(Invokes.SaveSettings, { settings: settingsToSave });
+      return true;
     } catch (err) {
       console.error('Failed to save settings:', err);
+      return false;
     }
   },
 }));

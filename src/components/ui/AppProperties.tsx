@@ -47,6 +47,7 @@ export enum Invokes {
   CreateVirtualCopy = 'create_virtual_copy',
   CullImages = 'cull_images',
   DeleteFolder = 'delete_folder',
+  DiscoverDefaultXmpProfileRoots = 'discover_default_xmp_profile_roots',
   DiscoverXmpProfiles = 'discover_xmp_profiles',
   DuplicateFile = 'duplicate_file',
   EstimateExportSizes = 'estimate_export_sizes',
@@ -251,6 +252,7 @@ export interface AppSettings {
   groupEditedFiles?: boolean;
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
+  xmpProfileRoots?: string[];
   workspace?: WorkspaceState;
 }
 

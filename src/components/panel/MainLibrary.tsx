@@ -82,7 +82,7 @@ interface MainLibraryProps {
   onImportClick(): void;
   onLibraryRefresh(): void;
   onOpenFolder(): void;
-  onSettingsChange(settings: AppSettings): Promise<void>;
+  onSettingsChange(settings: AppSettings): Promise<unknown>;
   onThumbnailAspectRatioChange(aspectRatio: ThumbnailAspectRatio): void;
   onThumbnailSizeChange(size: ThumbnailSize): void;
   onRequestThumbnails?(paths: string[]): void;

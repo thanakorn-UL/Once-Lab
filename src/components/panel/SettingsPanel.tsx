@@ -88,7 +88,7 @@ interface SettingsPanelProps {
   appSettings: any;
   onBack(): void;
   onLibraryRefresh(): void;
-  onSettingsChange(settings: any): Promise<void>;
+  onSettingsChange(settings: any): Promise<unknown>;
   rootPaths: string[];
 }
 

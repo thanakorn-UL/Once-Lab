@@ -476,6 +476,11 @@ pub struct AppSettings {
     pub enable_xmp_sync: Option<bool>,
     #[serde(default)]
     pub create_xmp_if_missing: Option<bool>,
+    /// Profile folders the user added, persisted by exact path so the library
+    /// can be restored at startup. Detected Adobe roots are never stored here,
+    /// and neither is the active profile nor its amount.
+    #[serde(default)]
+    pub xmp_profile_roots: Vec<String>,
     #[serde(default)]
     pub is_waveform_visible: Option<bool>,
     #[serde(default)]
@@ -592,6 +597,7 @@ impl Default for AppSettings {
             linear_raw_mode: default_linear_raw_mode(),
             enable_xmp_sync: Some(true),
             create_xmp_if_missing: Some(false),
+            xmp_profile_roots: Vec::new(),
             is_waveform_visible: Some(false),
             waveform_height: Some(220),
             active_waveform_channel: Some("luma".to_string()),
@@ -733,4 +739,108 @@ pub fn save_settings(settings: AppSettings, app_handle: AppHandle) -> Result<(),
         .unwrap()
         .set_capacity(cache_size);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Settings written before the profile root list existed must keep loading,
+    /// with the list defaulting to empty.
+    #[test]
+    fn old_settings_without_xmp_profile_roots_still_load() {
+        let old = r#"{
+            "lastRootPath": "/photos",
+            "rootFolders": ["/photos"],
+            "theme": "light",
+            "thumbnailSize": "large",
+            "language": "de"
+        }"#;
+
+        let settings: AppSettings =
+            serde_json::from_str(old).expect("an older settings file must still deserialize");
+
+        assert!(settings.xmp_profile_roots.is_empty());
+        assert_eq!(settings.theme.as_deref(), Some("light"));
+        assert_eq!(settings.root_folders, vec!["/photos".to_string()]);
+        assert_eq!(settings.language.as_deref(), Some("de"));
+    }
+
+    /// The persisted root list survives a save/load cycle unchanged.
+    #[test]
+    fn xmp_profile_roots_roundtrip_exactly() {
+        let roots = vec!["/profiles/a".to_string(), "/profiles/b".to_string()];
+        let settings = AppSettings {
+            xmp_profile_roots: roots.clone(),
+            ..AppSettings::default()
+        };
+
+        let serialized = serde_json::to_string(&settings).expect("serialize settings");
+        assert!(serialized.contains("\"xmpProfileRoots\""));
+
+        let reloaded: AppSettings = serde_json::from_str(&serialized).expect("deserialize settings");
+        assert_eq!(reloaded.xmp_profile_roots, roots);
+    }
+
+    /// The copy/paste adjustment sets are `HashSet`s, so their arrays come back
+    /// in a different order on every run; sorting them keeps the comparison
+    /// about content rather than about hash order.
+    fn normalize_hashed_arrays(value: &mut Value) {
+        for key in ["includedAdjustments", "knownAdjustments"] {
+            if let Some(Value::Array(items)) = value.pointer_mut(&format!("/copyPasteSettings/{key}")) {
+                items.sort_by_key(|item| item.as_str().map(str::to_string));
+            }
+        }
+    }
+
+    /// The frontend saves the whole settings object with only the root list
+    /// changed, so nothing else may be lost or rewritten in the process.
+    #[test]
+    fn changing_roots_preserves_every_unrelated_field() {
+        let partial = r#"{
+            "lastRootPath": "/photos",
+            "rootFolders": ["/photos", "/photos/2024"],
+            "theme": "light",
+            "fontFamily": "Inter",
+            "language": "de",
+            "thumbnailSize": "large",
+            "sortCriteria": { "key": "modified", "order": "desc" },
+            "keybinds": { "copy": ["mod+c"] },
+            "exportPresets": [],
+            "xmpProfileRoots": ["/profiles/a"]
+        }"#;
+
+        let loaded: AppSettings = serde_json::from_str(partial).expect("load settings");
+        let full = serde_json::to_string(&loaded).expect("serialize settings");
+
+        let mut updated: AppSettings = serde_json::from_str(&full).expect("reload settings");
+        updated.xmp_profile_roots.push("/profiles/b".to_string());
+        let saved = serde_json::to_string(&updated).expect("serialize settings");
+
+        let mut before: Value = serde_json::from_str(&full).expect("parse json");
+        let mut after: Value = serde_json::from_str(&saved).expect("parse json");
+
+        let roots_before = before
+            .as_object_mut()
+            .expect("settings object")
+            .remove("xmpProfileRoots")
+            .expect("root list");
+        let roots_after = after
+            .as_object_mut()
+            .expect("settings object")
+            .remove("xmpProfileRoots")
+            .expect("root list");
+
+        assert_eq!(roots_before, json!(["/profiles/a"]));
+        assert_eq!(roots_after, json!(["/profiles/a", "/profiles/b"]));
+
+        normalize_hashed_arrays(&mut before);
+        normalize_hashed_arrays(&mut after);
+
+        assert_eq!(
+            before, after,
+            "saving the root list must leave every other setting untouched"
+        );
+    }
 }

@@ -2141,6 +2141,7 @@ pub fn run() {
             image_loader::is_image_cached,
             xmp_profile::inspect_xmp_profile,
             xmp_profile::discover_xmp_profiles,
+            xmp_profile::discover_default_xmp_profile_roots,
             panorama_stitching::stitch_panorama,
             panorama_stitching::save_panorama,
             export_processing::export_images,

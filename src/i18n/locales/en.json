@@ -1991,6 +1991,7 @@
     },
     "xmpProfile": {
       "addFolder": "Add Profile Folder",
+      "adobeRootName": "Adobe Camera Raw",
       "amount": "Amount",
       "applyFailed": "Failed to apply XMP profile",
       "browse": "Browse Profiles",
@@ -2008,6 +2009,9 @@
       "refreshAll": "Refresh All",
       "refreshFolder": "Refresh Folder",
       "removeFolder": "Remove Folder",
+      "rootsSaveFailed": "Failed to save profile folders. Changes will not survive a restart.",
+      "systemRoot": "System",
+      "unavailableRoot": "Unavailable",
       "ungrouped": "Ungrouped"
     }
   }
