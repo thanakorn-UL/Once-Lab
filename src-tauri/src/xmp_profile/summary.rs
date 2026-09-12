@@ -31,7 +31,9 @@ pub(crate) fn summarize_xmp_profile(profile: &XmpRgbProfile, path: &Path) -> Xmp
     }
 }
 
-fn normalize_path_string(path: &Path) -> String {
+/// Renders `path` the same way for single-file inspection and library
+/// discovery, so both surfaces agree on a profile's identity.
+pub(crate) fn normalize_path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 

@@ -8,6 +8,13 @@ use std::path::Path;
 
 use crate::xmp_profile::XmpRgbProfile;
 
+/// Whether `path` carries an `.xmp` extension, compared case-insensitively.
+pub(crate) fn has_xmp_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"))
+}
+
 /// Reads and parses an Adobe XMP RGB profile from `path`.
 ///
 /// The file extension is validated first, so a non-`.xmp` path is rejected
@@ -15,12 +22,7 @@ use crate::xmp_profile::XmpRgbProfile;
 /// bytes are an error rather than being replaced), and parsing reuses the
 /// existing [`parse_xmp_rgb_profile`](super::parse_xmp_rgb_profile).
 pub(crate) fn load_xmp_rgb_profile_from_path(path: &Path) -> Result<XmpRgbProfile, String> {
-    let has_xmp_extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"));
-
-    if !has_xmp_extension {
+    if !has_xmp_extension(path) {
         return Err(format!("expected .xmp profile file: {}", path.display()));
     }
 

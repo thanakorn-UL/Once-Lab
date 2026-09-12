@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 mod apply;
+mod discovery;
 mod integration;
 mod loader;
 mod parser;
@@ -17,4 +20,16 @@ pub(crate) use rgb_table::{RgbTable, decode_adobe_rgb_table};
 #[tauri::command]
 pub fn inspect_xmp_profile(path: String) -> Result<summary::XmpProfileSummary, String> {
     summary::inspect_xmp_profile(&path)
+}
+
+/// Discovers supported XMP RGB profiles under the caller-provided roots.
+///
+/// Roots are explicit: nothing is scanned implicitly, and no Adobe installation
+/// directory is hardcoded here.
+#[tauri::command]
+pub fn discover_xmp_profiles(
+    roots: Vec<String>,
+) -> Result<Vec<discovery::XmpProfileEntry>, String> {
+    let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    discovery::discover_xmp_profiles(&roots)
 }

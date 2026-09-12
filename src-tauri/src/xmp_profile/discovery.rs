@@ -1,0 +1,695 @@
+//! Read-only discovery of supported Adobe XMP RGB profiles.
+//!
+//! A `.xmp` extension is not proof of a profile: the same extension covers
+//! develop presets, RAW sidecars and unrelated metadata. Every candidate is
+//! therefore routed through the approved parser, and anything that does not
+//! parse into the supported color profile shape is skipped rather than
+//! surfaced to the frontend.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use walkdir::WalkDir;
+
+use crate::xmp_profile::XmpRgbProfile;
+use crate::xmp_profile::loader::has_xmp_extension;
+use crate::xmp_profile::parser::parse_xmp_rgb_profile;
+use crate::xmp_profile::summary::normalize_path_string;
+
+/// Frontend-facing description of a discoverable XMP RGB profile.
+///
+/// Deliberately excludes the decoded RGBTable, its byte payload and the
+/// authored `crs:RGBTableAmount`: the backend stays authoritative and the
+/// frontend never parses XMP itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XmpProfileEntry {
+    pub name: String,
+    pub group: Option<String>,
+    pub uuid: String,
+    pub path: String,
+    pub supports_amount: bool,
+}
+
+/// Classifies a single path without ever failing on unsupported content.
+///
+/// * non-`.xmp` path → `Ok(None)`
+/// * readable but not a supported color RGB profile → `Ok(None)`
+/// * readable supported profile → `Ok(Some(entry))`
+/// * unreadable path (missing file, permissions, non-UTF-8) → `Err(context)`
+///
+/// Only the read step is duplicated from the loader; parsing is delegated to
+/// the approved [`parse_xmp_rgb_profile`] so no profile semantics live here.
+pub(crate) fn classify_xmp_profile_path(path: &Path) -> Result<Option<XmpProfileEntry>, String> {
+    if !has_xmp_extension(path) {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read XMP profile '{}': {error}", path.display()))?;
+
+    match parse_xmp_rgb_profile(&contents) {
+        Ok(profile) => Ok(Some(entry_from_profile(&profile, path))),
+        // Presets, RAW sidecars, grayscale profiles and malformed documents all
+        // mean the same thing to a library scan: not a supported profile.
+        Err(error) => {
+            log::debug!(
+                "Skipping XMP file that is not a supported RGB profile '{}': {error}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Discovers every supported XMP RGB profile under `roots`.
+///
+/// Scans are recursive. Symlinked directories are never descended into, so a
+/// symlink cycle cannot walk the scan outside the caller-provided roots;
+/// symlinked profile files are read like any other file. Individual unreadable
+/// or unsupported files are skipped, while a root that is missing or unreadable
+/// fails the scan with a contextual error.
+///
+/// Deduplication is by walked path, so repeated or overlapping roots cannot
+/// return the same file twice. Discovery never canonicalizes, so the same file
+/// reached through two different spellings of a root (for example `profiles`
+/// and `./profiles`) is not recognised as a duplicate.
+///
+/// An empty `roots` slice discovers nothing; scanning is never implicit.
+pub(crate) fn discover_xmp_profiles(roots: &[PathBuf]) -> Result<Vec<XmpProfileEntry>, String> {
+    let mut entries: Vec<XmpProfileEntry> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+
+    for root in roots {
+        if !root.is_dir() {
+            return Err(format!(
+                "XMP profile directory does not exist or is not a directory: {}",
+                root.display()
+            ));
+        }
+
+        std::fs::read_dir(root).map_err(|error| {
+            format!(
+                "failed to read XMP profile directory '{}': {error}",
+                root.display()
+            )
+        })?;
+
+        for walked in WalkDir::new(root) {
+            let walked = match walked {
+                Ok(walked) => walked,
+                Err(error) => {
+                    log::warn!("Skipping unreadable path while scanning XMP profiles: {error}");
+                    continue;
+                }
+            };
+
+            let path = walked.path();
+            if !has_xmp_extension(path) || !path.is_file() || !visited.insert(path.to_path_buf()) {
+                continue;
+            }
+
+            match classify_xmp_profile_path(path) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => {}
+                Err(error) => log::warn!("Skipping unusable XMP file: {error}"),
+            }
+        }
+    }
+
+    entries.sort_by_key(profile_sort_key);
+    Ok(entries)
+}
+
+/// Sort order: grouped entries first by case-insensitive group, then by
+/// case-insensitive name, then by path.
+fn profile_sort_key(entry: &XmpProfileEntry) -> (bool, String, String, String) {
+    (
+        entry.group.is_none(),
+        entry.group.as_deref().unwrap_or_default().to_lowercase(),
+        entry.name.to_lowercase(),
+        entry.path.clone(),
+    )
+}
+
+fn entry_from_profile(profile: &XmpRgbProfile, path: &Path) -> XmpProfileEntry {
+    XmpProfileEntry {
+        name: profile.name.clone(),
+        group: profile.group.clone(),
+        uuid: profile.uuid.clone(),
+        path: normalize_path_string(path),
+        supports_amount: profile.supports_amount,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Synthetic 2x2x2 identity RGBTable (same fixture pattern as the parser,
+    /// rgb_table, loader and summary tests).
+    const IDENTITY_2X2X2_BASE85: &str = "71000rtKmwBRLy1{X$/w9'=(bLC9YEvFE(9%a0@fg0";
+
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "once_lab_xmp_discovery_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            counter
+        ));
+
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Writes `contents` to `dir/name`, creating parent directories.
+    fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+
+        fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    /// Supported color profile whose embedded identity is independent of the
+    /// file name. `crs:RGBTableAmount` is intentionally absent: discovery must
+    /// not depend on authored amount metadata.
+    fn profile_xmp(name: &str, group: Option<&str>, uuid: &str, supports_amount: &str) -> String {
+        let group_block = group
+            .map(|group| {
+                format!(
+                    r#"
+      <crs:Group>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{group}</rdf:li>
+        </rdf:Alt>
+      </crs:Group>"#
+                )
+            })
+            .unwrap_or_default();
+
+        format!(
+            r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:PresetType="Look"
+      crs:UUID="{uuid}"
+      crs:SupportsAmount="{supports_amount}"
+      crs:ConvertToGrayscale="False"
+      crs:RGBTable="TESTTABLE"
+      crs:Table_TESTTABLE="{table}">
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{name}</rdf:li>
+        </rdf:Alt>
+      </crs:Name>{group_block}
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+            table = IDENTITY_2X2X2_BASE85
+        )
+    }
+
+    /// Valid XMP that is a develop preset, not a profile.
+    fn preset_xmp() -> String {
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:PresetType="Normal"
+      crs:UUID="PRESET123"
+      crs:ProcessVersion="11.0">
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Some Develop Preset</rdf:li>
+        </rdf:Alt>
+      </crs:Name>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#
+            .to_string()
+    }
+
+    /// Mirrors the shape a RAW editor writes next to a RAW file: develop
+    /// settings containing a `crs:Look` block and embedded RGBTable data, but
+    /// no `crs:PresetType`. This must never be mistaken for a profile.
+    fn raw_sidecar_xmp() -> String {
+        format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:Version="18.5.1"
+      crs:ProcessVersion="15.4"
+      crs:WhiteBalance="As Shot"
+      crs:Exposure2012="0.00"
+      crs:CameraProfile="Adobe Standard"
+      crs:HasSettings="True">
+      <crs:Look>
+        <rdf:Description
+          crs:Name="Embedded Look"
+          crs:Amount="1"
+          crs:UUID="LOOKUUID">
+          <crs:Parameters>
+            <rdf:Description
+              crs:Version="18.5.1"
+              crs:ConvertToGrayscale="False"
+              crs:RGBTable="SIDECARTABLE"
+              crs:RGBTableAmount="0.5"
+              crs:Table_SIDECARTABLE="{table}">
+            </rdf:Description>
+          </crs:Parameters>
+        </rdf:Description>
+      </crs:Look>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+            table = IDENTITY_2X2X2_BASE85
+        )
+    }
+
+    #[test]
+    fn discovers_valid_rgb_profile() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "sample.xmp",
+            &profile_xmp("Sample", Some("Group"), "UUID-A", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0],
+            XmpProfileEntry {
+                name: "Sample".to_string(),
+                group: Some("Group".to_string()),
+                uuid: "UUID-A".to_string(),
+                path: dir.join("sample.xmp").to_string_lossy().to_string(),
+                supports_amount: true,
+            }
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn ignores_non_xmp_files() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "sample.xmp",
+            &profile_xmp("Sample", None, "UUID-A", "True"),
+        );
+        write_file(&dir, "notes.txt", "not a profile");
+        write_file(&dir, "photo.NEF", "not a profile");
+        write_file(&dir, "photo.NEF.rrdata", "{\"tags\":[]}");
+        write_file(&dir, "photo.acr", "not a profile");
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(entries.len(), 1, "only the .xmp profile may be discovered");
+        assert_eq!(entries[0].name, "Sample");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn extension_is_case_insensitive() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "upper.XMP",
+            &profile_xmp("Upper", None, "UUID-U", "True"),
+        );
+        write_file(
+            &dir,
+            "mixed.Xmp",
+            &profile_xmp("Mixed", None, "UUID-M", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        let mut names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Mixed", "Upper"]);
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn skips_malformed_xmp_without_failing_scan() {
+        let dir = unique_temp_dir();
+        write_file(&dir, "broken.xmp", "<x:xmpmeta><rdf:RDF");
+        write_file(&dir, "empty.xmp", "");
+        write_file(&dir, "binary.xmp", "\u{FFFD}\u{0}not xml");
+        write_file(
+            &dir,
+            "good.xmp",
+            &profile_xmp("Good", None, "UUID-G", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must survive bad files");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Good");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn skips_non_profile_xmp() {
+        let dir = unique_temp_dir();
+        write_file(&dir, "preset.xmp", &preset_xmp());
+        write_file(&dir, "sidecar.xmp", &raw_sidecar_xmp());
+        write_file(
+            &dir,
+            "good.xmp",
+            &profile_xmp("Good", None, "UUID-G", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Good");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn returns_multiple_profiles() {
+        let dir = unique_temp_dir();
+        write_file(&dir, "one.xmp", &profile_xmp("One", None, "UUID-1", "True"));
+        write_file(
+            &dir,
+            "two.xmp",
+            &profile_xmp("Two", None, "UUID-2", "False"),
+        );
+        write_file(
+            &dir,
+            "three.xmp",
+            &profile_xmp("Three", None, "UUID-3", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(entries.len(), 3);
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn deterministic_sorting() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "f1.xmp",
+            &profile_xmp("Bravo", Some("alpha"), "UUID-1", "True"),
+        );
+        write_file(
+            &dir,
+            "f2.xmp",
+            &profile_xmp("Alpha", Some("alpha"), "UUID-2", "True"),
+        );
+        write_file(
+            &dir,
+            "f3.xmp",
+            &profile_xmp("Charlie", Some("Beta"), "UUID-3", "True"),
+        );
+        write_file(
+            &dir,
+            "f4.xmp",
+            &profile_xmp("Delta", None, "UUID-4", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let observed: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.group.as_deref()))
+            .collect();
+
+        // Case-insensitive group order (alpha before Beta), name order within a
+        // group, and ungrouped profiles last.
+        assert_eq!(
+            observed,
+            [
+                ("Alpha", Some("alpha")),
+                ("Bravo", Some("alpha")),
+                ("Charlie", Some("Beta")),
+                ("Delta", None),
+            ]
+        );
+
+        // Repeated scans of unchanged inputs must agree.
+        let again = discover_xmp_profiles(&[dir.clone()]).expect("rescan should succeed");
+        assert_eq!(entries, again);
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn duplicate_paths_not_returned_twice() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "nested/deep.xmp",
+            &profile_xmp("Deep", None, "UUID-D", "True"),
+        );
+        // The same root twice, plus an overlapping parent/child pair.
+        let entries = discover_xmp_profiles(&[dir.clone(), dir.clone(), dir.join("nested")])
+            .expect("scan should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Deep");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Path is the identity at this milestone: two installations of the same
+    /// profile share a UUID but are distinct files, and both stay visible.
+    #[test]
+    fn duplicate_uuids_at_different_paths_are_both_returned() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "install-a/Shared.xmp",
+            &profile_xmp("Shared A", None, "SHARED-UUID", "True"),
+        );
+        write_file(
+            &dir,
+            "install-b/Shared.xmp",
+            &profile_xmp("Shared B", None, "SHARED-UUID", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "a UUID match must not silently collapse distinct files"
+        );
+        assert!(entries.iter().all(|entry| entry.uuid == "SHARED-UUID"));
+        assert_ne!(entries[0].path, entries[1].path);
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Symlink policy: a symlinked profile file is read, but a symlinked
+    /// directory is never descended into, so the scan cannot walk outside the
+    /// root it was given.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_is_read_but_symlinked_directory_is_not_descended() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_temp_dir();
+        let outside = unique_temp_dir();
+
+        let external_profile = write_file(
+            &outside,
+            "External.xmp",
+            &profile_xmp("External", None, "UUID-E", "True"),
+        );
+        write_file(
+            &outside,
+            "nested/Hidden.xmp",
+            &profile_xmp("Hidden", None, "UUID-H", "True"),
+        );
+
+        symlink(&external_profile, dir.join("linked.xmp")).expect("symlink to profile");
+        symlink(outside.join("nested"), dir.join("linked-dir")).expect("symlink to directory");
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            ["External"],
+            "the symlinked profile is discoverable, the symlinked directory is not followed"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+        fs::remove_dir_all(&outside).expect("remove temp dir");
+    }
+
+    #[test]
+    fn missing_root_returns_contextual_error() {
+        let dir = unique_temp_dir();
+        let missing = dir.join("does-not-exist");
+
+        let error = discover_xmp_profiles(&[missing.clone()])
+            .expect_err("a missing root must fail the scan");
+
+        assert!(
+            error.contains(&missing.to_string_lossy().to_string()),
+            "error should name the offending root: {error}"
+        );
+
+        let file_root = write_file(&dir, "not-a-dir.xmp", &preset_xmp());
+        let error = discover_xmp_profiles(&[file_root.clone()])
+            .expect_err("a file passed as root must fail the scan");
+        assert!(
+            error.contains(&file_root.to_string_lossy().to_string()),
+            "error should name the offending root: {error}"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn profile_entry_uses_embedded_name_group_uuid() {
+        let dir = unique_temp_dir();
+        let path = write_file(
+            &dir,
+            "file-name-does-not-match.xmp",
+            &profile_xmp(
+                "Embedded Name",
+                Some("Embedded Group"),
+                "EMBEDDED-UUID",
+                "False",
+            ),
+        );
+
+        let entry = classify_xmp_profile_path(&path)
+            .expect("classification should succeed")
+            .expect("a supported profile must classify as Some");
+
+        assert_eq!(entry.name, "Embedded Name");
+        assert_eq!(entry.group, Some("Embedded Group".to_string()));
+        assert_eq!(entry.uuid, "EMBEDDED-UUID");
+        assert!(!entry.supports_amount);
+        assert_eq!(entry.path, path.to_string_lossy().to_string());
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn classify_returns_none_for_non_xmp_path() {
+        let dir = unique_temp_dir();
+        let path = write_file(&dir, "photo.NEF", "raw data");
+
+        assert_eq!(
+            classify_xmp_profile_path(&path),
+            Ok(None),
+            "non-.xmp paths are never candidates"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn classify_returns_none_for_unsupported_xmp_content() {
+        let dir = unique_temp_dir();
+        let preset = write_file(&dir, "preset.xmp", &preset_xmp());
+        let sidecar = write_file(&dir, "sidecar.xmp", &raw_sidecar_xmp());
+        let malformed = write_file(&dir, "broken.xmp", "<x:xmpmeta>");
+
+        for path in [preset, sidecar, malformed] {
+            assert_eq!(
+                classify_xmp_profile_path(&path),
+                Ok(None),
+                "{} must be treated as unsupported content",
+                path.display()
+            );
+        }
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn classify_reports_unreadable_xmp_as_error() {
+        let dir = unique_temp_dir();
+        let missing = dir.join("missing.xmp");
+
+        let error = classify_xmp_profile_path(&missing)
+            .expect_err("an unreadable file must be distinguishable from unsupported content");
+
+        assert!(
+            error.contains(&missing.to_string_lossy().to_string()),
+            "error should contain the path: {error}"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Discovers the real reference profiles. The fixture directory is
+    /// UNTRACKED, so a clean checkout has to skip this test instead of failing
+    /// the suite (same guard the render acceptance test uses).
+    #[test]
+    fn real_reference_discovery() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../raw-filewithxmp-profile");
+
+        if !fixture.is_dir() {
+            eprintln!("ACCEPTANCE SKIPPED: {} is missing", fixture.display());
+            return;
+        }
+
+        // The directory is known to exist, so canonicalizing it is safe from
+        // here on. Discovery itself never rewrites the roots it is given.
+        let fixture = fixture.canonicalize().expect("acceptance directory");
+        let entries = discover_xmp_profiles(&[fixture]).expect("reference scan");
+
+        eprintln!("ACCEPTANCE: discovered {} entries", entries.len());
+        for entry in &entries {
+            eprintln!(
+                "  name={:?} group={:?} uuid={} supports_amount={} path={}",
+                entry.name, entry.group, entry.uuid, entry.supports_amount, entry.path
+            );
+        }
+
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"Au ⛏️"), "Au must be discovered: {names:?}");
+        assert!(names.contains(&"Cu ⛏️"), "Cu must be discovered: {names:?}");
+
+        // The RAW file and the unrelated sidecar artifacts in the same folder
+        // must never surface as profiles.
+        for entry in &entries {
+            assert!(
+                has_xmp_extension(Path::new(&entry.path)),
+                "discovered entry is not an .xmp file: {}",
+                entry.path
+            );
+            assert!(
+                !entry.path.ends_with("TLP_8278.NEF") && !entry.path.ends_with(".rrdata"),
+                "non-profile artifact was discovered: {}",
+                entry.path
+            );
+        }
+    }
+}
