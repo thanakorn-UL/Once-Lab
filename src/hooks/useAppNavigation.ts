@@ -296,7 +296,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
                 if (selectedImagePathRef.current !== path) return;
                 const restored = profileProjectionFromRestore(restore);
                 if (!isSliderDragging && !profileProjectionsEqual(restored, cachedProfile ?? PROFILE_PROJECTION_NONE)) {
-                  console.log(`Develop profile changed on disk for ${path}; reloading authoritatively`);
+                  console.warn(`Develop profile changed on disk for ${path}; reloading authoritatively`);
                   setEditor({ selectedImage: { ...cached?.selectedImage, isReady: false } });
                 }
               })

@@ -69,6 +69,17 @@ pub(crate) fn resolve_reference_against_roots(
     reference: &DevelopProfileReference,
     roots: &[PathBuf],
 ) -> DevelopProfileRestore {
+    // Fast path: when the saved path alone already determines the outcome, the
+    // reference resolves without scanning a single root. This is
+    // outcome-equivalent: the candidate the scan would produce at this path is
+    // exactly this file, so the `find(path == p && uuid == u)` arm (or, for a
+    // path-only reference, `find(path == p)`) returns it either way. A saved
+    // path holding a DIFFERENT profile falls through, so the scan can still
+    // prefer the saved uuid elsewhere.
+    if let Some(resolved) = resolve_from_saved_path(reference) {
+        return resolved;
+    }
+
     let candidates = collect_profile_candidates(roots, reference);
 
     match resolve_profile_reference(reference, &candidates) {
@@ -95,6 +106,39 @@ pub(crate) fn resolve_reference_against_roots(
         // different profile sitting at the saved path is never substituted.
         ProfileResolution::Missing { reference } => DevelopProfileRestore::Missing { reference },
     }
+}
+
+/// Resolves `reference` from its own saved path, when that path alone settles
+/// the outcome; `None` falls through to the root scan.
+///
+/// The saved path settles the outcome when the file loads AND either the
+/// reference carries no uuid (a path-only reference can only ever match this
+/// path) OR the loaded profile's uuid equals the saved uuid. A saved path whose
+/// profile has a DIFFERENT uuid returns `None`, so the root scan still runs and
+/// can prefer the saved uuid elsewhere.
+fn resolve_from_saved_path(reference: &DevelopProfileReference) -> Option<DevelopProfileRestore> {
+    let saved_path = reference
+        .path
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(saved_path);
+
+    if !path.is_file() {
+        return None;
+    }
+
+    let loaded = load_xmp_rgb_profile_from_path(path).ok()?;
+
+    if let Some(uuid) = reference.uuid.as_deref().filter(|value| !value.is_empty())
+        && loaded.uuid.as_str() != uuid
+    {
+        return None;
+    }
+
+    Some(DevelopProfileRestore::Resolved {
+        reference: reference.clone(),
+        summary: summarize_xmp_profile(&loaded, path),
+    })
 }
 
 /// Every profile the resolution may match, in discovery order.
@@ -740,6 +784,103 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("remove temp dir");
         fs::remove_dir_all(&elsewhere).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_saved_path_that_resolves_skips_the_root_scan() {
+        let saved_dir = unique_temp_dir("skip_scan_saved");
+        let saved = write_profile(&saved_dir, "Saved.xmp", "Saved Profile", "UUID-SAVED");
+        let saved_string = saved.to_string_lossy().to_string();
+
+        // A root that cannot be scanned: nothing must depend on the scan.
+        let missing_root = unique_temp_dir("skip_scan_missing");
+        let missing_root_path = missing_root.join("does-not-exist");
+
+        // A root whose profile has a DIFFERENT uuid and is listed FIRST: the
+        // saved path must still win, pinning that the early exit did not change
+        // the preference rules.
+        let first_root = unique_temp_dir("skip_scan_first");
+        write_profile(&first_root, "AAFirst.xmp", "First", "UUID-OTHER");
+
+        let reference = reference(
+            Some("UUID-SAVED"),
+            Some(&saved_string),
+            Some("Saved Profile"),
+            100.0,
+        );
+
+        let restore = resolve_reference_against_roots(
+            &reference,
+            &[missing_root_path.clone(), first_root.clone()],
+        );
+
+        let DevelopProfileRestore::Resolved { summary, .. } = restore else {
+            panic!("the saved path must resolve regardless of the roots: {restore:?}");
+        };
+        assert_eq!(summary.uuid, "UUID-SAVED");
+        assert_eq!(summary.path, saved_string);
+
+        fs::remove_dir_all(&saved_dir).expect("remove temp dir");
+        fs::remove_dir_all(&missing_root).expect("remove temp dir");
+        fs::remove_dir_all(&first_root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_saved_path_holding_a_different_uuid_still_falls_through() {
+        // The file at the saved path loads, but with a DIFFERENT uuid than the
+        // reference: the early exit must NOT fire, so the root holding the saved
+        // uuid still wins.
+        let saved_dir = unique_temp_dir("fallthrough_saved");
+        let impostor = write_profile(&saved_dir, "Impostor.xmp", "Impostor", "UUID-IMPOSTOR");
+        let impostor_string = impostor.to_string_lossy().to_string();
+
+        let root = unique_temp_dir("fallthrough_root");
+        let real = write_profile(&root, "Real.xmp", "Real Profile", "UUID-REAL");
+        let real_string = real.to_string_lossy().to_string();
+
+        let reference = reference(
+            Some("UUID-REAL"),
+            Some(&impostor_string),
+            Some("Impostor"),
+            100.0,
+        );
+
+        let restore = resolve_reference_against_roots(&reference, std::slice::from_ref(&root));
+
+        let DevelopProfileRestore::Resolved { summary, .. } = restore else {
+            panic!("the saved uuid in the root must resolve: {restore:?}");
+        };
+        assert_eq!(summary.uuid, "UUID-REAL");
+        assert_eq!(summary.path, real_string);
+
+        fs::remove_dir_all(&saved_dir).expect("remove temp dir");
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_saved_path_only_reference_resolves_without_scanning() {
+        // No uuid, only a valid path: the saved path must settle the outcome
+        // even with an empty root list.
+        let saved_dir = unique_temp_dir("path_only_saved");
+        let saved = write_profile(&saved_dir, "PathOnly.xmp", "Path Only", "UUID-ONLY");
+        let saved_string = saved.to_string_lossy().to_string();
+
+        let reference = reference(None, Some(&saved_string), None, 75.0);
+
+        let restore = resolve_reference_against_roots(&reference, &[]);
+
+        let DevelopProfileRestore::Resolved {
+            reference: resolved_reference,
+            summary,
+        } = restore
+        else {
+            panic!("a path-only reference must resolve with an empty root list: {restore:?}");
+        };
+        assert_eq!(summary.uuid, "UUID-ONLY");
+        assert_eq!(summary.path, saved_string);
+        assert_eq!(resolved_reference.amount_percent, 75.0);
+
+        fs::remove_dir_all(&saved_dir).expect("remove temp dir");
     }
 
     #[test]

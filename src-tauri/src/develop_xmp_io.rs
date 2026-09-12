@@ -625,22 +625,24 @@ fn finalize_look(
         .filter(|value| !value.is_empty());
     let amount = description.amount.or(look.amount);
 
-    if name.is_none() && uuid.is_none() {
-        // Adobe's empty form, `<crs:Look crs:Name=""/>`.
-        return Ok(None);
-    }
-
-    let amount_percent = match amount {
-        Some(value) => parse_crs_amount(&value)?,
-        None => DEFAULT_AMOUNT_PERCENT,
-    };
-
     // A record written by a newer schema is still applied for its
     // Adobe-compatible part; the private fields we do not understand are
     // discarded.
     let path = match description.schema_version {
         Some(version) if version > DEVELOP_STATE_VERSION => None,
         _ => description.path.filter(|value| !value.is_empty()),
+    };
+
+    if name.is_none() && uuid.is_none() && path.is_none() {
+        // Adobe's empty form, `<crs:Look crs:Name=""/>`, carries none of the
+        // three identifiers. A Look carrying only `onelab:ProfilePath` is a real
+        // (path-only) reference and must NOT be discarded as the empty form.
+        return Ok(None);
+    }
+
+    let amount_percent = match amount {
+        Some(value) => parse_crs_amount(&value)?,
+        None => DEFAULT_AMOUNT_PERCENT,
     };
 
     Ok(Some(RawXmpLook {
@@ -2127,6 +2129,64 @@ mod tests {
         assert_eq!(look.path.as_deref(), Some("/profiles/rt.xmp"));
         assert_eq!(look.name.as_deref(), Some("Round Trip"));
         assert_eq!(look.amount_percent, 137.5);
+    }
+
+    #[test]
+    fn a_path_only_look_round_trips_through_write_and_read() {
+        // A reference with a saved PATH but no uuid and no name: the exact
+        // shape that used to be discarded as Adobe's empty form, so an explicit
+        // Write followed by an explicit Read silently cleared the develop state.
+        let reference = reference(None, Some("/profiles/path-only.xmp"), None, 65.0);
+
+        let element = render_crs_look_element(" ", Some(&reference));
+
+        // What we WRITE is unchanged: no Name value, no UUID, the path present.
+        assert!(element.contains("crs:Name=\"\""), "{element}");
+        assert!(!element.contains("crs:UUID"), "{element}");
+        assert!(
+            element.contains("onelab:ProfilePath=\"/profiles/path-only.xmp\""),
+            "{element}"
+        );
+
+        let document = splice_crs_look(&skeleton(), &element).expect("splice");
+
+        let look = read_crs_look(&document)
+            .expect("parse")
+            .expect("a Look carrying only a path is NOT the empty form");
+
+        assert_eq!(look.path.as_deref(), Some("/profiles/path-only.xmp"));
+        assert_eq!(look.uuid, None);
+        assert_eq!(look.name, None);
+        assert_eq!(look.amount_percent, 65.0);
+    }
+
+    #[test]
+    fn the_empty_look_form_still_reads_as_no_profile() {
+        // The PROVEN Adobe empty form: no `crs:UUID` and no
+        // `onelab:ProfilePath`, so it is still the empty form.
+        let document = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description>
+   <crs:Look xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Name=""/>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+        assert_eq!(
+            read_crs_look(document).expect("parse"),
+            None,
+            "the empty form carries no profile"
+        );
+
+        // The renderer's own empty form must also read back as no profile.
+        let rendered = render_crs_look_element("  ", None);
+        let spliced = splice_crs_look(&skeleton(), &rendered).expect("splice");
+
+        assert_eq!(
+            read_crs_look(&spliced).expect("parse"),
+            None,
+            "the rendered empty form carries no profile"
+        );
     }
 
     #[test]
