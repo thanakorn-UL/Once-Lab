@@ -858,6 +858,98 @@ fn export_adjustments_as_lut(
     Ok(cube_lut)
 }
 
+/// The profile an export should develop with, taken from the image's stored
+/// develop state. A missing or unreadable profile yields `None` so the export
+/// renders with no profile rather than substituting a different one, and the
+/// amount is only passed for a profile that advertises amount support.
+///
+/// `is_raw` is the export target's file type. The decode seam accepts a profile
+/// only for RAW input, so asking for one on a non-RAW image would FAIL the
+/// export; resolving `None` there keeps the bridge's "never fail an export"
+/// ruling. A non-RAW image therefore always exports through the profile-less
+/// decode path it used before this bridge existed.
+pub(crate) fn resolve_export_profile(
+    develop_state: &crate::develop_state::DevelopState,
+    is_raw: bool,
+) -> Option<(PathBuf, Option<f32>)> {
+    if !is_raw {
+        return None;
+    }
+
+    // A record this build must not interpret is never applied; the export simply
+    // develops with no profile.
+    if !develop_state.is_supported() {
+        return None;
+    }
+
+    let reference = develop_state.profile.as_ref()?;
+    let saved_path = reference
+        .path
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(saved_path);
+
+    if !path.is_file() {
+        log::warn!(
+            "Export: saved XMP profile '{}' is not available; exporting with no profile",
+            path.display()
+        );
+        return None;
+    }
+
+    // Load and parse the profile outside the RAW-development panic boundary so a
+    // bad profile is a logged downgrade to an unprofiled export, never a failure
+    // and never a substitute.
+    let profile = match crate::xmp_profile::load_xmp_rgb_profile_from_path(path) {
+        Ok(profile) => profile,
+        Err(error) => {
+            log::warn!(
+                "Export: saved XMP profile '{}' is unreadable ({error}); exporting with no profile",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    // The decode path hard-rejects an amount override for a profile that does not
+    // support one, so the amount is passed ONLY when the profile advertises it.
+    let amount = profile.supports_amount.then_some(reference.amount_percent);
+
+    Some((PathBuf::from(saved_path), amount))
+}
+
+/// Decodes one export target's base image and composites its AI patches.
+///
+/// `export_profile` is the profile resolved from the image's stored develop
+/// state; `None` means the image is developed with no profile, which is the
+/// identical decode path this export took before the develop-state bridge.
+pub(crate) fn decode_export_base_image(
+    bytes: &[u8],
+    source_path_str: &str,
+    js_adjustments: &serde_json::Value,
+    settings: &crate::app_settings::AppSettings,
+    export_profile: Option<(&std::path::Path, Option<f32>)>,
+) -> Result<image::DynamicImage, String> {
+    let (profile_path, profile_amount) = match export_profile {
+        Some((path, amount)) => (Some(path), amount),
+        None => (None, None),
+    };
+
+    let decoded = crate::image_loader::load_base_image_from_bytes_with_xmp_profile(
+        bytes,
+        source_path_str,
+        false,
+        settings,
+        profile_path,
+        profile_amount,
+        None,
+    )
+    .map_err(|e| format!("Failed to load export base image: {e}"))?;
+
+    composite_patches_on_image(&decoded, js_adjustments)
+        .map_err(|e| format!("Failed to composite AI patches: {e}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_images_impl(
     paths: Vec<String>,
@@ -996,6 +1088,11 @@ pub(crate) async fn export_images_impl(
                     ExportAdjustmentsMode::GlobalOverride(_) => false,
                 };
 
+                // Bind the sidecar once: its `adjustments` feed `js_adjustments`
+                // exactly as before, and its `develop_state` is where the batch
+                // decode bridge below reads the profile from.
+                let sidecar_meta = crate::exif_processing::load_sidecar(&sidecar_path);
+
                 let mut js_adjustments = match &adjustments_mode {
                     ExportAdjustmentsMode::UseSidecars {
                         active_adjustments, ..
@@ -1004,15 +1101,19 @@ pub(crate) async fn export_images_impl(
                             if let Some(adj) = active_adjustments {
                                 adj.clone()
                             } else {
-                                crate::exif_processing::load_sidecar(&sidecar_path).adjustments
+                                sidecar_meta.adjustments.clone()
                             }
                         } else {
-                            crate::exif_processing::load_sidecar(&sidecar_path).adjustments
+                            sidecar_meta.adjustments.clone()
                         }
                     }
                     ExportAdjustmentsMode::GlobalOverride(adj) => adj.clone(),
                 };
 
+                // The stored profile is resolved only on the BATCH path below,
+                // the sole branch that decodes from disk. Resolving it here would
+                // waste I/O for a `.cube` export and could log a spurious warning
+                // for a LUT export that never touches the image pixels.
                 hydrate_adjustments(&state, &mut js_adjustments);
                 let is_raw = is_raw_file(&source_path_str);
                 let original_path = std::path::Path::new(&source_path_str);
@@ -1158,28 +1259,37 @@ pub(crate) async fn export_images_impl(
                             }
                         }
                     } else {
+                        // BATCH BRANCH ONLY: the pixels are decoded from disk here,
+                        // so the stored profile is applied at this seam. With no
+                        // profile (`None`) `decode_export_base_image` makes the
+                        // exact call `load_base_image_from_bytes` makes today — an
+                        // image without a profile exports through a byte-identical
+                        // decode path. The profile is resolved here, after the
+                        // `.cube` early-return, so a LUT export never pays for it.
+                        let export_profile =
+                            resolve_export_profile(&sidecar_meta.develop_state(), is_raw);
+                        let profile = export_profile
+                            .as_ref()
+                            .map(|(path, amount)| (path.as_path(), *amount));
+
                         match read_file_mapped(Path::new(&source_path_str)) {
-                            Ok(mmap) => load_and_composite(
+                            Ok(mmap) => decode_export_base_image(
                                 &mmap,
                                 &source_path_str,
                                 &js_adjustments,
-                                false,
                                 &settings,
-                                None,
-                            )
-                            .map_err(|e| format!("Failed to load from mmap: {}", e))?,
+                                profile,
+                            )?,
                             Err(_) => {
                                 let bytes =
                                     fs::read(&source_path_str).map_err(|e| e.to_string())?;
-                                load_and_composite(
+                                decode_export_base_image(
                                     &bytes,
                                     &source_path_str,
                                     &js_adjustments,
-                                    false,
                                     &settings,
-                                    None,
-                                )
-                                .map_err(|e| format!("Failed to load from bytes: {}", e))?
+                                    profile,
+                                )?
                             }
                         }
                     };
@@ -1756,4 +1866,121 @@ pub async fn estimate_export_sizes(
     };
 
     Ok(single_image_extrapolated_size * paths.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_export_base_image;
+    use image::GenericImageView;
+    use std::path::PathBuf;
+
+    /// The untracked acceptance fixture root (`raw-filewithxmp-profile/`), which a
+    /// clean checkout does not have. READ ONLY: nothing in this test may create,
+    /// modify or delete a file under it, and the guard runs before any I/O.
+    fn acceptance_fixture() -> Option<PathBuf> {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../raw-filewithxmp-profile");
+
+        if !fixture.is_dir() {
+            eprintln!("ACCEPTANCE SKIPPED: {} is missing", fixture.display());
+            return None;
+        }
+
+        // The directory exists, so canonicalizing it (and the usual `expect`) is
+        // safe from here on.
+        let dir = fixture.canonicalize().expect("acceptance directory");
+        let nef = dir.join("TLP_8278.NEF");
+        let profile = dir.join("Au ⛏️.xmp");
+        if !nef.exists() || !profile.exists() {
+            eprintln!(
+                "ACCEPTANCE SKIPPED: fixture is incomplete ({} / {})",
+                nef.display(),
+                profile.display()
+            );
+            return None;
+        }
+
+        Some(dir)
+    }
+
+    /// FIX 2 acceptance: `decode_export_base_image` really is the batch export's
+    /// decode seam. Two independent facts are asserted on the real RAW fixture.
+    ///
+    /// Assertion 1 (profile-less parity) proves the develop-state bridge cannot
+    /// change an export that has no profile: with `export_profile == None` the
+    /// helper is byte-identical to the pre-bridge `load_and_composite` call.
+    ///
+    /// Assertion 2 (wiring) proves the profile actually reaches the decoder
+    /// through this helper: the SAME call with `Some((Au, None))` renders a
+    /// materially different image.
+    ///
+    /// Non-vacuity:
+    /// - Replacing the seam call with `load_base_image_from_bytes` drops the
+    ///   profile, so the two decodes become byte-identical and assertion 2 fails.
+    /// - Passing a profile unconditionally for `export_profile == None` (e.g.
+    ///   resolving a substitute internally) changes the unprofiled pixels and
+    ///   assertion 1 fails.
+    #[test]
+    fn decode_export_base_image_matches_the_pre_bridge_path_and_wires_the_profile() {
+        let Some(dir) = acceptance_fixture() else {
+            return;
+        };
+
+        let nef = dir.join("TLP_8278.NEF");
+        let profile = dir.join("Au ⛏️.xmp");
+        let bytes = std::fs::read(&nef).expect("read the acceptance NEF");
+        let path_str = nef.to_string_lossy().to_string();
+        let settings = crate::app_settings::AppSettings::default();
+        let adjustments = serde_json::json!({});
+
+        // Assertion 1 — profile-less parity with the pre-change export path.
+        let pre_change = crate::image_loader::load_and_composite(
+            &bytes,
+            &path_str,
+            &adjustments,
+            false,
+            &settings,
+            None,
+        )
+        .expect("pre-bridge decode");
+        let decoded = decode_export_base_image(&bytes, &path_str, &adjustments, &settings, None)
+            .expect("profile-less export decode");
+
+        assert_eq!(
+            pre_change.dimensions(),
+            decoded.dimensions(),
+            "profile-less export decode must keep the pre-bridge dimensions"
+        );
+        assert_eq!(
+            pre_change.as_bytes(),
+            decoded.as_bytes(),
+            "profile-less export decode must be BYTE-identical to the pre-bridge path"
+        );
+
+        // Assertion 2 — the resolved profile actually reaches the decoder.
+        let profiled = decode_export_base_image(
+            &bytes,
+            &path_str,
+            &adjustments,
+            &settings,
+            Some((profile.as_path(), None)),
+        )
+        .expect("profile-aware export decode");
+
+        assert_eq!(
+            decoded.dimensions(),
+            profiled.dimensions(),
+            "applying the profile must not change the export dimensions"
+        );
+
+        let differing_channels = decoded
+            .as_bytes()
+            .iter()
+            .zip(profiled.as_bytes())
+            .filter(|(unprofiled, profiled)| unprofiled != profiled)
+            .count();
+        assert!(
+            differing_channels > 0,
+            "the profile must reach the decoder: the profiled export is byte-identical to the unprofiled one"
+        );
+    }
 }

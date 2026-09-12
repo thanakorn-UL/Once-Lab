@@ -796,6 +796,20 @@ fn element_is(scope: &NsScope, name: &[u8], namespace: &str, local: &[u8]) -> bo
 
 // ------------------------------------------------------------------- commands
 
+/// The refusal returned when an XMP write targets a virtual copy.
+///
+/// A `?vc=` copy shares its physical image's XMP sidecar, so writing from it
+/// would overwrite the ORIGINAL image's metadata: there is exactly one XMP
+/// sidecar and it belongs to the physical image, never to a virtual copy.
+/// Reading XMP for a `?vc=` path stays allowed (see
+/// `read_develop_state_from_xmp`) because it is read-only and the physical
+/// sidecar is the only XMP there is.
+fn virtual_copy_xmp_refusal(virtual_path: &str) -> String {
+    format!(
+        "refusing to write XMP for the virtual copy '{virtual_path}': a virtual copy shares its physical image's XMP sidecar, so writing it would overwrite the original's metadata"
+    )
+}
+
 /// Writes the image's current internal develop state into its XMP sidecar.
 ///
 /// Refuses a virtual-copy path: a `?vc=` copy shares its physical image's
@@ -803,9 +817,7 @@ fn element_is(scope: &NsScope, name: &[u8], namespace: &str, local: &[u8]) -> bo
 #[tauri::command]
 pub fn write_develop_state_to_xmp(path: String) -> Result<XmpDevelopWriteOutcome, String> {
     if path.contains("?vc=") {
-        return Err(format!(
-            "refusing to write XMP from the virtual copy '{path}': a virtual copy shares its source image's sidecar"
-        ));
+        return Err(virtual_copy_xmp_refusal(&path));
     }
 
     let (image_path, _) = crate::file_management::parse_virtual_path(&path);
@@ -842,9 +854,7 @@ pub(crate) fn write_develop_state_to_xmp_at(
     let image_path_string = image_path.to_string_lossy().to_string();
 
     if image_path_string.contains("?vc=") {
-        return Err(format!(
-            "refusing to write XMP from the virtual copy '{image_path_string}': a virtual copy shares its source image's sidecar"
-        ));
+        return Err(virtual_copy_xmp_refusal(&image_path_string));
     }
 
     let (_, sidecar_path) = crate::file_management::parse_virtual_path(&image_path_string);
@@ -2439,6 +2449,58 @@ mod tests {
             .expect_err("the write body must refuse a virtual copy path too");
 
         assert!(error.contains("virtual copy"), "{error}");
+    }
+
+    /// 6C5-R3/6C5-R7: a virtual-copy XMP write is refused with a message that
+    /// names the shared-sidecar reason, and it can NEVER touch the PHYSICAL
+    /// image's `.xmp` — asserted against a real fixture (a physical image, its
+    /// `.rrdata` state and a spliceable `.xmp`) rather than a bare path string.
+    ///
+    /// Mutation that breaks it: removing the `?vc=` guard from
+    /// `write_develop_state_to_xmp` lets the call de-virtualize to `photo.NEF`,
+    /// splice the sidecar's profile into `photo.xmp` and return `Ok`, so the
+    /// `expect_err` and the byte-unchanged assertion both fail.
+    #[test]
+    fn writing_xmp_for_a_virtual_copy_is_refused_and_leaves_the_physical_xmp_unchanged() {
+        let dir = unique_temp_dir("vc_refuse_xmp");
+        let image = dir.join("photo.NEF");
+        write_image(&image);
+
+        // A spliceable, non-profile physical sidecar: exactly what a write would
+        // modify if it were allowed through.
+        let xmp = dir.join("photo.xmp");
+        fs::write(&xmp, SIDECAR_SKELETON).expect("write the physical xmp skeleton");
+        let xmp_before = fs::read(&xmp).expect("read the physical xmp");
+
+        // The physical develop state carries a profile — the payload a write
+        // would splice into `photo.xmp`.
+        fs::write(
+            dir.join("photo.NEF.rrdata"),
+            sidecar_with_profile("UUID-ALPHA", "/profiles/alpha.xmp", "Alpha", 75.0),
+        )
+        .expect("write the physical develop state");
+
+        let virtual_path = format!("{}?vc=1234", image.to_string_lossy());
+        let error =
+            write_develop_state_to_xmp(virtual_path).expect_err("a virtual copy must be refused");
+
+        assert!(error.contains("virtual copy"), "{error}");
+        assert!(
+            error.contains("shares its physical image's XMP sidecar"),
+            "the refusal must explain the shared sidecar: {error}"
+        );
+        assert!(
+            error.contains("overwrite the original's metadata"),
+            "the refusal must explain what writing would overwrite: {error}"
+        );
+
+        assert_eq!(
+            fs::read(&xmp).expect("re-read the physical xmp"),
+            xmp_before,
+            "a refused virtual-copy write must leave the physical xmp byte-unchanged"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     #[test]

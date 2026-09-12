@@ -1943,4 +1943,574 @@ mod tests {
             "duplicates must be removed while first-seen order is preserved"
         );
     }
+
+    // ----------------------------------------------------- 6C5 virtual copies
+
+    /// 6C5-R1/R2: creation clones the source's develop state by construction —
+    /// the clone is a byte copy of the source `.rrdata`, so the reference AND its
+    /// Amount come along without any per-field clone code.
+    ///
+    /// Mutation that breaks it: replacing the clone helper's `fs::copy` branch
+    /// with a `ImageMetadata::default()` write makes the copy carry no profile.
+    #[test]
+    fn virtual_copy_clone_inherits_the_source_develop_state() {
+        let root = unique_temp_dir("vc_clone_root");
+        let profile_path = write_profile(&root, "Alpha.xmp", "Alpha Profile", "UUID-ALPHA");
+        let profile_path_string = profile_path.to_string_lossy().to_string();
+
+        let source_sidecar = root.join("photo.NEF.rrdata");
+        let source_ref = reference(
+            Some("UUID-ALPHA"),
+            Some(&profile_path_string),
+            Some("Alpha Profile"),
+            50.0,
+        );
+        write_develop_profile_to_sidecar(&source_sidecar, Some(source_ref.clone()))
+            .expect("seed the source develop state");
+
+        let new_sidecar = root.join("photo.NEF.copy-1.rrdata");
+        crate::file_management::clone_sidecar_for_virtual_copy(&source_sidecar, &new_sidecar)
+            .expect("clone the source into the copy");
+
+        let cloned = crate::exif_processing::load_sidecar(&new_sidecar).develop_state();
+        assert_eq!(
+            cloned.profile,
+            Some(source_ref.clone()),
+            "the clone inherits the source profile reference"
+        );
+        assert_eq!(
+            cloned
+                .profile
+                .expect("the clone carries a profile")
+                .amount_percent,
+            50.0,
+            "the clone inherits the source Amount"
+        );
+        assert_eq!(
+            fs::read(&new_sidecar).expect("read the clone"),
+            fs::read(&source_sidecar).expect("read the source"),
+            "the clone is a byte copy of the source sidecar"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// The other half of the clone: a source that has never been edited has no
+    /// sidecar, yet the copy still gets a valid default document so it can be
+    /// written to later.
+    ///
+    /// Mutation that breaks it: deleting the `else` branch (or making it write an
+    /// empty/absent file) leaves the copy without a parseable document.
+    #[test]
+    fn virtual_copy_clone_of_a_source_without_a_sidecar_writes_a_default() {
+        let root = unique_temp_dir("vc_clone_default_root");
+        let source_sidecar = root.join("photo.NEF.rrdata");
+        assert!(
+            !source_sidecar.exists(),
+            "precondition: the source has no sidecar"
+        );
+
+        let new_sidecar = root.join("photo.NEF.copy-1.rrdata");
+        crate::file_management::clone_sidecar_for_virtual_copy(&source_sidecar, &new_sidecar)
+            .expect("clone from a source without a sidecar");
+
+        let document = read_sidecar(&new_sidecar);
+        assert_eq!(document["version"], json!(1));
+        assert_eq!(document["rating"], json!(0));
+        assert!(document["adjustments"].is_null());
+        assert!(
+            document.get("develop_state").is_none(),
+            "a default document carries no develop state: {document}"
+        );
+
+        let metadata = crate::exif_processing::load_sidecar(&new_sidecar);
+        assert_eq!(metadata.develop_state(), DevelopState::default());
+        assert!(metadata.develop_state().is_supported());
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// 6C5-R1: after the clone, the source and the copy are independent — writing
+    /// one leaves the other's reference untouched.
+    ///
+    /// Mutation that breaks it: making `save_develop_profile_for_path` resolve the
+    /// PHYSICAL sidecar for a `?vc=` target (i.e. dropping the
+    /// `parse_virtual_path` split) writes the copy's profile onto the source and
+    /// fails the source-still-UUID-SOURCE assertion.
+    #[test]
+    fn virtual_copy_and_source_keep_independent_profiles() {
+        let root = unique_temp_dir("vc_independent_root");
+        let source_profile = write_profile(&root, "Source.xmp", "Source", "UUID-SOURCE");
+        let source_profile_string = source_profile.to_string_lossy().to_string();
+        let copy_profile = write_profile(&root, "Copy.xmp", "Copy", "UUID-COPY");
+        let copy_profile_string = copy_profile.to_string_lossy().to_string();
+
+        let source = image_path(&root, "photo");
+        let copy = format!("{source}?vc=copy-1");
+
+        let source_ref = reference(
+            Some("UUID-SOURCE"),
+            Some(&source_profile_string),
+            Some("Source"),
+            50.0,
+        );
+        save_develop_profile_for_path(&source, Some(&source_ref)).expect("seed the source");
+
+        let (_, source_sidecar) = crate::file_management::parse_virtual_path(&source);
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&copy);
+        crate::file_management::clone_sidecar_for_virtual_copy(&source_sidecar, &copy_sidecar)
+            .expect("clone the source into the copy");
+        assert_eq!(
+            copy_sidecar,
+            root.join("photo.NEF.copy-1.rrdata"),
+            "the copy owns its OWN sidecar"
+        );
+
+        let copy_ref = reference(
+            Some("UUID-COPY"),
+            Some(&copy_profile_string),
+            Some("Copy"),
+            100.0,
+        );
+        save_develop_profile_for_path(&copy, Some(&copy_ref)).expect("write the copy profile");
+
+        let restore =
+            resolve_develop_profile_from_sidecar(&source_sidecar, std::slice::from_ref(&root));
+        let DevelopProfileRestore::Resolved { reference, .. } = restore else {
+            panic!("the source must still resolve its own profile: {restore:?}");
+        };
+        assert_eq!(
+            reference, source_ref,
+            "the copy's write must not touch the source"
+        );
+        assert_eq!(reference.amount_percent, 50.0);
+
+        let restore =
+            resolve_develop_profile_from_sidecar(&copy_sidecar, std::slice::from_ref(&root));
+        let DevelopProfileRestore::Resolved { reference, .. } = restore else {
+            panic!("the copy must resolve its own profile: {restore:?}");
+        };
+        assert_eq!(reference, copy_ref);
+        assert_eq!(reference.amount_percent, 100.0);
+
+        // Reversing the order keeps them independent.
+        save_develop_profile_for_path(&source, Some(&source_ref)).expect("rewrite the source");
+        let stored = read_sidecar(&copy_sidecar);
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-COPY")
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["amount_percent"],
+            json!(100.0)
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// 6C5-R6: each sidecar is a separate file, so a reopen — modelled by reading
+    /// both files fresh from disk — restores each state independently.
+    ///
+    /// Mutation that breaks it: storing the develop state inside the physical
+    /// image's file (or any shared record) makes both reloads report the SAME
+    /// reference.
+    #[test]
+    fn virtual_copy_state_survives_a_reload() {
+        let root = unique_temp_dir("vc_reload_root");
+        let source_profile = write_profile(&root, "Source.xmp", "Source", "UUID-SOURCE");
+        let source_profile_string = source_profile.to_string_lossy().to_string();
+        let copy_profile = write_profile(&root, "Copy.xmp", "Copy", "UUID-COPY");
+        let copy_profile_string = copy_profile.to_string_lossy().to_string();
+
+        let source = image_path(&root, "photo");
+        let copy = format!("{source}?vc=copy-1");
+        let (_, source_sidecar) = crate::file_management::parse_virtual_path(&source);
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&copy);
+
+        let source_ref = reference(
+            Some("UUID-SOURCE"),
+            Some(&source_profile_string),
+            Some("Source"),
+            50.0,
+        );
+        write_develop_profile_to_sidecar(&source_sidecar, Some(source_ref.clone()))
+            .expect("seed the source");
+        crate::file_management::clone_sidecar_for_virtual_copy(&source_sidecar, &copy_sidecar)
+            .expect("clone");
+        let copy_ref = reference(
+            Some("UUID-COPY"),
+            Some(&copy_profile_string),
+            Some("Copy"),
+            100.0,
+        );
+        write_develop_profile_to_sidecar(&copy_sidecar, Some(copy_ref.clone()))
+            .expect("write the copy");
+
+        // "Restart": re-read BOTH sidecars from disk and resolve each independently.
+        let reloaded_source =
+            resolve_develop_profile_from_sidecar(&source_sidecar, std::slice::from_ref(&root));
+        let reloaded_copy =
+            resolve_develop_profile_from_sidecar(&copy_sidecar, std::slice::from_ref(&root));
+
+        let DevelopProfileRestore::Resolved { reference, .. } = reloaded_source else {
+            panic!("the source must reload its own state: {reloaded_source:?}");
+        };
+        assert_eq!(reference, source_ref);
+        assert_eq!(reference.amount_percent, 50.0);
+
+        let DevelopProfileRestore::Resolved { reference, .. } = reloaded_copy else {
+            panic!("the copy must reload its own state: {reloaded_copy:?}");
+        };
+        assert_eq!(reference, copy_ref);
+        assert_eq!(reference.amount_percent, 100.0);
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// 6C5-R5: pasting into a virtual copy through the combined batch writes the
+    /// COPY's own sidecar and leaves the physical image's state byte-unchanged.
+    ///
+    /// Mutation that breaks it: resolving the sidecar from the de-virtualized
+    /// image path turns this into a write of the physical `.rrdata`, changing its
+    /// bytes and failing the byte-unchanged assertion.
+    #[test]
+    fn copy_into_a_virtual_copy_leaves_the_physical_sidecar_unchanged() {
+        let root = unique_temp_dir("vc_copy_target_root");
+        let profile_path = write_profile(&root, "Alpha.xmp", "Alpha Profile", "UUID-ALPHA");
+        let profile_path_string = profile_path.to_string_lossy().to_string();
+
+        let physical_sidecar = write_sidecar(&root, "photo.NEF.rrdata", &legacy_document());
+        let physical_before = fs::read(&physical_sidecar).expect("read the physical sidecar");
+
+        let virtual_path = format!("{}?vc=copy-1", image_path(&root, "photo"));
+        let profile = ProfileUpdate::Set {
+            profile: Some(reference(
+                Some("UUID-ALPHA"),
+                Some(&profile_path_string),
+                Some("Alpha Profile"),
+                55.0,
+            )),
+        };
+
+        apply_develop_state_batch(
+            std::slice::from_ref(&virtual_path),
+            None,
+            &profile,
+            None,
+            false,
+            false,
+        );
+
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&virtual_path);
+        assert_eq!(
+            copy_sidecar,
+            root.join("photo.NEF.copy-1.rrdata"),
+            "the copy must gain its OWN sidecar"
+        );
+        let stored = read_sidecar(&copy_sidecar);
+        assert_eq!(
+            stored["develop_state"]["profile"]["uuid"],
+            json!("UUID-ALPHA")
+        );
+        assert_eq!(
+            stored["develop_state"]["profile"]["amount_percent"],
+            json!(55.0)
+        );
+
+        assert_eq!(
+            fs::read(&physical_sidecar).expect("re-read the physical sidecar"),
+            physical_before,
+            "the physical image's own state must be byte-unchanged"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// 6C5-R5: a copy reads its OWN saved state, never the physical image's.
+    ///
+    /// Mutation that breaks it: resolving the `?vc=` path to the PHYSICAL sidecar
+    /// returns `UUID-PHYSICAL` and fails the equality with the copy's reference.
+    #[test]
+    fn copy_from_a_virtual_copy_reads_the_virtual_copys_own_state() {
+        let root = unique_temp_dir("vc_copy_source_root");
+        let profile_path = write_profile(&root, "Alpha.xmp", "Alpha Profile", "UUID-ALPHA");
+        let profile_path_string = profile_path.to_string_lossy().to_string();
+
+        let virtual_path = format!("{}?vc=copy-1", image_path(&root, "photo"));
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&virtual_path);
+
+        // The physical image and the copy carry DIFFERENT references.
+        write_sidecar(
+            &root,
+            "photo.NEF.rrdata",
+            &sidecar_with_profile(json!({
+                "uuid": "UUID-PHYSICAL",
+                "name": "Physical",
+                "amount_percent": 10.0,
+            })),
+        );
+        let copy_ref = reference(
+            Some("UUID-ALPHA"),
+            Some(&profile_path_string),
+            Some("Alpha Profile"),
+            55.0,
+        );
+        write_develop_profile_to_sidecar(&copy_sidecar, Some(copy_ref.clone()))
+            .expect("seed the copy");
+
+        let restore =
+            resolve_develop_profile_from_sidecar(&copy_sidecar, std::slice::from_ref(&root));
+        let DevelopProfileRestore::Resolved { reference, .. } = restore else {
+            panic!("the copy must resolve its own saved profile: {restore:?}");
+        };
+        assert_eq!(
+            reference, copy_ref,
+            "the copy reads its OWN state, never the source's"
+        );
+        assert_eq!(reference.amount_percent, 55.0);
+
+        // Non-vacuity: the physical sidecar really holds a different reference.
+        let (_, physical_sidecar) =
+            crate::file_management::parse_virtual_path(&image_path(&root, "photo"));
+        let physical = crate::exif_processing::load_sidecar(&physical_sidecar).develop_state();
+        assert_eq!(
+            physical
+                .profile
+                .expect("the physical profile")
+                .uuid
+                .as_deref(),
+            Some("UUID-PHYSICAL")
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// 6C5-R4: a copy whose saved reference is not available resolves to `Missing`
+    /// and RETAINS the reference — it is never substituted by another profile.
+    ///
+    /// Mutation that breaks it: falling back to a root scan that accepts any
+    /// profile (e.g. matching by name, or ignoring the uuid) resolves the present
+    /// profile and fails the `Missing` assertion.
+    #[test]
+    fn a_missing_profile_in_a_virtual_copy_stays_unresolved() {
+        let root = unique_temp_dir("vc_missing_root");
+        // A real, resolvable profile sits in the root, so a substitute would be
+        // POSSIBLE if the resolver ever reached for one.
+        write_profile(&root, "Present.xmp", "Present", "UUID-PRESENT");
+
+        let virtual_path = format!("{}?vc=copy-1", image_path(&root, "photo"));
+        let (_, copy_sidecar) = crate::file_management::parse_virtual_path(&virtual_path);
+        let missing_ref = reference(
+            Some("UUID-GONE"),
+            Some("/profiles/gone.xmp"),
+            Some("Gone"),
+            75.0,
+        );
+        write_develop_profile_to_sidecar(&copy_sidecar, Some(missing_ref.clone()))
+            .expect("seed the copy with an unavailable profile");
+
+        let restore =
+            resolve_develop_profile_from_sidecar(&copy_sidecar, std::slice::from_ref(&root));
+        assert_eq!(
+            restore,
+            DevelopProfileRestore::Missing {
+                reference: missing_ref.clone(),
+            },
+            "a missing profile must not be substituted by the root's other profile"
+        );
+
+        // The reference is retained on disk for a later resolution.
+        let stored = crate::exif_processing::load_sidecar(&copy_sidecar).develop_state();
+        assert_eq!(stored.profile, Some(missing_ref));
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    // ------------------------------------------------------- 6C5 export bridge
+
+    /// A develop state with no profile resolves to no export profile.
+    ///
+    /// Mutation that breaks it: defaulting to any path (or the first discovered
+    /// profile) instead of returning `None` for an absent profile reference.
+    #[test]
+    fn export_profile_is_none_without_a_develop_state() {
+        let state = DevelopState::default();
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(&state, true),
+            None,
+            "an image with no stored profile must export with no profile"
+        );
+    }
+
+    /// A record written by a newer build is never interpreted here either.
+    ///
+    /// Mutation that breaks it: dropping the `is_supported()` guard lets a future
+    /// record's profile leak into the export.
+    #[test]
+    fn export_profile_is_none_for_an_unsupported_version() {
+        let state = DevelopState {
+            version: DEVELOP_STATE_VERSION + 1,
+            profile: Some(reference(
+                Some("UUID-ALPHA"),
+                Some("/profiles/alpha.xmp"),
+                Some("Alpha"),
+                100.0,
+            )),
+            unknown: serde_json::Map::new(),
+        };
+        assert!(!state.is_supported());
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(&state, true),
+            None,
+            "an unsupported record must never resolve an export profile"
+        );
+    }
+
+    /// The export profile is taken from the SAVED PATH, and the amount is passed
+    /// ONLY for a profile that advertises amount support (the decode path
+    /// hard-rejects an amount override otherwise).
+    ///
+    /// Mutation that breaks it: passing `Some(amount)` unconditionally makes the
+    /// `SupportsAmount="False"` case yield `Some((path, Some(37.5)))`; passing
+    /// `None` unconditionally flips the first case.
+    #[test]
+    fn export_profile_uses_the_saved_path_and_only_passes_the_amount_when_supported() {
+        let root = unique_temp_dir("export_profile_root");
+        let with_amount = root.join("WithAmount.xmp");
+        fs::write(
+            &with_amount,
+            profile_xmp("With Amount", "UUID-WITH", "True"),
+        )
+        .expect("write the amount-supporting profile");
+        let without_amount = root.join("WithoutAmount.xmp");
+        fs::write(
+            &without_amount,
+            profile_xmp("Without Amount", "UUID-WITHOUT", "False"),
+        )
+        .expect("write the non-supporting profile");
+
+        let supporting = DevelopState {
+            version: DEVELOP_STATE_VERSION,
+            profile: Some(reference(
+                Some("UUID-WITH"),
+                Some(&with_amount.to_string_lossy()),
+                Some("With Amount"),
+                37.5,
+            )),
+            unknown: serde_json::Map::new(),
+        };
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(&supporting, true),
+            Some((with_amount.clone(), Some(37.5))),
+            "a profile that supports an Amount is passed at the saved amount"
+        );
+
+        let non_supporting = DevelopState {
+            version: DEVELOP_STATE_VERSION,
+            profile: Some(reference(
+                Some("UUID-WITHOUT"),
+                Some(&without_amount.to_string_lossy()),
+                Some("Without Amount"),
+                37.5,
+            )),
+            unknown: serde_json::Map::new(),
+        };
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(&non_supporting, true),
+            Some((without_amount.clone(), None)),
+            "a profile that does NOT support an Amount is passed with no amount"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// A saved path that is GONE exports with no profile — never a substitute and
+    /// never an error.
+    ///
+    /// Mutation that breaks it: substituting another profile (e.g. a root scan)
+    /// returns `Some(...)`; propagating the absence as an error would break the
+    /// `None` equality too.
+    #[test]
+    fn export_profile_is_none_when_the_profile_file_is_gone() {
+        let root = unique_temp_dir("export_profile_gone_root");
+        let gone = root.join("gone.xmp");
+        let gone_string = gone.to_string_lossy().to_string();
+        assert!(!gone.exists(), "precondition: the saved profile is absent");
+
+        let state = DevelopState {
+            version: DEVELOP_STATE_VERSION,
+            profile: Some(reference(
+                Some("UUID-GONE"),
+                Some(&gone_string),
+                Some("Gone"),
+                75.0,
+            )),
+            unknown: serde_json::Map::new(),
+        };
+
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(&state, true),
+            None,
+            "a gone profile must export with no profile, never a substitute and never an error"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
+
+    /// A non-RAW image must NEVER resolve an export profile: the decode seam
+    /// accepts a profile only for RAW input and would otherwise FAIL the export
+    /// (6C5-R4, "never fail an export"). The SAME valid, present, parseable
+    /// reference on a RAW image still resolves.
+    ///
+    /// Non-vacuity: ignoring `is_raw` (e.g. resolving the profile regardless of
+    /// file type) makes the `.JPG` assertion return `Some(...)` and fail.
+    #[test]
+    fn export_profile_is_none_for_a_non_raw_image() {
+        let root = unique_temp_dir("export_profile_non_raw_root");
+        let profile_path = write_profile(&root, "Present.xmp", "Present", "UUID-PRESENT");
+
+        // A profile that is present and parses: the reference is fully valid.
+        let state = DevelopState {
+            version: DEVELOP_STATE_VERSION,
+            profile: Some(reference(
+                Some("UUID-PRESENT"),
+                Some(&profile_path.to_string_lossy()),
+                Some("Present"),
+                50.0,
+            )),
+            unknown: serde_json::Map::new(),
+        };
+
+        let jpg = root.join("photo.JPG");
+        let jpg_str = jpg.to_string_lossy().to_string();
+        assert!(
+            !crate::formats::is_raw_file(&jpg_str),
+            "precondition: a .JPG path is not RAW"
+        );
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(
+                &state,
+                crate::formats::is_raw_file(&jpg_str)
+            ),
+            None,
+            "a non-RAW image must export with no profile: a profile on the decode seam would fail the export"
+        );
+
+        let nef = root.join("photo.NEF");
+        let nef_str = nef.to_string_lossy().to_string();
+        assert!(
+            crate::formats::is_raw_file(&nef_str),
+            "precondition: a .NEF path is RAW"
+        );
+        assert_eq!(
+            crate::export_processing::resolve_export_profile(
+                &state,
+                crate::formats::is_raw_file(&nef_str)
+            ),
+            Some((profile_path.clone(), Some(50.0))),
+            "the SAME state on a RAW image still resolves its profile"
+        );
+
+        fs::remove_dir_all(&root).expect("remove temp dir");
+    }
 }

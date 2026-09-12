@@ -4283,6 +4283,31 @@ pub fn rename_files(
     Ok(final_new_paths)
 }
 
+/// Clones the develop state of a source image into a new virtual copy's own
+/// sidecar (`<img>.rrdata` -> `<img>.<id>.rrdata`).
+///
+/// The sidecar carries both the adjustments and the `develop_state` record, so a
+/// byte copy clones the profile reference and its Amount by construction — no
+/// per-field clone code points at them. When the source has no sidecar yet (a
+/// never-edited image) the new copy gets a valid default document instead, so
+/// every virtual copy still owns a sidecar it can later be written to.
+pub(crate) fn clone_sidecar_for_virtual_copy(
+    source_sidecar_path: &Path,
+    new_sidecar_path: &Path,
+) -> Result<(), String> {
+    if source_sidecar_path.exists() {
+        fs::copy(source_sidecar_path, new_sidecar_path)
+            .map_err(|e| format!("Failed to copy sidecar file: {}", e))?;
+    } else {
+        let default_metadata = ImageMetadata::default();
+        let json_string =
+            serde_json::to_string_pretty(&default_metadata).map_err(|e| e.to_string())?;
+        fs::write(new_sidecar_path, json_string).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn create_virtual_copy(
     source_virtual_path: String,
@@ -4295,15 +4320,7 @@ pub fn create_virtual_copy(
     let new_virtual_path = format!("{}?vc={}", source_path.to_string_lossy(), new_copy_id);
     let (_, new_sidecar_path) = parse_virtual_path(&new_virtual_path);
 
-    if source_sidecar_path.exists() {
-        fs::copy(&source_sidecar_path, &new_sidecar_path)
-            .map_err(|e| format!("Failed to copy sidecar file: {}", e))?;
-    } else {
-        let default_metadata = ImageMetadata::default();
-        let json_string =
-            serde_json::to_string_pretty(&default_metadata).map_err(|e| e.to_string())?;
-        fs::write(new_sidecar_path, json_string).map_err(|e| e.to_string())?;
-    }
+    clone_sidecar_for_virtual_copy(&source_sidecar_path, &new_sidecar_path)?;
 
     if let Some(album_id) = target_album_id {
         let _ = add_to_album(album_id, vec![new_virtual_path.clone()], app_handle);

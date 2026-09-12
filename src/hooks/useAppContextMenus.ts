@@ -58,7 +58,7 @@ import { Invokes, Option, OPTION_SEPARATOR, Panel, AlbumItem, Album, AlbumGroup 
 import { Color, COLOR_LABELS, INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
 import TaggingSubMenu from '../context/TaggingSubMenu';
 import { useDevelopMetadataActions } from './useDevelopMetadataActions';
-import { useEditorActions } from './useEditorActions';
+import { debouncedSave, useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
 import { globalImageCache } from '../utils/ImageLRUCache';
 
@@ -463,6 +463,15 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
 
       const handleCreateVirtualCopy = async (sourcePath: string) => {
         try {
+          // 6C5-R2: the virtual copy clones the source `.rrdata` byte-for-byte, so
+          // it is only as fresh as the last WRITE. Adjustments are persisted by a
+          // 300 ms debounce, so flush it here to clone what the user currently
+          // sees. Guarded so a partial mock without a flusher can never break
+          // copy creation.
+          if (typeof debouncedSave?.flush === 'function') {
+            debouncedSave.flush();
+          }
+
           await invoke(Invokes.CreateVirtualCopy, {
             sourceVirtualPath: sourcePath,
             targetAlbumId: activeAlbumId || null,
