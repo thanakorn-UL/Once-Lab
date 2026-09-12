@@ -16,7 +16,15 @@ const FOOTER_BYTES: usize = 12;
 const AMOUNT_BYTES: usize = 16;
 const BYTES_PER_NODE: usize = 6;
 const MIN_SIZE: u32 = 2;
-const MAX_SIZE: u32 = 32;
+/// Adobe's read/write/import ceiling for a 3-D table:
+/// `dng_rgb_table::kMaxDivisions3D_InMemory` (`dng_big_table.h:623`). The other
+/// constant, `kMaxDivisions3D` (32), is only the default *resample* resolution
+/// used when baking a table -- it is NOT the maximum a table may carry.
+/// `dng_rgb_table::GetStream` accepts 3-D divisions up to this value
+/// (`dng_big_table.cpp:2477-2490`, "Raised from 32 so common 64-cube LUTs
+/// persist"), and `PutStream`/`Set`/`.cube` import enforce the same limit, so a
+/// legal Adobe 64-division `crs:RGBTable` decodes here. 65 is rejected.
+const MAX_SIZE: u32 = 64;
 
 /// BigTableTypeEnum::btt_RGBTable.
 const RGB_TABLE_TYPE: u32 = 1;
@@ -498,5 +506,77 @@ mod tests {
             error.contains("embedded RGBTable declared size is below the supported minimum"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn decodes_33_and_64_division_rgb_tables() {
+        // 33 sat just above the old 32 ceiling; 64 is Adobe's real read/write
+        // ceiling (`kMaxDivisions3D_InMemory`, `dng_big_table.h:623`). Both must
+        // now decode, with no fallback and an exact node count.
+        for size in [33u32, 64u32] {
+            let block = build_block(size, 3);
+            let table = parse_uncompressed_block(&block)
+                .unwrap_or_else(|error| panic!("size {size} must decode: {error}"));
+            assert_eq!(table.size, size as usize, "decoded size");
+            assert_eq!(
+                table.values.len(),
+                (size as usize) * (size as usize) * (size as usize),
+                "decoded node count for size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_65_division_rgb_table() {
+        // One past Adobe's ceiling: still rejected, by SHAPE (it is a 3-D table,
+        // so the block-length window would admit its byte size).
+        let block = build_block(65, 3);
+        let error =
+            parse_uncompressed_block(&block).expect_err("65 divisions must be rejected");
+        assert!(
+            error.contains("unsupported embedded RGBTable size 65"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn decodes_64_division_rgb_table_over_the_wire() {
+        // End-to-end, exactly what the parser/discovery see: Adobe base85 + a
+        // 4-byte length prefix + zlib. The declared size (~1.5 MB) must clear the
+        // pre-allocation guard and the decompressed block must match it exactly.
+        let size = 64u32;
+        let block = build_block(size, 3);
+        let encoded = encode_payload(block.len() as u32, &block);
+
+        let table =
+            decode_adobe_rgb_table(&encoded).expect("a 64-division wire table must decode");
+        assert_eq!(table.size, 64);
+        assert_eq!(table.values.len(), 64 * 64 * 64);
+
+        // Zero deltas reconstruct each axis's identity ramp, so the corner nodes
+        // are exact...
+        assert_eq!(table.values[0], [0.0, 0.0, 0.0], "first corner");
+        assert_eq!(
+            table.values[64 * 64 * 64 - 1],
+            [1.0, 1.0, 1.0],
+            "last corner"
+        );
+        // ...and an interior node indexes back to its own coordinate (within one
+        // 16-bit reconstruction step, ~1.5e-5, of the ideal ramp), which fails if
+        // the node ordering or the size stride were wrong.
+        const RAMP_TOLERANCE: f32 = 1e-4;
+        let (r, g, b) = (10usize, 20usize, 30usize);
+        let node = table.values[r * 64 * 64 + g * 64 + b];
+        let scale = 63.0f32;
+        for (channel, value, expected) in [
+            (0usize, node[0], r as f32 / scale),
+            (1, node[1], g as f32 / scale),
+            (2, node[2], b as f32 / scale),
+        ] {
+            assert!(
+                (value - expected).abs() < RAMP_TOLERANCE,
+                "interior node {r},{g},{b} channel {channel}: {value} vs {expected}"
+            );
+        }
     }
 }

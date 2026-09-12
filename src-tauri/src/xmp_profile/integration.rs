@@ -1719,4 +1719,93 @@ mod tests {
             "invalid profile must be rejected even when there are no pixels"
         );
     }
+
+    /// A grayscale (`crs:ConvertToGrayscale="True"`) profile renders COLOUR through
+    /// its real look/table (ruling 5A-R1: no fabricated gray conversion), so it
+    /// must simply render finite, in-range pixels -- and identically to the same
+    /// profile with the flag off.
+    #[test]
+    fn grayscale_profile_render_is_finite_and_flag_neutral() {
+        let rgb = identity_rgb_table();
+        let look = constant_look_table([30.0, 1.2, 0.9]);
+
+        let mut grayscale = profile_with_look_table(rgb.clone(), look.clone());
+        grayscale.convert_to_grayscale = true;
+        let mut color = profile_with_look_table(rgb, look);
+        color.convert_to_grayscale = false;
+
+        // Includes an out-of-gamut probe so the stage's clamping is exercised.
+        let inputs = [[-0.1f32, 0.2, 1.4], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.6, 0.2, 0.1]];
+
+        let mut gray_pixels = inputs.to_vec();
+        let mut color_pixels = inputs.to_vec();
+
+        apply_profile_to_three_color_pixels(&mut gray_pixels, &grayscale)
+            .expect("a grayscale profile must render");
+        apply_profile_to_three_color_pixels(&mut color_pixels, &color).expect("color render");
+
+        for (index, pixel) in gray_pixels.iter().enumerate() {
+            for channel in pixel {
+                assert!(
+                    channel.is_finite() && (0.0..=1.0).contains(channel),
+                    "grayscale pixel {index} is not a finite in-range value: {pixel:?}"
+                );
+            }
+        }
+
+        // The flag is carried, not rendered: it must not change a single pixel.
+        assert_eq!(
+            gray_pixels, color_pixels,
+            "ConvertToGrayscale must not alter the render"
+        );
+    }
+
+    /// Unknown table metadata never renders under a guessed default. Each
+    /// out-of-range enum is rejected with a contextual error and leaves the pixels
+    /// untouched -- and the (sRGB/sRGB/clip) default render would have changed
+    /// them, so the "untouched" assertion is meaningful.
+    #[test]
+    fn unknown_table_metadata_is_never_rendered_under_guessed_defaults() {
+        let original = amount_mutation_pixels();
+
+        // What a guessed-default fallback WOULD have produced.
+        let defaults = make_profile(CONSTANT_2X2X2, Some(1.0));
+        let mut guessed = original.clone();
+        apply_profile_to_three_color_pixels(&mut guessed, &defaults).expect("default render");
+        assert!(
+            (0..original.len())
+                .any(|index| max_channel_delta(guessed[index], original[index]) > MATERIAL_DIFFERENCE),
+            "the guessed-default render must materially change the probe, else this test is vacuous"
+        );
+
+        let cases: [(fn(&mut XmpRgbProfile), &str); 3] = [
+            (
+                |profile| profile.table.color_space = 5,
+                "unsupported RGBTable primaries: 5",
+            ),
+            (
+                |profile| profile.table.gamma = 5,
+                "unsupported RGBTable gamma: 5",
+            ),
+            (
+                |profile| profile.table.gamut = 2,
+                "unsupported RGBTable gamut: 2",
+            ),
+        ];
+
+        for (mutate, expected) in cases {
+            let mut profile = make_profile(CONSTANT_2X2X2, Some(1.0));
+            mutate(&mut profile);
+
+            let mut pixels = original.clone();
+            let error = apply_profile_to_three_color_pixels(&mut pixels, &profile)
+                .expect_err("unknown metadata must be rejected, never defaulted");
+
+            assert_eq!(error, expected);
+            assert_eq!(
+                pixels, original,
+                "no pixel may be rendered under a guessed default ({expected})"
+            );
+        }
+    }
 }

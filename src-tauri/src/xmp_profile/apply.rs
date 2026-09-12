@@ -38,7 +38,11 @@ use super::color_space::{self, Gamma, Gamut, Primaries, PrimariesTransform};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MIN_SIZE: usize = 2;
-const MAX_SIZE: usize = 32;
+/// Adobe's read/write/import ceiling for a 3-D table
+/// (`dng_rgb_table::kMaxDivisions3D_InMemory`, `dng_big_table.h:623`). The
+/// renderer accepts the same 2..=64 range the wire decoder does; the smaller
+/// `kMaxDivisions3D` (32) is only Adobe's default resample resolution.
+const MAX_SIZE: usize = 64;
 
 // Test-only counter of how many times the full (O(size^3)) table validation
 // runs. It is thread-local so tests running in parallel cannot observe each
@@ -137,6 +141,17 @@ impl<'a> RgbTableApplyContext<'a> {
 
         // (b) clamp to [0,1] (BOTH gamut modes) and (b') the extend-mode delta,
         // recorded in linear table primaries.
+        //
+        // Deliberate generalisation of Adobe's `hasMatrix` coupling: the SDK only
+        // runs the clamp and the gamutDelta when `hasMatrix` is true
+        // (`dng_reference.cpp:3595-3622`), and its reference build sets
+        // `fNeedMatrix = false` for `primaries_ProPhoto` by leaving `space = NULL`
+        // (`dng_big_table.cpp:5236-5242`) — because ADOBE'S OWN WORKING SPACE IS
+        // LINEAR ProPhoto, so a ProPhoto table has no device-to-table hop. Once-Lab
+        // works in linear sRGB/D65, so ProPhoto genuinely needs a matrix and
+        // `hasMatrix` is effectively always true for us; clamping + extending
+        // uniformly is the correct spec-model behaviour, not a mis-copy of Adobe's
+        // null-space fast path. See §I of `5c-support-matrix.md`.
         let (clamped, delta) = color_space::gamut_clamp(linear, self.gamut);
 
         // (c) gamma ENCODE.
@@ -529,6 +544,61 @@ mod tests {
         assert_rgb_close(output, [0.0, 0.5, 1.0], 1e-5, "gamut clip");
     }
 
+    #[test]
+    fn extreme_and_negative_pixels_render_finitely_in_both_gamut_modes() {
+        // Every value is finite, so each must render a finite, in-range pixel in
+        // BOTH gamut modes and for both an identity and a non-identity table --
+        // no panic, no NaN/Inf, no out-of-range escape.
+        let inputs = [
+            [-1.0f32, -2.0, -3.0],
+            [-1.0e30, -1.0e30, -1.0e30],
+            [1.0e30, 1.0e30, 1.0e30],
+            [f32::MIN, f32::MIN, f32::MIN],
+            [f32::MAX, f32::MAX, f32::MAX],
+        ];
+
+        for (label, values) in [("identity", IDENTITY_2X2X2), ("constant", CONSTANT_2X2X2)] {
+            for gamut in [0u32, 1u32] {
+                let table = table_with_enums(values, 0, 1, gamut);
+                let context = RgbTableApplyContext::new(&table, 1.0).expect("context");
+
+                for input in inputs {
+                    let output = context
+                        .apply(input)
+                        .unwrap_or_else(|error| panic!("{label}/{gamut} {input:?}: {error}"));
+
+                    for channel in output {
+                        assert!(
+                            channel.is_finite(),
+                            "{label}/{gamut} input {input:?} produced non-finite {output:?}"
+                        );
+                        assert!(
+                            (0.0..=1.0).contains(&channel),
+                            "{label}/{gamut} input {input:?} left [0,1]: {output:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Non-vacuity: with a non-identity table the two gamut modes genuinely
+        // differ on a saturated extreme, so the finite/in-range checks above are
+        // exercising both real branches rather than a shared clamp.
+        let extreme = [1.0e30f32, 1.0e30, 1.0e30];
+        let clip = RgbTableApplyContext::new(&table_with_enums(CONSTANT_2X2X2, 0, 1, 0), 1.0)
+            .expect("clip")
+            .apply(extreme)
+            .expect("clip apply");
+        let extend = RgbTableApplyContext::new(&table_with_enums(CONSTANT_2X2X2, 0, 1, 1), 1.0)
+            .expect("extend")
+            .apply(extreme)
+            .expect("extend apply");
+        assert!(
+            max_channel_delta(clip, extend) > MATERIAL_DIFFERENCE,
+            "the two gamut modes must differ on a saturated extreme, got {clip:?} vs {extend:?}"
+        );
+    }
+
     // -------------------------------------------------------- interpolation
 
     #[test]
@@ -716,6 +786,176 @@ mod tests {
                 .expect_err("non-finite amount must be rejected");
             assert_eq!(error, "invalid RGBTable amount");
         }
+    }
+
+    #[test]
+    fn rejects_non_finite_input_on_every_channel() {
+        let table = table_2x2x2(IDENTITY_2X2X2, 0.0, 1.0);
+
+        for channel in 0..3 {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut input = [0.5f32, 0.5, 0.5];
+                input[channel] = bad;
+
+                let error = apply_rgb_table(input, &table, 1.0)
+                    .expect_err("non-finite input on any channel must be rejected");
+                assert_eq!(
+                    error, "RGBTable input contains non-finite value",
+                    "channel {channel} with {bad}"
+                );
+            }
+        }
+
+        // Non-vacuity: the same probes render when finite.
+        assert!(apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0).is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_table_size() {
+        // 2..=64 are the supported sizes (Adobe's kMaxDivisions3D_InMemory); 0, 1
+        // and 65 are not. The error names the size and there is deliberately NO
+        // fallback to a default size.
+        for size in [0usize, 1, 65] {
+            let table = make_table(size, vec![[0.5f32, 0.5, 0.5]; 8], 0.0, 1.0);
+
+            let error = apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0)
+                .expect_err("an out-of-range table size must be rejected");
+            assert_eq!(error, format!("unsupported RGBTable size: {size}"));
+        }
+
+        // Non-vacuity: the boundary sizes 2, 32, 33 and 64 are accepted (with a
+        // correctly sized identity table). 33 and 64 were rejected before the
+        // ceiling was raised from 32 to Adobe's 64.
+        for size in [2usize, 32, 33, 64] {
+            let node_count = size * size * size;
+            let values = vec![[0.5f32, 0.5, 0.5]; node_count];
+            let table = make_table(size, values, 0.0, 1.0);
+            assert!(
+                apply_rgb_table([0.5, 0.5, 0.5], &table, 1.0).is_ok(),
+                "size {size} must be supported"
+            );
+        }
+    }
+
+    /// A true identity 3-D table of `size` divisions: node `(r,g,b)` maps to
+    /// `(r, g, b) / (size - 1)`. Node order matches the renderer's
+    /// `node_index` (B fastest, R slowest).
+    fn identity_table_of_size(size: usize) -> RgbTable {
+        let scale = (size - 1) as f32;
+        let mut values = Vec::with_capacity(size * size * size);
+        for r in 0..size {
+            for g in 0..size {
+                for b in 0..size {
+                    values.push([r as f32 / scale, g as f32 / scale, b as f32 / scale]);
+                }
+            }
+        }
+        make_table(size, values, 0.0, 1.0)
+    }
+
+    #[test]
+    fn accepts_64_division_table_and_renders() {
+        // The old ceiling (32) rejected this Adobe-legal shape outright. A 64-cube
+        // identity table must now render near-identically under the default
+        // (sRGB / sRGB / clip) metadata, and a non-identity 64-cube must visibly
+        // change a probe (so the near-identity checks are not vacuous).
+        let identity = identity_table_of_size(64);
+        for probe in [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.25, 0.5, 0.75],
+            [0.4, 0.7, 0.2],
+            [0.9, 0.1, 0.6],
+        ] {
+            let output = apply_rgb_table(probe, &identity, 1.0)
+                .expect("a 64-division table must render");
+            assert_rgb_close(
+                output,
+                probe,
+                IDENTITY_COMBINATION_TOLERANCE,
+                &format!("64-division identity {probe:?}"),
+            );
+        }
+
+        let constant = make_table(64, vec![[0.9f32, 0.1, 0.1]; 64 * 64 * 64], 0.0, 1.0);
+        let moved = apply_rgb_table([0.4, 0.7, 0.2], &constant, 1.0).expect("render");
+        assert!(
+            max_channel_delta(moved, [0.4, 0.7, 0.2]) > MATERIAL_DIFFERENCE,
+            "a non-identity 64-division table must move the probe, got {moved:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_33_division_table_previously_over_the_ceiling() {
+        // 33 divisions sat just above the old 32 ceiling and used to be rejected.
+        let table = identity_table_of_size(33);
+        let probe = [0.4f32, 0.7, 0.2];
+        let output = apply_rgb_table(probe, &table, 1.0).expect("33-division table must render");
+        assert_rgb_close(output, probe, IDENTITY_COMBINATION_TOLERANCE, "33-division identity");
+    }
+
+    #[test]
+    fn rejects_non_finite_amount_bounds() {
+        let input = [0.5f32, 0.5, 0.5];
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let nan_min = table_2x2x2(IDENTITY_2X2X2, bad, 1.5);
+            assert_eq!(
+                apply_rgb_table(input, &nan_min, 1.0).expect_err("non-finite min"),
+                "invalid RGBTable amount bounds",
+                "min = {bad}"
+            );
+
+            let nan_max = table_2x2x2(IDENTITY_2X2X2, 0.0, bad);
+            assert_eq!(
+                apply_rgb_table(input, &nan_max, 1.0).expect_err("non-finite max"),
+                "invalid RGBTable amount bounds",
+                "max = {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn amount_at_the_min_and_max_edges_renders_finitely() {
+        // A table with a non-zero minimum: amounts at, below and above the edges
+        // must clamp to the authored bounds and still render finite, in-range
+        // pixels in both gamut modes.
+        for gamut in [0u32, 1u32] {
+            let mut table = table_2x2x2(CONSTANT_2X2X2, 0.25, 1.5);
+            table.gamut = gamut;
+
+            for amount in [0.25f32, 1.5, -1.0e9, 1.0e9] {
+                let effective =
+                    f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
+                let expected = apply_rgb_table([0.2, 0.4, 0.6], &table, effective)
+                    .expect("edge amount should apply");
+                let actual = apply_rgb_table([0.2, 0.4, 0.6], &table, amount)
+                    .expect("edge amount should apply");
+
+                for channel in 0..3 {
+                    assert!(
+                        actual[channel].is_finite() && (0.0..=1.0).contains(&actual[channel]),
+                        "gamut {gamut}, amount {amount}: non-finite/out-of-range {actual:?}"
+                    );
+                    assert_close(
+                        actual[channel],
+                        expected[channel],
+                        1e-7,
+                        &format!("gamut {gamut} amount {amount} clamping channel {channel}"),
+                    );
+                }
+            }
+        }
+
+        // Non-vacuity: at the min and max edges the amount genuinely changes the
+        // result, so the clamp assertions above are not all identical outputs.
+        let table = table_2x2x2(CONSTANT_2X2X2, 0.25, 1.5);
+        let at_min = apply_rgb_table([0.2, 0.4, 0.6], &table, 0.25).expect("min");
+        let at_max = apply_rgb_table([0.2, 0.4, 0.6], &table, 1.5).expect("max");
+        assert!(
+            max_channel_delta(at_min, at_max) > MATERIAL_DIFFERENCE,
+            "min and max amounts must render differently, got {at_min:?} vs {at_max:?}"
+        );
     }
 
     #[test]

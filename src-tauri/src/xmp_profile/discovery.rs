@@ -279,6 +279,236 @@ mod tests {
             .to_string()
     }
 
+    /// Writes raw bytes to `dir/name`, for fixtures that are not valid UTF-8.
+    fn write_bytes(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).expect("write temp bytes");
+        path
+    }
+
+    /// Adobe Base85 (`dng_big_table.cpp` `kEncodeTable`): 5 characters encode a
+    /// 4-byte little-endian word, and a final short group encodes `len - 1`
+    /// bytes. Mirrors the decoder in `rgb_table.rs`; test-only.
+    fn base85_encode(data: &[u8]) -> String {
+        use crate::xmp_profile::rgb_table::ADOBE_BASE85_ALPHABET;
+
+        let mut out = String::new();
+
+        let encode_group = |out: &mut String, bytes: &[u8]| {
+            let mut value = 0u32;
+            for (index, byte) in bytes.iter().enumerate() {
+                value += u32::from(*byte) << (8 * index);
+            }
+            for _ in 0..bytes.len() + 1 {
+                out.push(ADOBE_BASE85_ALPHABET[(value % 85) as usize] as char);
+                value /= 85;
+            }
+        };
+
+        let full = data.len() - (data.len() % 4);
+        for chunk in data[..full].chunks(4) {
+            encode_group(&mut out, chunk);
+        }
+        if !data[full..].is_empty() {
+            encode_group(&mut out, &data[full..]);
+        }
+
+        out
+    }
+
+    /// Wraps a raw big-table body in the `[u32 LE length][zlib]` + Base85 framing.
+    fn encode_big_table(body: &[u8]) -> String {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).expect("test zlib compression");
+
+        let mut payload = (body.len() as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&encoder.finish().expect("test zlib finish"));
+
+        base85_encode(&payload)
+    }
+
+    /// A genuinely well-formed, Adobe-legal **1-D** RGBTable big-table payload.
+    ///
+    /// `dng_rgb_table::GetStream` accepts `dimensions == 1` with
+    /// `kMinDivisions1D..=kMaxDivisions1D` (`dng_big_table.cpp:2463-2472`), so this
+    /// is a shape Adobe itself writes. Once-Lab supports only 3-D tables, so a
+    /// profile carrying one is a real "unsupported but well-formed Adobe profile".
+    /// 16 divisions keeps the block inside the 3-D size window so it is rejected
+    /// for its SHAPE, not its byte length.
+    fn one_dimensional_rgb_table_payload() -> String {
+        const DIVISIONS: u32 = 16;
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // btt_RGBTable
+        body.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        body.extend_from_slice(&1u32.to_le_bytes()); // dimensions = 1
+        body.extend_from_slice(&DIVISIONS.to_le_bytes());
+        for index in 0..DIVISIONS {
+            let sample = (index as u16) * 4000;
+            for _ in 0..3 {
+                body.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        body.extend_from_slice(&0u32.to_le_bytes()); // primaries sRGB
+        body.extend_from_slice(&1u32.to_le_bytes()); // gamma sRGB
+        body.extend_from_slice(&0u32.to_le_bytes()); // gamut clip
+        body.extend_from_slice(&0.0f64.to_le_bytes()); // min amount
+        body.extend_from_slice(&1.0f64.to_le_bytes()); // max amount
+        encode_big_table(&body)
+    }
+
+    /// A 3-D identity RGBTable big-table payload re-encoded in the tests, so a
+    /// fixture can swap only the footer metadata (primaries/gamma/gamut). Zero
+    /// per-node deltas reconstruct each axis's identity ramp, i.e. an identity
+    /// table.
+    fn three_dimensional_rgb_table_payload(primaries: u32, gamma: u32, gamut: u32) -> String {
+        const SIZE: u32 = 2;
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // btt_RGBTable
+        body.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        body.extend_from_slice(&3u32.to_le_bytes()); // dimensions = 3
+        body.extend_from_slice(&SIZE.to_le_bytes());
+        for _ in 0..(SIZE * SIZE * SIZE) {
+            body.extend_from_slice(&0u16.to_le_bytes()); // red delta
+            body.extend_from_slice(&0u16.to_le_bytes()); // green delta
+            body.extend_from_slice(&0u16.to_le_bytes()); // blue delta
+        }
+        body.extend_from_slice(&primaries.to_le_bytes());
+        body.extend_from_slice(&gamma.to_le_bytes());
+        body.extend_from_slice(&gamut.to_le_bytes());
+        body.extend_from_slice(&0.0f64.to_le_bytes());
+        body.extend_from_slice(&1.0f64.to_le_bytes());
+        encode_big_table(&body)
+    }
+
+    /// A profile-shaped XMP whose ONLY problem is the embedded RGBTable: it uses
+    /// `table_payload` instead of the standard identity table.
+    fn profile_xmp_with_table(
+        name: &str,
+        uuid: &str,
+        supports_amount: &str,
+        table_payload: &str,
+    ) -> String {
+        format!(
+            r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:PresetType="Look"
+      crs:UUID="{uuid}"
+      crs:SupportsAmount="{supports_amount}"
+      crs:ConvertToGrayscale="False"
+      crs:RGBTable="TESTTABLE"
+      crs:Table_TESTTABLE="{table_payload}">
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{name}</rdf:li>
+        </rdf:Alt>
+      </crs:Name>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#
+        )
+    }
+
+    /// Synthetic replicas of the four real Adobe application-metadata `.xmp`
+    /// files: each carries an `rdf:Description` and the `crs:` namespace but has
+    /// NO `crs:PresetType`. Shapes taken from the installed Adobe tree (never
+    /// copied from it). List lengths are shortened; the element/attribute shapes
+    /// are faithful.
+    fn adobe_app_metadata_documents() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "RawDefaults.xmp",
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
+   <crs:RawDefaults>
+    <rdf:Seq>
+     <rdf:li
+      crs:Defaults="Adobe"
+      crs:MasterOnly="True"/>
+    </rdf:Seq>
+   </crs:RawDefaults>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#
+                    .to_string(),
+            ),
+            (
+                "Preferences.xmp",
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   crs:RawDefaultsElements="Adobe"
+   crs:DNGSidecarHandling="0"
+   crs:NegativeCachePath=""
+   crs:NegativeCacheMaximumSize="5.0"
+   crs:NegativeCacheLargePreviewSize="2048"
+   crs:JPEGHandling="OpenIfHasSettings"
+   crs:TIFFHandling="OpenIfHasSettings"/>
+ </rdf:RDF>
+</x:xmpmeta>"#
+                    .to_string(),
+            ),
+            (
+                "FavoriteStyles.xmp",
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
+   <crs:HiddenPresetGroups2>
+    <rdf:Bag>
+     <rdf:li
+      crs:ID="00FB827C51C6EC44D394668160AC6E61"
+      crs:Hidden="True"/>
+     <rdf:li
+      crs:ID="0328DAA3F987A293F77FA0E7B0E0626B"
+      crs:Hidden="True"/>
+    </rdf:Bag>
+   </crs:HiddenPresetGroups2>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#
+                    .to_string(),
+            ),
+            (
+                "TimeEstimates.xmp",
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
+   <crs:Recorders rdf:parseType="Resource">
+    <crs:RecorderList>
+     <rdf:Seq>
+      <rdf:li>
+       <rdf:Description
+        crs:name="adaptive_profile"
+        crs:max_entries="5">
+       <crs:times>
+        <rdf:Seq>
+         <rdf:li>14.32020895832102</rdf:li>
+        </rdf:Seq>
+       </crs:times>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Seq>
+    </crs:RecorderList>
+   </crs:Recorders>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#
+                    .to_string(),
+            ),
+        ]
+    }
+
     /// Mirrors the shape a RAW editor writes next to a RAW file: develop
     /// settings containing a `crs:Look` block and embedded RGBTable data, but
     /// no `crs:PresetType`. This must never be mistaken for a profile.
@@ -707,6 +937,228 @@ mod tests {
             error.contains(&missing.to_string_lossy().to_string()),
             "error should contain the path: {error}"
         );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    // ------------------------------------------- corpus-derived classification
+
+    /// The four real Adobe application-metadata files in the installed Camera Raw
+    /// tree (`Defaults/RawDefaults.xmp`, `Defaults/Preferences.xmp`,
+    /// `Defaults/FavoriteStyles.xmp`, `GPU/TimeEstimates.xmp`) all carry an
+    /// `rdf:Description` and the `crs:` namespace but no `crs:PresetType`. None may
+    /// be surfaced to the frontend, and none may disturb a scan that also finds a
+    /// real profile.
+    #[test]
+    fn real_adobe_app_metadata_shapes_are_not_surfaced_as_profiles() {
+        let dir = unique_temp_dir();
+
+        for (name, contents) in adobe_app_metadata_documents() {
+            let path = write_file(&dir, name, &contents);
+
+            assert_eq!(
+                classify_xmp_profile_path(&path),
+                Ok(None),
+                "{name} carries app metadata, not a profile; it must classify as unsupported"
+            );
+        }
+
+        // Non-vacuity + scan safety: alongside the four app-metadata files, a real
+        // profile is still discovered, and only it.
+        write_file(
+            &dir,
+            "Real ⛏️.xmp",
+            &profile_xmp("Real ⛏️", Some("Group"), "UUID-REAL", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the real profile may be returned, got {entries:?}"
+        );
+        assert_eq!(entries[0].name, "Real ⛏️");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// A genuinely non-UTF-8 file, a truncated profile and a malformed document
+    /// must each be skipped without aborting the root scan: the valid profile
+    /// beside them is still returned. Non-UTF-8 is NOT valid UTF-8 (unlike the
+    /// replacement-character fixture used elsewhere), so it exercises the
+    /// `read_to_string` failure path.
+    #[test]
+    fn scan_survives_non_utf8_truncated_and_malformed_neighbours() {
+        let dir = unique_temp_dir();
+
+        // Raw bytes that are not a valid UTF-8 sequence at all.
+        let invalid = write_bytes(
+            &dir,
+            "invalid-utf8.xmp",
+            &[0xFF, 0xFE, 0x00, 0x3C, 0x78, 0x3A, 0x80, 0x81],
+        );
+
+        // Truncated mid-attribute: the quote is never closed. Built from a real
+        // profile document so the cut is provably mid-token.
+        let full = profile_xmp("Truncated", None, "UUID-T", "True");
+        let anchor = full
+            .find("crs:PresetType=\"Look\"")
+            .expect("canonical fixture has a PresetType");
+        let truncated = &full[..anchor + "crs:PresetType=\"Lo".len()];
+        assert!(
+            parse_xmp_rgb_profile(truncated).is_err(),
+            "the truncated fixture must genuinely be unparseable"
+        );
+        write_file(&dir, "truncated.xmp", truncated);
+
+        write_file(&dir, "malformed.xmp", "<x:xmpmeta><rdf:RDF");
+        write_file(&dir, "empty.xmp", "");
+        write_file(
+            &dir,
+            "good.xmp",
+            &profile_xmp("Good", None, "UUID-G", "True"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must survive bad files");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "the scan must still return the valid profile, got {entries:?}"
+        );
+        assert_eq!(entries[0].name, "Good");
+
+        // The non-UTF-8 file is reported as *unreadable* (a contextual error),
+        // which the scan downgrades to a skip -- it is never silently treated as
+        // a supported profile.
+        assert!(
+            classify_xmp_profile_path(&invalid).is_err(),
+            "a non-UTF-8 .xmp must be reported as unreadable, not parsed"
+        );
+        assert_eq!(
+            classify_xmp_profile_path(&dir.join("truncated.xmp")),
+            Ok(None),
+            "a truncated document is unsupported content, not a profile"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// A well-formed, Adobe-legal profile shape that Once-Lab does not support (a
+    /// 1-D RGBTable, which `dng_rgb_table::GetStream` accepts) must not masquerade
+    /// as supported: classification returns `None`, and the neighbouring real
+    /// profile is still returned.
+    #[test]
+    fn unsupported_but_well_formed_adobe_profile_is_not_surfaced() {
+        let dir = unique_temp_dir();
+
+        let one_d = profile_xmp_with_table(
+            "One-D",
+            "UUID-1D",
+            "True",
+            &one_dimensional_rgb_table_payload(),
+        );
+
+        // The rejection is specifically about the TABLE SHAPE, not a byte-length
+        // accident: the same payload reaches the dimensions check.
+        let error = parse_xmp_rgb_profile(&one_d)
+            .expect_err("a 1-D RGBTable is outside Once-Lab's supported table shapes");
+        assert!(
+            error.contains("unsupported embedded RGBTable dimensions 1"),
+            "unexpected error: {error}"
+        );
+
+        let path = write_file(&dir, "one-d.xmp", &one_d);
+        assert_eq!(
+            classify_xmp_profile_path(&path),
+            Ok(None),
+            "an unsupported (1-D) profile must not be surfaced as supported"
+        );
+
+        // Non-vacuity: the exact same document becomes a supported profile once
+        // its table is a supported 3-D identity table.
+        let three_d = profile_xmp_with_table(
+            "Three-D",
+            "UUID-3D",
+            "True",
+            &three_dimensional_rgb_table_payload(0, 1, 0),
+        );
+        let three_d_path = write_file(&dir, "three-d.xmp", &three_d);
+        let entry = classify_xmp_profile_path(&three_d_path)
+            .expect("classification should succeed")
+            .expect("a supported 3-D table must classify as a profile");
+        assert_eq!(entry.name, "Three-D");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Unknown metadata is never guessed into a supported profile: an unknown
+    /// `crs:PresetType`, an unknown boolean spelling and an unknown big-table type
+    /// all classify as `None` rather than defaulting to Look / False / RGBTable.
+    #[test]
+    fn unknown_metadata_is_not_guessed_into_a_supported_profile() {
+        let dir = unique_temp_dir();
+
+        // Unknown PresetType value.
+        let unknown_preset = profile_xmp("UnknownPreset", None, "UUID-P", "True")
+            .replace("crs:PresetType=\"Look\"", "crs:PresetType=\"Look2\"");
+        // Unknown boolean spelling (Adobe writes only True/False).
+        let unknown_bool = profile_xmp("UnknownBool", None, "UUID-B", "True")
+            .replace("crs:SupportsAmount=\"True\"", "crs:SupportsAmount=\"yes\"");
+        // Unknown big-table type (2 is not btt_RGBTable == 1). Padded past the
+        // minimum block size so it is rejected for its TYPE, not its length.
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes()); // unknown type
+        body.extend_from_slice(&[0u8; 96]); // pad into the accepted size window
+        let unknown_type =
+            profile_xmp_with_table("UnknownType", "UUID-T", "True", &encode_big_table(&body));
+
+        for (name, contents) in [
+            ("unknown-preset.xmp", unknown_preset),
+            ("unknown-bool.xmp", unknown_bool),
+            ("unknown-type.xmp", unknown_type),
+        ] {
+            let path = write_file(&dir, name, &contents);
+
+            assert_eq!(
+                classify_xmp_profile_path(&path),
+                Ok(None),
+                "{name}: unknown metadata must be skipped, never defaulted"
+            );
+        }
+
+        // Non-vacuity: a well-formed profile in the same directory is returned,
+        // so the assertion above is not simply "nothing is ever discovered".
+        write_file(
+            &dir,
+            "good.xmp",
+            &profile_xmp("Good", None, "UUID-G", "True"),
+        );
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Good");
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// A valid supported profile is returned (and only through the approved
+    /// parser): embedded name/group/uuid win over the file name.
+    #[test]
+    fn valid_supported_profile_is_returned() {
+        let dir = unique_temp_dir();
+        write_file(
+            &dir,
+            "not-the-name.xmp",
+            &profile_xmp("Authoritative Name", Some("Authoritative Group"), "UUID-V", "False"),
+        );
+
+        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Authoritative Name");
+        assert_eq!(entries[0].group.as_deref(), Some("Authoritative Group"));
+        assert_eq!(entries[0].uuid, "UUID-V");
+        assert!(!entries[0].supports_amount);
 
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }

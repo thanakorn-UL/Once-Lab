@@ -418,6 +418,35 @@ mod tests {
         )
     }
 
+    /// The canonical color fixture with its `crs:Group` child replaced by
+    /// `group_block` (which may be empty), for the self-closing/explicit shapes.
+    fn color_profile_xmp_with_group(group_block: &str) -> String {
+        format!(
+            r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      crs:PresetType="Look"
+      crs:UUID="TEST123"
+      crs:ProcessVersion="11.0"
+      crs:SupportsAmount="True"
+      crs:ConvertToGrayscale="False"
+      crs:RGBTable="TESTTABLE"
+      crs:RGBTableAmount="0.5"
+      crs:Table_TESTTABLE="{table}">
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Test Profile</rdf:li>
+        </rdf:Alt>
+      </crs:Name>{group_block}
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+            table = IDENTITY_2X2X2_BASE85
+        )
+    }
+
     #[test]
     fn parses_color_xmp_profile_with_embedded_rgb_table() {
         let profile = parse_xmp_rgb_profile(&color_profile_xmp())
@@ -534,5 +563,144 @@ mod tests {
             parse_xmp_rgb_profile(&xmp).expect_err("non-Adobe boolean spelling must be rejected");
 
         assert_eq!(error, "invalid crs:ConvertToGrayscale");
+    }
+
+    // ------------------------------------------------- real XML shape variation
+
+    /// Attribute order, interior whitespace, an XML declaration, a namespace
+    /// bound on an ancestor and mixed quoting are all legal XML/XMP and must not
+    /// change the parsed profile. The table attribute is deliberately written
+    /// BEFORE the `crs:RGBTable` that references it.
+    #[test]
+    fn parses_document_with_reordered_attributes_whitespace_and_alternate_quoting() {
+        let canonical = parse_xmp_rgb_profile(&color_profile_xmp()).expect("canonical parses");
+
+        let reordered = format!(
+            r#"<?xml version='1.0' encoding='UTF-8'?>
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description	rdf:about=""
+      crs:Table_TESTTABLE="{table}"
+      crs:RGBTableAmount='0.5'
+      crs:RGBTable='TESTTABLE'
+      crs:ConvertToGrayscale='False'
+      crs:SupportsAmount='True'
+      crs:ProcessVersion='11.0'
+      crs:UUID='TEST123'
+      crs:PresetType='Look'>
+      <crs:Name>
+        <rdf:Alt>
+          <rdf:li
+            xml:lang="x-default">   Test Profile
+          </rdf:li>
+        </rdf:Alt>
+      </crs:Name>
+      <crs:Group>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Test Group</rdf:li>
+        </rdf:Alt>
+      </crs:Group>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+            table = IDENTITY_2X2X2_BASE85
+        );
+
+        let parsed =
+            parse_xmp_rgb_profile(&reordered).expect("reordered/whitespace document must parse");
+        assert_eq!(
+            parsed, canonical,
+            "valid XML variation must not change the parsed profile"
+        );
+    }
+
+    /// Every optional field is genuinely optional: absent, the profile still
+    /// parses with the documented defaults; present, only those fields change.
+    #[test]
+    fn optional_fields_absent_fall_back_to_documented_defaults() {
+        let absent = minimal_xmp(&format!(
+            r#"crs:RGBTable="TESTTABLE"
+      crs:Table_TESTTABLE="{}""#,
+            IDENTITY_2X2X2_BASE85
+        ));
+        let parsed = parse_xmp_rgb_profile(&absent).expect("a minimal profile must parse");
+
+        assert_eq!(parsed.process_version, None, "ProcessVersion is optional");
+        assert_eq!(parsed.group, None, "Group is optional");
+        assert!(!parsed.supports_amount, "SupportsAmount defaults to false");
+        assert!(!parsed.convert_to_grayscale, "ConvertToGrayscale defaults to false");
+        assert_eq!(parsed.rgb_table_amount, None, "RGBTableAmount is optional");
+        assert_eq!(parsed.table.size, 2, "the table still decodes");
+
+        // Non-vacuity: supplying the optional fields changes exactly those fields.
+        let present = minimal_xmp(&format!(
+            r#"crs:RGBTable="TESTTABLE"
+      crs:RGBTableAmount="0.5"
+      crs:SupportsAmount="True"
+      crs:ConvertToGrayscale="True"
+      crs:ProcessVersion="11.0"
+      crs:Table_TESTTABLE="{}""#,
+            IDENTITY_2X2X2_BASE85
+        ));
+        let with_optionals =
+            parse_xmp_rgb_profile(&present).expect("a profile with optionals must parse");
+
+        assert_eq!(with_optionals.process_version, Some("11.0".to_string()));
+        assert!(with_optionals.supports_amount);
+        assert!(with_optionals.convert_to_grayscale);
+        assert_eq!(with_optionals.rgb_table_amount, Some(0.5));
+        // The presence of the optionals must not disturb the identity fields.
+        assert_eq!(with_optionals.name, parsed.name);
+        assert_eq!(with_optionals.uuid, parsed.uuid);
+        assert_eq!(&with_optionals.table, &parsed.table);
+    }
+
+    /// The optional `crs:Group` may be omitted, written self-closing, or written
+    /// with an explicit empty start/end pair. All three are valid XML and must
+    /// yield the same (absent) group.
+    #[test]
+    fn omitted_self_closing_and_explicit_empty_group_elements_are_equivalent() {
+        for (label, block) in [
+            ("omitted", ""),
+            ("self-closing", "<crs:Group/>"),
+            ("explicit empty", "<crs:Group></crs:Group>"),
+        ] {
+            let parsed = parse_xmp_rgb_profile(&color_profile_xmp_with_group(block))
+                .unwrap_or_else(|error| panic!("{label} group form must parse: {error}"));
+
+            assert_eq!(parsed.group, None, "{label} group must be absent");
+        }
+
+        // Non-vacuity: a populated group IS returned, so the loop above is
+        // distinguishing "empty" from "present", not "always None".
+        let populated = color_profile_xmp_with_group(
+            "<crs:Group>\n<rdf:Alt>\n<rdf:li xml:lang=\"x-default\">Test Group</rdf:li>\n</rdf:Alt>\n</crs:Group>",
+        );
+        let parsed = parse_xmp_rgb_profile(&populated).expect("populated group must parse");
+        assert_eq!(parsed.group.as_deref(), Some("Test Group"));
+    }
+
+    /// The `crs:` prefix may be bound on any ancestor. Moving the declaration from
+    /// `rdf:Description` to the root `x:xmpmeta` is valid XML and must parse the
+    /// same profile.
+    #[test]
+    fn namespace_bound_on_the_root_element_is_accepted() {
+        let canonical = parse_xmp_rgb_profile(&color_profile_xmp()).expect("canonical parses");
+
+        let root_bound = color_profile_xmp()
+            .replacen(
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">"#,
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">"#,
+                1,
+            )
+            .replacen(
+                "      xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n",
+                "",
+                1,
+            );
+
+        let parsed = parse_xmp_rgb_profile(&root_bound).expect("root-bound namespace must parse");
+        assert_eq!(parsed, canonical);
     }
 }

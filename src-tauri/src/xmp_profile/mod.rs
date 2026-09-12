@@ -7,6 +7,7 @@ mod color_space;
 mod default_roots;
 mod discovery;
 mod integration;
+mod linear_rgb;
 mod loader;
 mod look_table;
 mod look_table_apply;

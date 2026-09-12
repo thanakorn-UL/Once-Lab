@@ -19,7 +19,7 @@
 //! Both 3x3 matrices are *derived*, never hardcoded: they replicate Adobe's
 //! `dng_color_space::SetMatrixToPCS` row normalisation of the published sRGB and
 //! ProPhoto constants, so that device white and neutral grey round-trip exactly
-//! (see [`set_matrix_to_pcs`]).
+//! (see [`super::linear_rgb::set_matrix_to_pcs`]).
 //!
 //! Only `encoding == 0` (Linear) and `encoding == 1` (sRGB) exist; for `sRGB`,
 //! Adobe transfer-encodes **only** the `V` coordinate before the lookup and
@@ -28,6 +28,9 @@
 //! encode is confined to the `valDivisions >= 2` branch: the "2.5-D" branch
 //! leaves `vEncoded = v` (`dng_reference.cpp:1584`) yet still decodes.
 
+use super::linear_rgb::{
+    compose_working_to_primaries, invert3, mul3, to_f32, Matrix3, PROPHOTO_RAW, SRGB_RAW,
+};
 use super::look_table::{
     ENCODING_LINEAR, ENCODING_SRGB, LookTable, MAX_HUE_DIVISIONS, MAX_SAT_DIVISIONS,
     MAX_TOTAL_SAMPLES, MAX_VAL_DIVISIONS, MIN_HUE_DIVISIONS, MIN_SAT_DIVISIONS, MIN_VAL_DIVISIONS,
@@ -37,27 +40,7 @@ use super::srgb_transfer::{srgb_decode, srgb_encode};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A row-major 3x3 matrix.
-type Matrix3 = [[f32; 3]; 3];
-
-/// Adobe PCS white chromaticity: `D50_xy_coord()` (`dng_xy_coord.h:145`).
-const D50_XY: [f64; 2] = [0.3457, 0.3585];
-
-/// `dng_space_ProPhoto` constructor constants (`dng_color_space.cpp:996`).
-const PROPHOTO_RAW: [[f64; 3]; 3] = [
-    [0.7977, 0.1352, 0.0313],
-    [0.2880, 0.7119, 0.0001],
-    [0.0000, 0.0000, 0.8249],
-];
-
-/// `dng_space_sRGB` constructor constants (`dng_color_space.cpp:257`). These are
-/// already Bradford-adapted to the D50 PCS, so the sRGB <-> ProPhoto hop needs no
-/// separate chromatic-adaptation step.
-const SRGB_RAW: [[f64; 3]; 3] = [
-    [0.4361, 0.3851, 0.1431],
-    [0.2225, 0.7169, 0.0606],
-    [0.0139, 0.0971, 0.7141],
-];
+// The row-major 3x3 `Matrix3` type is the shared `super::linear_rgb::Matrix3`.
 
 // Test-only counter of how many times the full (O(samples)) table validation
 // runs. Thread-local so tests running in parallel cannot observe each other's
@@ -219,76 +202,15 @@ fn validate_table_structure(table: &LookTable) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------- color hop
-
-/// The Adobe PCS white `PCStoXYZ()` = `XYtoXYZ(D50_xy_coord())`.
-fn pcs_white() -> [f64; 3] {
-    let [x, y] = D50_XY;
-    [x / y, 1.0, (1.0 - x - y) / y]
-}
-
-/// Replicates `dng_color_space::SetMatrixToPCS`.
-///
-/// Adobe's published device->PCS matrices are rounded, so it rescales each row
-/// (`scale_i = W2_i / (M * (1,1,1))_i`) to make device white `(1,1,1)` land
-/// EXACTLY on the PCS white. Because both sRGB and ProPhoto are normalised to the
-/// *same* D50 white, any neutral `(t,t,t)` maps to `t * D50` in both spaces and
-/// therefore survives the sRGB <-> ProPhoto hop unchanged.
-fn set_matrix_to_pcs(raw: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let white = pcs_white();
-    let mut out = [[0.0f64; 3]; 3];
-
-    for row in 0..3 {
-        let sum = raw[row][0] + raw[row][1] + raw[row][2];
-        let scale = white[row] / sum;
-        for col in 0..3 {
-            out[row][col] = raw[row][col] * scale;
-        }
-    }
-
-    out
-}
-
-fn invert3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let [[a, b, c], [d, e, f], [g, h, i]] = m;
-
-    let cof_a = e * i - f * h;
-    let cof_b = -(d * i - f * g);
-    let cof_c = d * h - e * g;
-
-    let det = a * cof_a + b * cof_b + c * cof_c;
-
-    [
-        [cof_a / det, -(b * i - c * h) / det, (b * f - c * e) / det],
-        [cof_b / det, (a * i - c * g) / det, -(a * f - c * d) / det],
-        [cof_c / det, -(a * h - b * g) / det, (a * e - b * d) / det],
-    ]
-}
-
-fn mul3_f64(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0f64; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            out[row][col] = (0..3).map(|k| a[row][k] * b[k][col]).sum();
-        }
-    }
-    out
-}
-
-fn to_f32(m: [[f64; 3]; 3]) -> Matrix3 {
-    let mut out = [[0.0f32; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            out[row][col] = m[row][col] as f32;
-        }
-    }
-    out
-}
+//
+// The sRGB(D65) <-> ProPhoto(D50) hop is built by the single shared
+// [`super::linear_rgb`] toolbox, so the LookTable and RGBTable stages cannot
+// drift apart. It is *derived*, never hardcoded:
+// `Invert(SetMatrixToPCS(PROPHOTO_RAW)) * SetMatrixToPCS(SRGB_RAW)`.
 
 /// Linear ProPhoto (D50) <= sRGB (D65) transfer, in f64, from the raw constants.
 fn srgb_to_prophoto_f64() -> [[f64; 3]; 3] {
-    let prophoto = set_matrix_to_pcs(PROPHOTO_RAW);
-    let srgb = set_matrix_to_pcs(SRGB_RAW);
-    mul3_f64(invert3(prophoto), srgb)
+    compose_working_to_primaries(PROPHOTO_RAW, SRGB_RAW)
 }
 
 /// `M_sRGB(D65) -> ProPhoto(D50)` = `Invert(P) * S`, where `P`/`S` are the
@@ -300,15 +222,6 @@ pub(super) fn linear_srgb_to_linear_prophoto() -> Matrix3 {
 /// `M_ProPhoto(D50) -> sRGB(D65)` = `Invert(M_sRGB -> ProPhoto)`.
 pub(super) fn linear_prophoto_to_linear_srgb() -> Matrix3 {
     to_f32(invert3(srgb_to_prophoto_f64()))
-}
-
-/// Applies a row-major 3x3 matrix to a column vector.
-fn mul3(m: Matrix3, v: [f32; 3]) -> [f32; 3] {
-    let mut out = [0.0f32; 3];
-    for row in 0..3 {
-        out[row] = m[row][0] * v[0] + m[row][1] * v[1] + m[row][2] * v[2];
-    }
-    out
 }
 
 // ---------------------------------------------------------------------- HSV
@@ -889,7 +802,93 @@ mod tests {
         assert_close(linear_rgb_to_hsv([0.5, 0.0, 0.1])[0], 5.8, 1e-5, "pinned H would differ");
     }
 
+    #[test]
+    fn rgb_to_hsv_covers_all_negative_and_equal_negative_vectors() {
+        // All-negative vector: V is itself negative, so `S = gap / V` is NEGATIVE.
+        // r == V, so H = (g - b) / gap = (-0.3 + 0.2) / 0.2 = -0.5, folded to +6.
+        let [h, s, v] = linear_rgb_to_hsv([-0.1, -0.3, -0.2]);
+        assert_close(v, -0.1, 1e-6, "V is the maximum (least-negative) component");
+        assert_close(s, -2.0, 1e-6, "S = gap / V is negative when V < 0");
+        assert_close(h, 5.5, 1e-6, "H folds the negative (g-b)/gap into [0,6)");
+        assert!(s < 0.0, "an all-negative vector must yield a negative S, got {s}");
+
+        // Equal-negative vector: gap == 0 takes the `[0, 0, V]` branch.
+        let [h, s, v] = linear_rgb_to_hsv([-0.1, -0.1, -0.1]);
+        assert_close(v, -0.1, 1e-6, "V is the common component");
+        assert_eq!(s, 0.0, "a zero gap yields S = 0");
+        assert_eq!(h, 0.0, "a zero gap yields H = 0");
+
+        // Non-vacuity: the three vectors must be distinguishable, so the
+        // assertions above are not all testing the same branch.
+        assert_ne!(
+            linear_rgb_to_hsv([-0.1, -0.3, -0.2]),
+            linear_rgb_to_hsv([-0.1, -0.1, -0.1])
+        );
+    }
+
+    /// The whole LookTable pipeline must stay finite for out-of-gamut, all-negative
+    /// input: the hop, the unpinned RGB->HSV (negative V and S), the lookup and the
+    /// HSV->RGB round trip must never produce NaN/Inf, for a Linear and an
+    /// sRGB-encoded table.
+    #[test]
+    fn look_table_apply_returns_finite_pixels_for_negative_input() {
+        let tables = [
+            identity_table(36, 16, 16),
+            make_table(2, 2, 2, vec![[15.0, 1.5, 0.5]; 8], ENCODING_SRGB),
+        ];
+
+        for table in tables {
+            let context = LookTableApplyContext::new(&table).expect("valid context");
+
+            for input in [
+                [-0.1f32, -0.3, -0.2],
+                [-0.5, -0.5, -0.5],
+                [-1.0e6, -2.0e6, -3.0e6],
+            ] {
+                let output = context
+                    .apply(input)
+                    .unwrap_or_else(|error| panic!("negative input {input:?}: {error}"));
+
+                for channel in output {
+                    assert!(
+                        channel.is_finite(),
+                        "negative input {input:?} produced non-finite {output:?}"
+                    );
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- errors
+
+    #[test]
+    fn rejects_non_finite_input_on_every_channel() {
+        let table = identity_table(36, 16, 16);
+
+        for channel in 0..3 {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut input = [0.5f32, 0.5, 0.5];
+                input[channel] = bad;
+
+                let error = LookTableApplyContext::new(&table)
+                    .expect("context")
+                    .apply(input)
+                    .expect_err("non-finite input on any channel must be rejected");
+                assert_eq!(
+                    error, "LookTable input contains non-finite value",
+                    "channel {channel} with {bad}"
+                );
+            }
+        }
+
+        // Non-vacuity: the same probe renders when finite.
+        assert!(
+            LookTableApplyContext::new(&table)
+                .expect("context")
+                .apply([0.5, 0.5, 0.5])
+                .is_ok()
+        );
+    }
 
     #[test]
     fn rejects_unsupported_encoding() {

@@ -45,13 +45,11 @@
 //! Any nonzero difference, even the smallest of these, would *break* the
 //! required sRGB bit-identity if the sampled table were used.
 
+use super::linear_rgb::{
+    compose_working_to_primaries, invert3, mul3, to_f32, Matrix3, Matrix3F64, ADOBE_RGB_RAW,
+    DISPLAY_P3_RAW, PROPHOTO_RAW, REC2020_RAW, SRGB_RAW,
+};
 use super::srgb_transfer::{srgb_decode, srgb_encode};
-
-/// A row-major 3x3 matrix used on the per-pixel fast path.
-pub(super) type Matrix3 = [[f32; 3]; 3];
-
-/// A row-major 3x3 matrix used while deriving the PCS-normalised transforms.
-type Matrix3F64 = [[f64; 3]; 3];
 
 // -------------------------------------------------------------------- enums
 //
@@ -227,47 +225,11 @@ impl Gamut {
 }
 
 // -------------------------------------------------------------- primaries 3x3
-
-/// Adobe PCS white chromaticity: `D50_xy_coord()` (`dng_xy_coord.h:145`).
-const D50_XY: [f64; 2] = [0.3457, 0.3585];
-
-/// `dng_space_sRGB` constructor constants (`dng_color_space.cpp:257`); already
-/// Bradford-adapted to the D50 PCS. Also the working-space white anchor.
-const SRGB_RAW: Matrix3F64 = [
-    [0.4361, 0.3851, 0.1431],
-    [0.2225, 0.7169, 0.0606],
-    [0.0139, 0.0971, 0.7141],
-];
-
-/// `dng_space_AdobeRGB` constructor constants (`dng_color_space.cpp:565-572`).
-const ADOBE_RGB_RAW: Matrix3F64 = [
-    [0.6097, 0.2053, 0.1492],
-    [0.3111, 0.6257, 0.0632],
-    [0.0195, 0.0609, 0.7446],
-];
-
-/// `dng_space_ProPhoto` constructor constants (`dng_color_space.cpp:993-1000`).
-const PROPHOTO_RAW: Matrix3F64 = [
-    [0.7977, 0.1352, 0.0313],
-    [0.2880, 0.7119, 0.0001],
-    [0.0000, 0.0000, 0.8249],
-];
-
-/// `dng_space_DisplayP3` constructor constants (`dng_color_space.cpp:781-783`,
-/// the live `#else` branch; the `#if 0` chromaticity-derived block is dead).
-const DISPLAY_P3_RAW: Matrix3F64 = [
-    [0.5151, 0.2920, 0.1571],
-    [0.2412, 0.6922, 0.0666],
-    [-0.0010, 0.0419, 0.7843],
-];
-
-/// `dng_space_Rec2020` constructor constants (`dng_color_space.cpp:896-898`,
-/// the live `#else` branch).
-const REC2020_RAW: Matrix3F64 = [
-    [0.6735, 0.1657, 0.1251],
-    [0.2791, 0.6753, 0.0456],
-    [-0.0019, 0.0300, 0.7971],
-];
+//
+// The D50 PCS white, the raw device->PCS constructor constants and the
+// `SetMatrixToPCS`/inverse/multiply helpers live ONCE in [`super::linear_rgb`],
+// shared with the LookTable stage's sRGB<->ProPhoto hop. This module keeps only
+// the `Primaries` enum -> raw-constant mapping and the composition call.
 
 /// The raw device->PCS matrix Adobe passes to `SetMatrixToPCS` for `primaries`.
 fn raw_primaries_matrix(primaries: Primaries) -> Matrix3F64 {
@@ -280,76 +242,14 @@ fn raw_primaries_matrix(primaries: Primaries) -> Matrix3F64 {
     }
 }
 
-/// The Adobe PCS white `PCStoXYZ()` = `XYtoXYZ(D50_xy_coord())`.
-fn pcs_white() -> [f64; 3] {
-    let [x, y] = D50_XY;
-    [x / y, 1.0, (1.0 - x - y) / y]
-}
-
-/// Replicates `dng_color_space::SetMatrixToPCS` (`dng_color_space.cpp:205-228`).
-///
-/// The published matrices are rounded, so Adobe rescales each row
-/// (`scale_i = W2_i / (M * (1,1,1))_i`) to make device white `(1,1,1)` land
-/// EXACTLY on the PCS white. Because all five primaries are normalised to the
-/// same D50 white, neutrals survive the device-to-device hop unchanged.
-fn set_matrix_to_pcs(raw: Matrix3F64) -> Matrix3F64 {
-    let white = pcs_white();
-    let mut out = [[0.0f64; 3]; 3];
-
-    for row in 0..3 {
-        let sum = raw[row][0] + raw[row][1] + raw[row][2];
-        let scale = white[row] / sum;
-        for col in 0..3 {
-            out[row][col] = raw[row][col] * scale;
-        }
-    }
-
-    out
-}
-
-fn invert3(m: Matrix3F64) -> Matrix3F64 {
-    let [[a, b, c], [d, e, f], [g, h, i]] = m;
-
-    let cof_a = e * i - f * h;
-    let cof_b = -(d * i - f * g);
-    let cof_c = d * h - e * g;
-
-    let det = a * cof_a + b * cof_b + c * cof_c;
-
-    [
-        [cof_a / det, -(b * i - c * h) / det, (b * f - c * e) / det],
-        [cof_b / det, (a * i - c * g) / det, -(a * f - c * d) / det],
-        [cof_c / det, -(a * h - b * g) / det, (a * e - b * d) / det],
-    ]
-}
-
-fn mul3_f64(a: Matrix3F64, b: Matrix3F64) -> Matrix3F64 {
-    let mut out = [[0.0f64; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            out[row][col] = (0..3).map(|k| a[row][k] * b[k][col]).sum();
-        }
-    }
-    out
-}
-
-fn to_f32(m: Matrix3F64) -> Matrix3 {
-    let mut out = [[0.0f32; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            out[row][col] = m[row][col] as f32;
-        }
-    }
-    out
-}
-
 /// `M_working -> table primaries` in f64 = `Invert(tablePrimaries.PCS) * sRGB.PCS`,
 /// with `workingSpace` = Once-Lab's linear sRGB/D65 (`dng_big_table.cpp:5244-5251`,
-/// generalised from `look_table_apply.rs`).
+/// generalised from `look_table_apply.rs`). The composition itself is the single
+/// shared [`super::linear_rgb::compose_working_to_primaries`]; for
+/// `primaries_ProPhoto` it therefore yields exactly the matrix the LookTable
+/// stage uses.
 fn working_to_primaries_f64(primaries: Primaries) -> Matrix3F64 {
-    let table = set_matrix_to_pcs(raw_primaries_matrix(primaries));
-    let working = set_matrix_to_pcs(SRGB_RAW);
-    mul3_f64(invert3(table), working)
+    compose_working_to_primaries(raw_primaries_matrix(primaries), SRGB_RAW)
 }
 
 /// The linear `working space (Once-Lab: linear sRGB/D65) <-> table primaries` hop.
@@ -401,16 +301,25 @@ impl PrimariesTransform {
     pub(super) fn is_identity_shortcut(self) -> bool {
         self.encode.is_none()
     }
+
+    /// The stored `working -> table primaries` matrix, or `None` for the sRGB
+    /// identity shortcut. Test-only, so `linear_rgb`'s cross-check can pin that
+    /// the ProPhoto hop equals the shared composition.
+    #[cfg(test)]
+    pub(super) fn encode_matrix(self) -> Option<Matrix3> {
+        self.encode
+    }
+
+    /// The stored `table primaries -> working` matrix, or `None` for the sRGB
+    /// identity shortcut. Test-only (see [`Self::encode_matrix`]).
+    #[cfg(test)]
+    pub(super) fn decode_matrix(self) -> Option<Matrix3> {
+        self.decode
+    }
 }
 
-/// Applies a row-major 3x3 matrix to a column vector.
-fn mul3(m: Matrix3, v: [f32; 3]) -> [f32; 3] {
-    let mut out = [0.0f32; 3];
-    for row in 0..3 {
-        out[row] = m[row][0] * v[0] + m[row][1] * v[1] + m[row][2] * v[2];
-    }
-    out
-}
+// The row-major 3x3 multiply this module would otherwise need lives once, in
+// [`super::linear_rgb::mul3`]; the sRGB bit-identity path never calls it.
 
 // -------------------------------------------------------- transfer functions
 
@@ -560,6 +469,23 @@ fn rec2020_decode(y: f64) -> f64 {
 ///
 /// `gamut_extend` is *not* "skip the clamp" — it clamps identically and lets the
 /// caller re-add the delta after the gamma decode.
+///
+/// **Deliberate generalisation (Adobe's `hasMatrix` coupling).** In the SDK the
+/// clamp and the `gamutDelta` sit *inside* `if (hasMatrix)`
+/// (`dng_reference.cpp:3595-3622`), and `hasMatrix` is false whenever the
+/// encode/decode matrices are absent. Adobe passes `NULL` for those exactly when
+/// the table's primaries equal its own built-in working space — linear ProPhoto —
+/// so `fNeedMatrix = (space != NULL)` is false for `primaries_ProPhoto`
+/// (`dng_big_table.cpp:5236-5242`, dispatched at `:5416-5417`); Adobe documents
+/// the same shortcut in `dng_rgb_table::IsNOP()` (`dng_big_table.cpp:2353`).
+/// **That suppression is only valid because Adobe's working space IS linear
+/// ProPhoto** — a ProPhoto table needs no device-to-table hop, so there is nothing
+/// to clamp or to extend. Once-Lab's working space is linear sRGB/D65, so a
+/// ProPhoto table genuinely *does* need a matrix here: `hasMatrix` is effectively
+/// always true for us. Applying the spec model (`matrix -> clamp -> …`) uniformly
+/// to every primaries enum is therefore the correct generalisation for our
+/// working space, not a literal reproduction of Adobe's null-space fast path.
+/// See §I of `5c-support-matrix.md`.
 pub(super) fn gamut_clamp(linear: [f32; 3], gamut: Gamut) -> ([f32; 3], [f32; 3]) {
     let clamped = [
         linear[0].clamp(0.0, 1.0),
@@ -760,6 +686,91 @@ mod tests {
             REC2020_BETA as f32,
             1e-6,
             "Rec2020 decode breakpoint",
+        );
+    }
+
+    /// Every transfer function must be finite and stay inside `[0,1]` at its own
+    /// breakpoints and on BOTH sides of them, and the two analytic branches must
+    /// agree across each breakpoint (no jump, no NaN). The encoded breakpoint is
+    /// the linear breakpoint passed through the curve.
+    #[test]
+    fn every_transfer_is_finite_and_continuous_on_both_sides_of_each_breakpoint() {
+        const SIDE: f32 = 1.0e-3;
+        // Tolerance for the (small) gap between the two analytic branches at a
+        // breakpoint, which must be continuous.
+        const BREAK_TOLERANCE: f32 = 1.0e-3;
+
+        let cases: [(Gamma, f32, f32); 5] = [
+            (Gamma::Linear, 0.5, 0.5),
+            (Gamma::Srgb, 0.0031308, 0.04045),
+            (Gamma::OnePointEight, GAMMA_1_8_X1 as f32, GAMMA_1_8_Y1 as f32),
+            (Gamma::TwoPointTwo, GAMMA_2_2_X1 as f32, GAMMA_2_2_Y1 as f32),
+            (
+                Gamma::Rec2020,
+                REC2020_BETA as f32,
+                (REC2020_SLOPE * REC2020_BETA) as f32,
+            ),
+        ];
+
+        for (gamma, linear_bp, encoded_bp) in cases {
+            // Encode side: the endpoints of [0,1], the breakpoint and both sides.
+            let below = gamma.encode(linear_bp * (1.0 - SIDE));
+            let above = gamma.encode(linear_bp * (1.0 + SIDE));
+
+            for value in [0.0f32, 1.0, linear_bp, linear_bp * (1.0 - SIDE), linear_bp * (1.0 + SIDE)]
+            {
+                let encoded = gamma.encode(value);
+                assert!(
+                    encoded.is_finite(),
+                    "{gamma:?}: encode({value}) is not finite"
+                );
+                assert!(
+                    (0.0..=1.0).contains(&encoded),
+                    "{gamma:?}: encode({value}) = {encoded} left [0,1]"
+                );
+            }
+
+            let encode_gap = (above - below).abs();
+
+            // Decode side: both sides of the encoded breakpoint must be finite and
+            // in-range.
+            let decode_below = gamma.decode(encoded_bp * (1.0 - SIDE));
+            let decode_above = gamma.decode(encoded_bp * (1.0 + SIDE));
+
+            for value in [encoded_bp, encoded_bp * (1.0 - SIDE), encoded_bp * (1.0 + SIDE)] {
+                let linear = gamma.decode(value);
+                assert!(
+                    linear.is_finite(),
+                    "{gamma:?}: decode({value}) is not finite"
+                );
+                assert!(
+                    (0.0..=1.0).contains(&linear),
+                    "{gamma:?}: decode({value}) = {linear} left [0,1]"
+                );
+            }
+
+            let decode_gap = (decode_above - decode_below).abs();
+
+            // Linear has no breakpoint (it is the identity), so the gap is simply
+            // the slope over the probe window; only the piecewise curves express a
+            // branch that must meet continuously.
+            if gamma != Gamma::Linear {
+                assert!(
+                    encode_gap < BREAK_TOLERANCE,
+                    "{gamma:?}: encode jumps by {encode_gap} across its breakpoint {linear_bp}"
+                );
+                assert!(
+                    decode_gap < BREAK_TOLERANCE,
+                    "{gamma:?}: decode jumps by {decode_gap} across its breakpoint {encoded_bp}"
+                );
+            }
+        }
+
+        // Non-vacuity: the per-gamma dispatch must not be a single curve. At the
+        // sRGB linear breakpoint the sRGB encode and the Linear encode differ.
+        assert!(
+            (Gamma::Srgb.encode(0.0031308) - Gamma::Linear.encode(0.0031308)).abs() > 1e-3,
+            "sRGB and Linear must genuinely differ at the sRGB breakpoint"
         );
     }
 
@@ -992,6 +1003,46 @@ mod tests {
             extend_delta.iter().any(|d| *d != 0.0),
             "the test input must produce a non-zero excursion"
         );
+    }
+
+    /// The gamut policy must hold for the extremes as well: an all-negative and an
+    /// all-huge vector clamp to the same `[0,1]` corners in BOTH modes, clip always
+    /// discards the excursion, and extend records it exactly -- finitely, for
+    /// `f32::MIN`/`f32::MAX` too.
+    #[test]
+    fn gamut_clamp_handles_all_negative_and_all_huge_inputs() {
+        let cases: [([f32; 3], [f32; 3], [f32; 3]); 4] = [
+            ([-1.0, -2.0, -3.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -3.0]),
+            ([100.0, 200.0, 300.0], [1.0, 1.0, 1.0], [99.0, 199.0, 299.0]),
+            ([f32::MIN; 3], [0.0, 0.0, 0.0], [f32::MIN; 3]),
+            ([f32::MAX; 3], [1.0, 1.0, 1.0], [f32::MAX; 3]),
+        ];
+
+        for (linear, expected_clamped, expected_delta) in cases {
+            let (clipped, clip_delta) = gamut_clamp(linear, Gamut::Clip);
+            assert_eq!(
+                clipped, expected_clamped,
+                "clip must clamp {linear:?} to [0,1]"
+            );
+            assert_eq!(clip_delta, [0.0f32; 3], "clip records no excursion");
+
+            let (extended, extend_delta) = gamut_clamp(linear, Gamut::Extend);
+            assert_eq!(
+                extended, clipped,
+                "extend must clamp {linear:?} identically to clip"
+            );
+            assert_eq!(
+                extend_delta, expected_delta,
+                "extend must record the exact excursion of {linear:?}"
+            );
+
+            for value in clipped.iter().chain(extend_delta.iter()) {
+                assert!(
+                    value.is_finite(),
+                    "gamut handling of {linear:?} produced a non-finite value"
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------- enum parsing
