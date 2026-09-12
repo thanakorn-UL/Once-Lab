@@ -8,11 +8,7 @@ import { AlertTriangle, FileText, X } from 'lucide-react';
 import { Invokes } from './AppProperties';
 import Slider from './Slider';
 import XmpProfileBrowser, { type XmpProfileEntry } from './XmpProfileBrowser';
-import {
-  useEditorStore,
-  DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
-  nextXmpProfileTransactionId,
-} from '../../store/useEditorStore';
+import { useEditorStore, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT } from '../../store/useEditorStore';
 import { profileProjectionFromSelection } from '../../utils/developState';
 
 interface XmpProfileSummary {
@@ -33,7 +29,7 @@ export default function XmpProfileControl() {
   const { t } = useTranslation();
   const selectedImage = useEditorStore((s) => s.selectedImage);
   const xmpProfile = useEditorStore((s) => s.xmpProfile);
-  const setEditor = useEditorStore((s) => s.setEditor);
+  const requestProfileTransaction = useEditorStore((s) => s.requestProfileTransaction);
   const [isInspecting, setIsInspecting] = useState(false);
 
   // The slider is visually live while dragging, but only the released value is
@@ -50,53 +46,6 @@ export default function XmpProfileControl() {
 
   const isRaw = Boolean(selectedImage?.isRaw);
   const isDisabled = !selectedImage || !isRaw || isInspecting;
-
-  // Reloading the current RAW is what actually applies (or removes) a profile,
-  // so the selection only becomes active once the reload has been requested.
-  const commitProfile = (
-    path: string | null,
-    name: string | null,
-    uuid: string | null,
-    amountPercent: number = DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
-    supportsAmount: boolean = false,
-  ) => {
-    const {
-      xmpProfile: currentProjection,
-      xmpProfileRollback: pendingRollback,
-      selectedImage: image,
-    } = useEditorStore.getState();
-
-    // A reload for exactly this target is already in flight (isReady is false)
-    // and this commit would not change any reload input, so it has nothing left
-    // to request. The in-flight transaction keeps ownership of the rollback:
-    // rotating the transaction id here — with no reload to close it — would
-    // orphan that rollback, so the next failure would restore stale fields.
-    if (
-      image?.isReady === false &&
-      path === currentProjection.path &&
-      name === currentProjection.name &&
-      uuid === currentProjection.uuid &&
-      amountPercent === currentProjection.amountPercent &&
-      supportsAmount === currentProjection.supportsAmount
-    ) {
-      return;
-    }
-
-    // An in-flight transaction's rollback is the last successfully rendered
-    // state, so reuse its fields rather than snapshotting a not-yet-rendered
-    // amount; a fresh object with a new id keeps each transaction's rollback
-    // distinct so a superseded reload cannot clear this one.
-    const base = pendingRollback ?? { profile: currentProjection };
-
-    const id = nextXmpProfileTransactionId();
-
-    setEditor({
-      xmpProfile: profileProjectionFromSelection(path, name, uuid, amountPercent, supportsAmount),
-      xmpProfileRollback: { ...base, id },
-      xmpProfileRevision: id,
-      selectedImage: image ? { ...image, isReady: false } : image,
-    });
-  };
 
   const handleChoose = async () => {
     try {
@@ -122,7 +71,15 @@ export default function XmpProfileControl() {
       // A different profile always starts from its authored strength, so any
       // pending amount commit must not leak onto the newly chosen profile.
       debouncedAmountCommit.cancel();
-      commitProfile(selection, summary.name, summary.uuid, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, summary.supports_amount);
+      requestProfileTransaction(
+        profileProjectionFromSelection(
+          selection,
+          summary.name,
+          summary.uuid,
+          DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+          summary.supports_amount,
+        ),
+      );
     } catch (err) {
       console.error('Failed to choose XMP profile:', err);
       toast.error(`${t('ui.xmpProfile.applyFailed')}: ${err}`);
@@ -134,7 +91,9 @@ export default function XmpProfileControl() {
   const handleClear = () => {
     // Clearing picks a new (empty) profile, so cancel any pending amount commit.
     debouncedAmountCommit.cancel();
-    commitProfile(null, null, null);
+    requestProfileTransaction(
+      profileProjectionFromSelection(null, null, null, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, false),
+    );
   };
 
   // A discovered entry already carries the metadata the backend parsed out of
@@ -142,7 +101,15 @@ export default function XmpProfileControl() {
   // and never needs a second inspect round trip.
   const handleSelectDiscoveredProfile = (entry: XmpProfileEntry) => {
     debouncedAmountCommit.cancel();
-    commitProfile(entry.path, entry.name, entry.uuid, DEFAULT_XMP_PROFILE_AMOUNT_PERCENT, entry.supports_amount);
+    requestProfileTransaction(
+      profileProjectionFromSelection(
+        entry.path,
+        entry.name,
+        entry.uuid,
+        DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+        entry.supports_amount,
+      ),
+    );
   };
 
   const handleAmountCommit = () => {
@@ -152,7 +119,9 @@ export default function XmpProfileControl() {
     // The control only exists for an active profile that supports it.
     if (projection.status !== 'resolved' || !projection.path || percent === projection.amountPercent) return;
 
-    commitProfile(projection.path, projection.name, projection.uuid, percent, true);
+    requestProfileTransaction(
+      profileProjectionFromSelection(projection.path, projection.name, projection.uuid, percent, true),
+    );
   };
 
   // Wheel and keyboard changes reach the control only through onChange, so they

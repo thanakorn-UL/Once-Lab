@@ -54,15 +54,28 @@ pub(crate) fn resolve_develop_profile_from_sidecar(
         return DevelopProfileRestore::None;
     };
 
-    let candidates = collect_profile_candidates(roots, &reference);
+    resolve_reference_against_roots(&reference, roots)
+}
 
-    match resolve_profile_reference(&reference, &candidates) {
+/// Resolves an already-decoded `reference` against `roots`.
+///
+/// This is the ONE resolver shared by the `.rrdata` restore (6C2) and the XMP
+/// sidecar restore (6C3). The candidate list is built from the roots exactly as
+/// before, and only the profile identified by `reference`'s uuid/path resolves —
+/// a different profile sitting at the saved path is never substituted.
+pub(crate) fn resolve_reference_against_roots(
+    reference: &DevelopProfileReference,
+    roots: &[PathBuf],
+) -> DevelopProfileRestore {
+    let candidates = collect_profile_candidates(roots, reference);
+
+    match resolve_profile_reference(reference, &candidates) {
         ProfileResolution::Resolved { profile, .. } => {
             let profile_path = Path::new(&profile.path);
 
             match load_xmp_rgb_profile_from_path(profile_path) {
                 Ok(loaded) => DevelopProfileRestore::Resolved {
-                    reference,
+                    reference: reference.clone(),
                     summary: summarize_xmp_profile(&loaded, profile_path),
                 },
                 Err(error) => {
@@ -70,7 +83,9 @@ pub(crate) fn resolve_develop_profile_from_sidecar(
                         "Saved XMP profile became unreadable '{}': {error}",
                         profile_path.display()
                     );
-                    DevelopProfileRestore::Missing { reference }
+                    DevelopProfileRestore::Missing {
+                        reference: reference.clone(),
+                    }
                 }
             }
         }

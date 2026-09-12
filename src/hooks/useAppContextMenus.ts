@@ -9,6 +9,7 @@ import {
   Edit,
   FileEdit,
   FileInput,
+  FileOutput,
   Folder,
   FolderInput,
   FolderPlus,
@@ -56,6 +57,7 @@ import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, Option, OPTION_SEPARATOR, Panel, AlbumItem, Album, AlbumGroup } from '../components/ui/AppProperties';
 import { Color, COLOR_LABELS, INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
 import TaggingSubMenu from '../context/TaggingSubMenu';
+import { useDevelopMetadataActions } from './useDevelopMetadataActions';
 import { useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
 import { globalImageCache } from '../utils/ImageLRUCache';
@@ -84,6 +86,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
     handlePasteAdjustments,
   } = useEditorActions();
   const { handleRate, handleSetColorLabel, handleTagsChanged } = useLibraryActions();
+  const { writeDevelopMetadataToXmp, readDevelopMetadataFromXmp } = useDevelopMetadataActions();
 
   const albumIcons = useMemo(
     () => [
@@ -301,6 +304,16 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
             },
           ],
         },
+        {
+          label: t('contextMenus.editor.writeMetadataToXmp'),
+          icon: FileOutput,
+          onClick: () => writeDevelopMetadataToXmp([selectedImage.path]),
+        },
+        {
+          label: t('contextMenus.editor.readMetadataFromXmp'),
+          icon: FileInput,
+          onClick: () => readDevelopMetadataFromXmp([selectedImage.path]),
+        },
         { type: OPTION_SEPARATOR },
         {
           label: t('contextMenus.editor.resetAdjustments'),
@@ -335,6 +348,8 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       handleRate,
       handleSetColorLabel,
       handleTagsChanged,
+      writeDevelopMetadataToXmp,
+      readDevelopMetadataFromXmp,
       showContextMenu,
       t,
     ],
@@ -766,6 +781,16 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
             },
           ],
         },
+        {
+          label: t('contextMenus.editor.writeMetadataToXmp'),
+          icon: FileOutput,
+          onClick: () => writeDevelopMetadataToXmp(finalSelection),
+        },
+        {
+          label: t('contextMenus.editor.readMetadataFromXmp'),
+          icon: FileInput,
+          onClick: () => readDevelopMetadataFromXmp(finalSelection),
+        },
         { type: OPTION_SEPARATOR },
         {
           label: t('contextMenus.thumbnail.addToAlbum'),
@@ -827,6 +852,8 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       handleSetColorLabel,
       handleTagsChanged,
       handleResetAdjustments,
+      writeDevelopMetadataToXmp,
+      readDevelopMetadataFromXmp,
       showContextMenu,
       props,
       t,

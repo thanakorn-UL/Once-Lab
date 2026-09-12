@@ -221,3 +221,74 @@ export function readDevelopState(metadata: unknown): DevelopState {
 
   return { version, profile };
 }
+
+/** Reads a `DevelopProfileReference` out of a restore payload, or null when unusable. */
+function readRestoreReference(value: unknown): DevelopProfileReference | null {
+  if (typeof value !== 'object' || value === null) return null;
+
+  const raw = value as { uuid?: unknown; path?: unknown; name?: unknown; amount_percent?: unknown };
+
+  return {
+    uuid: typeof raw.uuid === 'string' ? raw.uuid : null,
+    path: typeof raw.path === 'string' ? raw.path : null,
+    name: typeof raw.name === 'string' ? raw.name : null,
+    amount_percent:
+      typeof raw.amount_percent === 'number' && Number.isFinite(raw.amount_percent)
+        ? raw.amount_percent
+        : DEFAULT_XMP_PROFILE_AMOUNT_PERCENT,
+  };
+}
+
+/** Reads the profile `summary` out of a resolved restore, or null when unusable. */
+function readRestoreSummary(value: unknown): XmpProfileSummary | null {
+  if (typeof value !== 'object' || value === null) return null;
+
+  const raw = value as {
+    name?: unknown;
+    path?: unknown;
+    uuid?: unknown;
+    supports_amount?: unknown;
+    convert_to_grayscale?: unknown;
+  };
+
+  // A resolved profile always carries the path the backend resolved it to; without
+  // one the projection has nothing to apply, so treat it as malformed.
+  if (typeof raw.path !== 'string') return null;
+
+  return {
+    name: typeof raw.name === 'string' ? raw.name : '',
+    path: raw.path,
+    uuid: typeof raw.uuid === 'string' ? raw.uuid : '',
+    supports_amount: raw.supports_amount === true,
+    convert_to_grayscale: raw.convert_to_grayscale === true,
+  };
+}
+
+/** Reads an `XmpDevelopReadOutcome` payload from `read_develop_state_from_xmp`. */
+export function readXmpOutcomeRestore(outcome: unknown): DevelopProfileRestore | null {
+  if (typeof outcome !== 'object' || outcome === null) return null;
+
+  const restore = (outcome as { restore?: unknown }).restore;
+  if (typeof restore !== 'object' || restore === null) return null;
+
+  const record = restore as { status?: unknown; reference?: unknown; summary?: unknown };
+
+  if (record.status === 'none') {
+    return { status: 'none' };
+  }
+
+  if (record.status === 'missing') {
+    const reference = readRestoreReference(record.reference);
+    return reference ? { status: 'missing', reference } : null;
+  }
+
+  if (record.status === 'resolved') {
+    const reference = readRestoreReference(record.reference);
+    const summary = readRestoreSummary(record.summary);
+    return reference && summary ? { status: 'resolved', reference, summary } : null;
+  }
+
+  // Never throws: any other payload is malformed, so the caller fails loudly
+  // rather than applying a half-built projection.
+  return null;
+}

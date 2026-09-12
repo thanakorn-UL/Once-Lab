@@ -197,11 +197,13 @@
       "rating": "Rating",
       "ratingLabel_one": "{{count}} Star",
       "ratingLabel_other": "{{count}} Stars",
+      "readMetadataFromXmp": "Read Metadata from XMP",
       "redo": "Redo",
       "resetAdjustments": "Reset Adjustments",
       "stitchPanorama": "Stitch Panorama",
       "tagging": "Tagging",
-      "undo": "Undo"
+      "undo": "Undo",
+      "writeMetadataToXmp": "Write Metadata to XMP"
     },
     "folders": {
       "changeIcon": "Change Icon",

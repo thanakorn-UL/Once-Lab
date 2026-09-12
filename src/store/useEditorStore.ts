@@ -43,6 +43,15 @@ export function nextXmpProfileTransactionId(): number {
   return ++xmpProfileTransactionId;
 }
 
+/**
+ * Requests a same-image reload that applies (or clears) a profile.
+ *
+ * Single owner of the profile transaction: the picker, the amount slider and the
+ * explicit XMP read all go through this action so the rollback/roll-forward
+ * bookkeeping exists exactly once.
+ */
+export type RequestProfileTransaction = (profile: DevelopProfileProjection) => void;
+
 interface EditorState {
   // Core Image & Adjustments
   selectedImage: SelectedImage | null;
@@ -109,6 +118,7 @@ interface EditorState {
 
   // Actions
   setEditor: (updater: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void;
+  requestProfileTransaction: RequestProfileTransaction;
   pushHistory: (newAdjustments: Adjustments) => void;
   undo: () => void;
   redo: () => void;
@@ -116,7 +126,7 @@ interface EditorState {
   goToHistoryIndex: (index: number) => void;
 }
 
-export const useEditorStore = create<EditorState>((set) => ({
+export const useEditorStore = create<EditorState>((set, get) => ({
   selectedImage: null,
   adjustments: INITIAL_ADJUSTMENTS,
   previewOverride: null,
@@ -169,6 +179,42 @@ export const useEditorStore = create<EditorState>((set) => ({
   patchesSentToBackend: new Set<string>(),
 
   setEditor: (updater) => set((state) => (typeof updater === 'function' ? updater(state) : updater)),
+
+  requestProfileTransaction: (profile) => {
+    const { xmpProfile: currentProjection, xmpProfileRollback: pendingRollback, selectedImage: image } = get();
+
+    // A reload for exactly this target is already in flight (isReady is false)
+    // and this request would not change any reload input, so it has nothing left
+    // to request. The in-flight transaction keeps ownership of the rollback:
+    // rotating the transaction id here — with no reload to close it — would
+    // orphan that rollback, so the next failure would restore stale fields.
+    if (
+      image?.isReady === false &&
+      profile.status === currentProjection.status &&
+      profile.path === currentProjection.path &&
+      profile.name === currentProjection.name &&
+      profile.uuid === currentProjection.uuid &&
+      profile.amountPercent === currentProjection.amountPercent &&
+      profile.supportsAmount === currentProjection.supportsAmount
+    ) {
+      return;
+    }
+
+    // An in-flight transaction's rollback is the last successfully rendered
+    // state, so reuse its fields rather than snapshotting a not-yet-rendered
+    // amount; a fresh object with a new id keeps each transaction's rollback
+    // distinct so a superseded reload cannot clear this one.
+    const base = pendingRollback ?? { profile: currentProjection };
+
+    const id = nextXmpProfileTransactionId();
+
+    set({
+      xmpProfile: profile,
+      xmpProfileRollback: { ...base, id },
+      xmpProfileRevision: id,
+      selectedImage: image ? { ...image, isReady: false } : image,
+    });
+  },
 
   pushHistory: (newAdj) =>
     set((state) => {

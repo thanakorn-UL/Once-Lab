@@ -18,6 +18,7 @@ mod culling;
 mod denoising;
 mod develop_state;
 mod develop_state_io;
+mod develop_xmp_io;
 mod exif_processing;
 mod export_processing;
 mod file_management;
@@ -2146,6 +2147,8 @@ pub fn run() {
             xmp_profile::discover_default_xmp_profile_roots,
             develop_state_io::resolve_image_develop_profile,
             develop_state_io::save_image_develop_profile,
+            develop_xmp_io::write_develop_state_to_xmp,
+            develop_xmp_io::read_develop_state_from_xmp,
             panorama_stitching::stitch_panorama,
             panorama_stitching::save_panorama,
             export_processing::export_images,
