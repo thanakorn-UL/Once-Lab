@@ -58,6 +58,10 @@ pub struct ImageMetadata {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exif: Option<std::collections::HashMap<String, String>>,
+    /// Canonical per-image develop state: the schema version and the profile
+    /// reference. The adjustment payload stays in `adjustments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub develop_state: Option<crate::develop_state::DevelopState>,
 }
 
 impl Default for ImageMetadata {
@@ -68,7 +72,23 @@ impl Default for ImageMetadata {
             adjustments: Value::Null,
             tags: None,
             exif: None,
+            develop_state: None,
         }
+    }
+}
+
+#[allow(dead_code)]
+impl ImageMetadata {
+    /// The image's develop state, defaulting when the sidecar carries none
+    /// (an older sidecar, or an image that has never had a profile).
+    pub fn develop_state(&self) -> crate::develop_state::DevelopState {
+        self.develop_state.clone().unwrap_or_default()
+    }
+
+    /// Replaces the develop state. Only the develop-state record is touched;
+    /// `adjustments` is written by its own existing call sites.
+    pub fn set_develop_state(&mut self, state: crate::develop_state::DevelopState) {
+        self.develop_state = Some(state);
     }
 }
 
@@ -3484,4 +3504,70 @@ pub fn calculate_auto_adjustments(
     let results = perform_auto_analysis(&original_image);
 
     Ok(auto_results_to_json(&results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::develop_state::{DEVELOP_STATE_VERSION, DevelopProfileReference, DevelopState};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_sidecar_document_deserializes_without_develop_state() {
+        let document = r#"{"version":1,"rating":3,"adjustments":{"exposure":1.0}}"#;
+        let metadata: ImageMetadata =
+            serde_json::from_str(document).expect("legacy sidecar deserializes");
+
+        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.rating, 3);
+        assert_eq!(metadata.adjustments, json!({ "exposure": 1.0 }));
+        assert!(metadata.develop_state.is_none());
+    }
+
+    #[test]
+    fn sidecar_without_develop_state_serializes_byte_identically_to_the_legacy_shape() {
+        let metadata = ImageMetadata {
+            rating: 2,
+            adjustments: json!({ "exposure": 0.5 }),
+            ..ImageMetadata::default()
+        };
+
+        let text = serde_json::to_string(&metadata).expect("serialize sidecar");
+
+        assert_eq!(
+            text, r#"{"version":1,"rating":2,"adjustments":{"exposure":0.5},"tags":null}"#,
+            "adding the develop_state field must leave the legacy .rrdata shape byte-identical"
+        );
+        assert!(
+            !text.contains("develop_state"),
+            "an unset develop state must not appear in a legacy .rrdata sidecar: {text}"
+        );
+        let value: Value = serde_json::from_str(&text).expect("parse serialized sidecar");
+        assert!(value.get("develop_state").is_none());
+    }
+
+    #[test]
+    fn develop_state_accessor_defaults_and_round_trips_through_the_sidecar() {
+        let mut metadata = ImageMetadata::default();
+        assert_eq!(metadata.develop_state(), DevelopState::default());
+
+        let state = DevelopState {
+            version: DEVELOP_STATE_VERSION,
+            profile: Some(DevelopProfileReference {
+                uuid: Some("uuid-1".to_string()),
+                path: Some("/profiles/a.xmp".to_string()),
+                name: Some("Profile A".to_string()),
+                amount_percent: 75.0,
+            }),
+            unknown: serde_json::Map::new(),
+        };
+        metadata.set_develop_state(state.clone());
+        assert_eq!(metadata.develop_state(), state);
+
+        let text = serde_json::to_string(&metadata).expect("serialize sidecar");
+        assert!(text.contains("develop_state"));
+
+        let back: ImageMetadata = serde_json::from_str(&text).expect("deserialize sidecar");
+        assert_eq!(back.develop_state(), state);
+    }
 }

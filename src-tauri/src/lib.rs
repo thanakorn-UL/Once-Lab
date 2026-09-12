@@ -16,6 +16,7 @@ mod cache_utils;
 mod camera_tethering;
 mod culling;
 mod denoising;
+mod develop_state;
 mod exif_processing;
 mod export_processing;
 mod file_management;

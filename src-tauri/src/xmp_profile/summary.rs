@@ -17,6 +17,9 @@ use crate::xmp_profile::XmpRgbProfile;
 pub struct XmpProfileSummary {
     pub name: String,
     pub path: String,
+    /// The embedded `crs:UUID`. Required for a parseable profile, so this is
+    /// always present and is the profile's stable identity.
+    pub uuid: String,
     /// Whether the profile advertises a scalable Amount, i.e. whether the
     /// frontend should offer the control at all.
     pub supports_amount: bool,
@@ -30,6 +33,7 @@ pub(crate) fn summarize_xmp_profile(profile: &XmpRgbProfile, path: &Path) -> Xmp
     XmpProfileSummary {
         name: profile.name.clone(),
         path: normalize_path_string(path),
+        uuid: profile.uuid.clone(),
         supports_amount: profile.supports_amount,
         convert_to_grayscale: profile.convert_to_grayscale,
     }
@@ -167,6 +171,18 @@ mod tests {
             path.file_stem().unwrap().to_string_lossy().to_string()
         );
         assert_eq!(summary.path, path.to_string_lossy().to_string());
+
+        fs::remove_file(&path).expect("remove temp xmp");
+    }
+
+    #[test]
+    fn profile_summary_exposes_the_embedded_uuid() {
+        let path = unique_temp_path("xmp");
+        fs::write(&path, named_profile_xmp()).expect("write temp xmp");
+
+        let summary = inspect_xmp_profile(&path.to_string_lossy()).expect("inspect");
+
+        assert_eq!(summary.uuid, "TEST123");
 
         fs::remove_file(&path).expect("remove temp xmp");
     }
