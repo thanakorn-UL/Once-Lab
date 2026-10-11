@@ -21,7 +21,9 @@ pub(crate) mod summary;
 #[cfg(test)]
 pub(crate) use apply::apply_rgb_table;
 pub(crate) use integration::{
-    apply_profile_to_three_color_pixels, apply_profile_to_three_color_pixels_with_amount,
+    ProfileRenderMode, apply_profile_to_three_color_pixels,
+    apply_profile_to_three_color_pixels_with_amount, apply_profile_to_three_color_pixels_with_mode,
+    profile_render_mode,
 };
 pub(crate) use loader::load_xmp_rgb_profile_from_path;
 pub(crate) use parser::{XmpRgbProfile, parse_xmp_rgb_profile};
