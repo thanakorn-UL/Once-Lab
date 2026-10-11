@@ -14,8 +14,13 @@ const INVALID_BASE85_DIGIT: u8 = 0xFF;
 const HEADER_BYTES: usize = 16;
 const FOOTER_BYTES: usize = 12;
 const AMOUNT_BYTES: usize = 16;
+/// The optional trailing `u32` big-table flags word
+/// (`dng_big_table.cpp:2606-2609`: read only when exactly 4 bytes remain).
+const FLAGS_BYTES: usize = 4;
 const BYTES_PER_NODE: usize = 6;
-const MIN_SIZE: u32 = 2;
+
+/// `dng_rgb_table::kMinDivisions3D`.
+const MIN_SIZE_3D: u32 = 2;
 /// Adobe's read/write/import ceiling for a 3-D table:
 /// `dng_rgb_table::kMaxDivisions3D_InMemory` (`dng_big_table.h:623`). The other
 /// constant, `kMaxDivisions3D` (32), is only the default *resample* resolution
@@ -24,7 +29,12 @@ const MIN_SIZE: u32 = 2;
 /// (`dng_big_table.cpp:2477-2490`, "Raised from 32 so common 64-cube LUTs
 /// persist"), and `PutStream`/`Set`/`.cube` import enforce the same limit, so a
 /// legal Adobe 64-division `crs:RGBTable` decodes here. 65 is rejected.
-const MAX_SIZE: u32 = 64;
+const MAX_SIZE_3D: u32 = 64;
+
+/// `dng_rgb_table::kMinDivisions1D` / `kMaxDivisions1D` (`dng_big_table.h:604-605`,
+/// read path `dng_big_table.cpp:2463-2472`).
+const MIN_SIZE_1D: u32 = 2;
+const MAX_SIZE_1D: u32 = 4096;
 
 /// BigTableTypeEnum::btt_RGBTable.
 const RGB_TABLE_TYPE: u32 = 1;
@@ -37,19 +47,27 @@ const RGB_TABLE_LABEL: &str = "RGBTable";
 /// dng_rgb_table::kRGBTableVersion.
 const RGB_TABLE_VERSION: u32 = 1;
 
-const SUPPORTED_DIMENSIONS: u32 = 3;
-const CHANNEL_LEVELS: u32 = 65536;
+/// `dng_rgb_table` legal `fDimensions` values (`dng_big_table.cpp:2463-2498`).
+const DIMENSIONS_1D: u32 = 1;
+const DIMENSIONS_3D: u32 = 3;
+
+/// In-memory sample stride: `fSamples` is `node_count` nodes of 4 u16
+/// (R, G, B, and a zero pad word), `dng_big_table.cpp:2515-2564`.
+const SAMPLE_STRIDE: usize = 4;
+
 const CHANNEL_MAX: u32 = 65535;
 
+/// Largest legal decompressed block: a 64-division 3-D table, plus the optional
+/// flags word.
 const MAX_BLOCK_BYTES: usize = HEADER_BYTES
-    + (MAX_SIZE as usize * MAX_SIZE as usize * MAX_SIZE as usize * BYTES_PER_NODE)
+    + (MAX_SIZE_3D as usize * MAX_SIZE_3D as usize * MAX_SIZE_3D as usize * BYTES_PER_NODE)
     + FOOTER_BYTES
-    + AMOUNT_BYTES;
+    + AMOUNT_BYTES
+    + FLAGS_BYTES;
 
-const MIN_BLOCK_BYTES: usize = HEADER_BYTES
-    + (MIN_SIZE as usize * MIN_SIZE as usize * MIN_SIZE as usize * BYTES_PER_NODE)
-    + FOOTER_BYTES
-    + AMOUNT_BYTES;
+/// Smallest legal decompressed block: a 2-division 1-D table.
+const MIN_BLOCK_BYTES: usize =
+    HEADER_BYTES + (MIN_SIZE_1D as usize * BYTES_PER_NODE) + FOOTER_BYTES + AMOUNT_BYTES;
 
 const fn build_base85_lookup() -> [u8; 256] {
     let mut table = [INVALID_BASE85_DIGIT; 256];
@@ -61,15 +79,86 @@ const fn build_base85_lookup() -> [u8; 256] {
     table
 }
 
+/// A decoded Adobe `dng_rgb_table`.
+///
+/// The samples are kept in Adobe's own in-memory layout: absolute `u16` values
+/// at a stride of 4 per node (`RGB0`, `dng_big_table.cpp:2515-2564`), NOT
+/// pre-normalized to `f32`. Preserving `u16` keeps the delta codec lossless
+/// mod 2^16 and matches what the SDK's tetrahedral kernel consumes
+/// (`RefRGBtoRGBTable3D`, `dng_reference.cpp:3728-3748`, weights x raw u16
+/// then `(1/65535)`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RgbTable {
+    /// `fDimensions`: 1 or 3 (`dng_big_table.cpp:2463-2498`).
+    pub dimensions: u32,
+    /// `fDivisions`: the per-axis node count (`size` historically).
     pub size: usize,
-    pub values: Vec<[f32; 3]>,
+    /// Absolute `u16` samples, `node_count * SAMPLE_STRIDE` long; node `i` is
+    /// `samples[4*i .. 4*i+3]` (the 4th word is Adobe's zero pad).
+    pub samples: Vec<u16>,
     pub color_space: u32,
     pub gamma: u32,
     pub gamut: u32,
     pub min_amount: f64,
     pub max_amount: f64,
+    /// The generic big-table flags word, when the stream carried one
+    /// (`dng_big_table.cpp:2606-2609`). Adobe defines only bit 0
+    /// ("embed never"), which affects file writing, never rendering.
+    pub flags: Option<u32>,
+}
+
+impl RgbTable {
+    /// Builds a table from normalized `f32` node values, quantizing to `u16`
+    /// exactly the way an Adobe encoder would (`round(x * 65535)` clamped).
+    /// Test-fixture convenience; production tables arrive as `u16` on the wire.
+    #[cfg(test)]
+    pub(crate) fn from_f32_nodes(
+        dimensions: u32,
+        size: usize,
+        values: &[[f32; 3]],
+        color_space: u32,
+        gamma: u32,
+        gamut: u32,
+        min_amount: f64,
+        max_amount: f64,
+    ) -> RgbTable {
+        let mut samples = Vec::with_capacity(values.len() * SAMPLE_STRIDE);
+        for node in values {
+            for channel in node {
+                let quantized = (f64::from(*channel) * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16;
+                samples.push(quantized);
+            }
+            samples.push(0);
+        }
+        RgbTable {
+            dimensions,
+            size,
+            samples,
+            color_space,
+            gamma,
+            gamut,
+            min_amount,
+            max_amount,
+            flags: None,
+        }
+    }
+
+    /// Number of stored nodes (`divisions` for 1-D, `divisions^3` for 3-D).
+    pub(crate) fn node_count(&self) -> usize {
+        self.samples.len() / SAMPLE_STRIDE
+    }
+
+    /// The RGB triplet of node `index`, normalized to `[0,1]` `f32`
+    /// (`u16 * (1/65535)`, the same conversion the SDK kernel applies).
+    #[cfg(test)]
+    pub(crate) fn node(&self, index: usize) -> [f32; 3] {
+        let base = index * SAMPLE_STRIDE;
+        [
+            self.samples[base] as f32 / 65535.0,
+            self.samples[base + 1] as f32 / 65535.0,
+            self.samples[base + 2] as f32 / 65535.0,
+        ]
+    }
 }
 
 pub(crate) fn decode_adobe_rgb_table(encoded: &str) -> Result<RgbTable, String> {
@@ -209,24 +298,35 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         ));
     }
 
-    if dimensions != SUPPORTED_DIMENSIONS {
-        return Err(format!(
-            "unsupported embedded RGBTable dimensions {dimensions}, expected {SUPPORTED_DIMENSIONS}"
-        ));
-    }
+    // Division bounds depend on dimensionality (`dng_rgb_table::GetStream`,
+    // `dng_big_table.cpp:2463-2498`): 1-D tables run `kMinDivisions1D..=
+    // kMaxDivisions1D` (2..=4096), 3-D tables `kMinDivisions3D..=
+    // kMaxDivisions3D_InMemory` (2..=64). Any other `fDimensions` is rejected.
+    let (min_size, max_size) = match dimensions {
+        DIMENSIONS_1D => (MIN_SIZE_1D, MAX_SIZE_1D),
+        DIMENSIONS_3D => (MIN_SIZE_3D, MAX_SIZE_3D),
+        _ => {
+            return Err(format!(
+                "unsupported embedded RGBTable dimensions {dimensions}, expected {DIMENSIONS_1D} or {DIMENSIONS_3D}"
+            ));
+        }
+    };
 
-    if !(MIN_SIZE..=MAX_SIZE).contains(&size_field) {
+    if !(min_size..=max_size).contains(&size_field) {
         return Err(format!(
-            "unsupported embedded RGBTable size {size_field}, expected {MIN_SIZE}..={MAX_SIZE}"
+            "unsupported embedded RGBTable size {size_field}, expected {min_size}..={max_size}"
         ));
     }
 
     let size = size_field as usize;
 
-    let node_count = size
-        .checked_mul(size)
-        .and_then(|nodes| nodes.checked_mul(size))
-        .ok_or_else(|| "embedded RGBTable node count overflows usize".to_string())?;
+    let node_count = match dimensions {
+        DIMENSIONS_1D => size,
+        _ => size
+            .checked_mul(size)
+            .and_then(|nodes| nodes.checked_mul(size))
+            .ok_or_else(|| "embedded RGBTable node count overflows usize".to_string())?,
+    };
 
     let sample_bytes = node_count
         .checked_mul(BYTES_PER_NODE)
@@ -238,13 +338,23 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         .and_then(|total| total.checked_add(AMOUNT_BYTES))
         .ok_or_else(|| "embedded RGBTable block size overflows usize".to_string())?;
 
-    if block.len() != expected_block_size {
+    // The stream is either exactly the table body, or the body plus the
+    // optional `u32` flags word (`dng_big_table.cpp:2606-2609`: the SDK reads
+    // the word whenever 4 bytes remain). Anything else is corrupt.
+    let flags_present = if block.len() == expected_block_size {
+        false
+    } else if block.len() == expected_block_size + FLAGS_BYTES {
+        true
+    } else {
         return Err(format!(
-            "embedded RGBTable block size mismatch: expected {expected_block_size} bytes, got {} bytes",
+            "embedded RGBTable block size mismatch: expected {expected_block_size} or {} bytes, got {} bytes",
+            expected_block_size + FLAGS_BYTES,
             block.len()
         ));
-    }
+    };
 
+    // `nopValue` identity ramp (`dng_big_table.cpp:2500-2510`):
+    // `(index * 0xFFFF + (divisions >> 1)) / (divisions - 1)`, integer math.
     let mut identity_ramp = Vec::with_capacity(size);
     for index in 0..size {
         let scaled = index
@@ -254,24 +364,32 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
         identity_ramp.push((scaled / (size - 1)) as u32);
     }
 
-    let mut values = Vec::with_capacity(node_count);
+    // Delta reconstruction is LOSSLESS mod 2^16: `sample = ramp + delta` in
+    // `u16`, so negative deltas wrap exactly like the SDK's `uint16` add
+    // (`dng_big_table.cpp:2522-2524, 2552-2554`). Samples stay `u16`; nothing
+    // is normalized to f32 here.
+    let mut samples = Vec::with_capacity(node_count * SAMPLE_STRIDE);
     let mut offset = HEADER_BYTES;
 
     for index in 0..node_count {
-        let r_index = index / (size * size);
-        let g_index = (index / size) % size;
-        let b_index = index % size;
+        let (r_index, g_index, b_index) = match dimensions {
+            DIMENSIONS_1D => (index, index, index),
+            _ => (index / (size * size), (index / size) % size, index % size),
+        };
 
         let red_delta = read_u16(block, offset, RGB_TABLE_LABEL)?;
         let green_delta = read_u16(block, offset + 2, RGB_TABLE_LABEL)?;
         let blue_delta = read_u16(block, offset + 4, RGB_TABLE_LABEL)?;
         offset += BYTES_PER_NODE;
 
-        values.push([
-            reconstruct_channel(red_delta, identity_ramp[r_index]),
-            reconstruct_channel(green_delta, identity_ramp[g_index]),
-            reconstruct_channel(blue_delta, identity_ramp[b_index]),
-        ]);
+        samples.push(identity_ramp[r_index] as u16);
+        samples.push(identity_ramp[g_index] as u16);
+        samples.push(identity_ramp[b_index] as u16);
+        let base = samples.len() - 3;
+        samples[base] = samples[base].wrapping_add(red_delta);
+        samples[base + 1] = samples[base + 1].wrapping_add(green_delta);
+        samples[base + 2] = samples[base + 2].wrapping_add(blue_delta);
+        samples.push(0);
     }
 
     let color_space = read_u32(block, offset, RGB_TABLE_LABEL)?;
@@ -282,20 +400,23 @@ fn parse_uncompressed_block(block: &[u8]) -> Result<RgbTable, String> {
     let min_amount = read_f64(block, offset, RGB_TABLE_LABEL)?;
     let max_amount = read_f64(block, offset + 8, RGB_TABLE_LABEL)?;
 
+    let flags = if flags_present {
+        Some(read_u32(block, offset + AMOUNT_BYTES, RGB_TABLE_LABEL)?)
+    } else {
+        None
+    };
+
     Ok(RgbTable {
+        dimensions,
         size,
-        values,
+        samples,
         color_space,
         gamma,
         gamut,
         min_amount,
         max_amount,
+        flags,
     })
-}
-
-fn reconstruct_channel(delta: u16, identity: u32) -> f32 {
-    let decoded = (u32::from(delta) + identity) % CHANNEL_LEVELS;
-    decoded as f32 / CHANNEL_MAX as f32
 }
 
 /// Little-endian integer/float readers shared with the LookTable decoder.
@@ -340,26 +461,24 @@ mod tests {
 
     const IDENTITY_2X2X2_BASE85: &str = "71000rtKmwBRLy1{X$/w9'=(bLC9YEvFE(9%a0@fg0";
 
-    const EXPECTED_IDENTITY: [[f32; 3]; 8] = [
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 1.0, 1.0],
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 1.0],
-        [1.0, 1.0, 0.0],
-        [1.0, 1.0, 1.0],
+    /// The identity corners as stored `u16` (RGB0 stride-4) samples.
+    const EXPECTED_IDENTITY: [[u16; 3]; 8] = [
+        [0, 0, 0],
+        [0, 0, 65535],
+        [0, 65535, 0],
+        [0, 65535, 65535],
+        [65535, 0, 0],
+        [65535, 0, 65535],
+        [65535, 65535, 0],
+        [65535, 65535, 65535],
     ];
 
-    fn assert_channel(actual: f32, expected: f32, context: &str) {
-        assert!(
-            (actual - expected).abs() < 1e-6,
-            "{context}: expected {expected}, got {actual}"
-        );
-    }
-
     fn build_block(size: u32, dimensions: u32) -> Vec<u8> {
-        let node_count = (size * size * size) as usize;
+        let node_count = if dimensions == 1 {
+            size as usize
+        } else {
+            (size * size * size) as usize
+        };
         let mut block = Vec::new();
         block.extend_from_slice(&1u32.to_le_bytes());
         block.extend_from_slice(&1u32.to_le_bytes());
@@ -429,20 +548,105 @@ mod tests {
         let table = decode_adobe_rgb_table(IDENTITY_2X2X2_BASE85)
             .expect("fixture should decode into a 2x2x2 identity table");
 
+        assert_eq!(table.dimensions, 3);
         assert_eq!(table.size, 2);
-        assert_eq!(table.values.len(), 8);
+        assert_eq!(table.samples.len(), 8 * 4);
         assert_eq!(table.color_space, 0);
         assert_eq!(table.gamma, 1);
         assert_eq!(table.gamut, 0);
         assert_eq!(table.min_amount, 0.0);
         assert_eq!(table.max_amount, 1.5);
+        assert_eq!(table.flags, None);
 
         for (index, expected) in EXPECTED_IDENTITY.iter().enumerate() {
-            let actual = table.values[index];
-            assert_channel(actual[0], expected[0], &format!("node {index} red"));
-            assert_channel(actual[1], expected[1], &format!("node {index} green"));
-            assert_channel(actual[2], expected[2], &format!("node {index} blue"));
+            let actual = &table.samples[index * 4..index * 4 + 3];
+            assert_eq!(
+                actual, expected,
+                "node {index} must reconstruct the exact u16 identity ramp"
+            );
         }
+    }
+
+    #[test]
+    fn decodes_one_dimensional_rgb_table() {
+        // A legal Adobe 1-D table (`dimensions == 1`, divisions 2..=4096):
+        // `dng_rgb_table::GetStream` reads `divisions` samples of 3 u16 deltas
+        // each against the SAME per-index identity ramp.
+        const DIVISIONS: u32 = 16;
+        let block = build_block(DIVISIONS, 1);
+        let table = parse_uncompressed_block(&block).expect("1-D table must decode");
+
+        assert_eq!(table.dimensions, 1);
+        assert_eq!(table.size, DIVISIONS as usize);
+        assert_eq!(table.samples.len(), DIVISIONS as usize * 4);
+        // Zero deltas reconstruct the identity ramp on every channel.
+        for index in 0..DIVISIONS as usize {
+            let ramp =
+                ((index * 65535 + (DIVISIONS as usize / 2)) / (DIVISIONS as usize - 1)) as u16;
+            assert_eq!(
+                &table.samples[index * 4..index * 4 + 3],
+                &[ramp, ramp, ramp],
+                "1-D node {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_one_dimensional_divisions_out_of_range() {
+        // 1-D bounds are 2..=4096 (`kMinDivisions1D`/`kMaxDivisions1D`), NOT the
+        // 3-D 2..=64 window: a 100-division 1-D table is legal, a 4097-division
+        // one is not.
+        let block = build_block(100, 1);
+        parse_uncompressed_block(&block).expect("100-division 1-D table must decode");
+
+        let block = build_block(4097, 1);
+        assert!(
+            parse_uncompressed_block(&block).is_err(),
+            "4097 1-D divisions must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_dimensions() {
+        // Only 1 and 3 are legal `fDimensions` (`dng_big_table.cpp:2463-2498`).
+        for dimensions in [0u32, 2, 4, u32::MAX] {
+            let block = build_block(2, dimensions);
+            let error =
+                parse_uncompressed_block(&block).expect_err("illegal dimensions must be rejected");
+            assert!(
+                error.contains("unsupported embedded RGBTable dimensions"),
+                "dimensions {dimensions}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_decoding_wraps_modulo_2_to_the_16() {
+        // A "negative" stored delta wraps mod 2^16 exactly like the SDK's
+        // `uint16` add: sample = (ramp + delta) mod 65536. With 4 divisions,
+        // ramp[0] = (0 * 65535 + 2) / 3 = 0, so delta 0xFFFF yields 65535.
+        let mut block = build_block(4, 3);
+        // First node's red delta sits at offset HEADER_BYTES.
+        block[16] = 0xFF;
+        block[17] = 0xFF;
+        let table = parse_uncompressed_block(&block).expect("decode");
+        assert_eq!(table.samples[0], 65535, "negative delta must wrap mod 2^16");
+    }
+
+    #[test]
+    fn decodes_optional_flags_word() {
+        // `dng_big_table.cpp:2606-2609`: when exactly 4 bytes remain after the
+        // amounts, the stream carries the optional u32 flags word.
+        let mut block = build_block(2, 3);
+        block.extend_from_slice(&0x07u32.to_le_bytes());
+        let table = parse_uncompressed_block(&block).expect("flags block must decode");
+        assert_eq!(table.flags, Some(7));
+
+        // And three trailing bytes is still malformed -- neither a bare block
+        // nor a flags-terminated one.
+        let mut block = build_block(2, 3);
+        block.extend_from_slice(&[0xAA; 3]);
+        assert!(parse_uncompressed_block(&block).is_err());
     }
 
     #[test]
@@ -519,7 +723,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("size {size} must decode: {error}"));
             assert_eq!(table.size, size as usize, "decoded size");
             assert_eq!(
-                table.values.len(),
+                table.node_count(),
                 (size as usize) * (size as usize) * (size as usize),
                 "decoded node count for size {size}"
             );
@@ -531,8 +735,7 @@ mod tests {
         // One past Adobe's ceiling: still rejected, by SHAPE (it is a 3-D table,
         // so the block-length window would admit its byte size).
         let block = build_block(65, 3);
-        let error =
-            parse_uncompressed_block(&block).expect_err("65 divisions must be rejected");
+        let error = parse_uncompressed_block(&block).expect_err("65 divisions must be rejected");
         assert!(
             error.contains("unsupported embedded RGBTable size 65"),
             "unexpected error: {error}"
@@ -548,25 +751,20 @@ mod tests {
         let block = build_block(size, 3);
         let encoded = encode_payload(block.len() as u32, &block);
 
-        let table =
-            decode_adobe_rgb_table(&encoded).expect("a 64-division wire table must decode");
+        let table = decode_adobe_rgb_table(&encoded).expect("a 64-division wire table must decode");
         assert_eq!(table.size, 64);
-        assert_eq!(table.values.len(), 64 * 64 * 64);
+        assert_eq!(table.node_count(), 64 * 64 * 64);
 
         // Zero deltas reconstruct each axis's identity ramp, so the corner nodes
         // are exact...
-        assert_eq!(table.values[0], [0.0, 0.0, 0.0], "first corner");
-        assert_eq!(
-            table.values[64 * 64 * 64 - 1],
-            [1.0, 1.0, 1.0],
-            "last corner"
-        );
+        assert_eq!(table.node(0), [0.0, 0.0, 0.0], "first corner");
+        assert_eq!(table.node(64 * 64 * 64 - 1), [1.0, 1.0, 1.0], "last corner");
         // ...and an interior node indexes back to its own coordinate (within one
         // 16-bit reconstruction step, ~1.5e-5, of the ideal ramp), which fails if
         // the node ordering or the size stride were wrong.
         const RAMP_TOLERANCE: f32 = 1e-4;
         let (r, g, b) = (10usize, 20usize, 30usize);
-        let node = table.values[r * 64 * 64 + g * 64 + b];
+        let node = table.node(r * 64 * 64 + g * 64 + b);
         let scale = 63.0f32;
         for (channel, value, expected) in [
             (0usize, node[0], r as f32 / scale),

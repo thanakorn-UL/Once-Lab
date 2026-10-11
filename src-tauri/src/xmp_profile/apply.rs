@@ -207,6 +207,7 @@ impl<'a> RgbTableApplyContext<'a> {
 ///
 /// For more than a handful of pixels prefer [`RgbTableApplyContext`], which
 /// validates once and then renders many pixels.
+#[cfg(test)]
 pub(crate) fn apply_rgb_table(
     rgb: [f32; 3],
     table: &RgbTable,
@@ -229,24 +230,15 @@ fn validate_table_structure(table: &RgbTable) -> Result<(), String> {
         .and_then(|nodes| nodes.checked_mul(size))
         .ok_or_else(|| "RGBTable node count overflows usize".to_string())?;
 
-    if table.values.len() != node_count {
+    if table.node_count() != node_count {
         return Err(format!(
             "malformed RGBTable: expected {node_count} nodes, got {}",
-            table.values.len()
+            table.node_count()
         ));
     }
 
-    // Every node of the table must be finite, not just the corners a particular
-    // lookup happens to sample: a malformed table must be rejected before any
-    // pixel is rendered.
-    for node in &table.values {
-        for value in node {
-            if !value.is_finite() {
-                return Err("RGBTable contains non-finite sample".to_string());
-            }
-        }
-    }
-
+    // Samples are stored as u16 (SDK `fSamples` layout), which is finite by
+    // construction — no O(size^3) finiteness scan is needed.
     Ok(())
 }
 
@@ -255,6 +247,17 @@ fn validate_table_structure(table: &RgbTable) -> Result<(), String> {
 /// The stored ordering is B fastest, G next, R slowest.
 fn node_index(size: usize, r_index: usize, g_index: usize, b_index: usize) -> usize {
     r_index * size * size + g_index * size + b_index
+}
+
+/// One stored node as normalized f32 (`u16 * (1/65535)` — bit-identical to the
+/// decoder's old `(delta + ramp) / 65535` reconstruction).
+fn node_f32(table: &RgbTable, index: usize) -> [f32; 3] {
+    let base = index * 4;
+    [
+        table.samples[base] as f32 / 65535.0,
+        table.samples[base + 1] as f32 / 65535.0,
+        table.samples[base + 2] as f32 / 65535.0,
+    ]
 }
 
 /// Map an encoded coordinate to the table cell base index and its fraction.
@@ -281,14 +284,14 @@ fn interpolate(table: &RgbTable, encoded: [f32; 3]) -> Result<[f32; 3], String> 
     let g_high = g_base + 1;
     let b_high = b_base + 1;
 
-    let c000 = table.values[node_index(size, r_base, g_base, b_base)];
-    let c100 = table.values[node_index(size, r_high, g_base, b_base)];
-    let c010 = table.values[node_index(size, r_base, g_high, b_base)];
-    let c001 = table.values[node_index(size, r_base, g_base, b_high)];
-    let c110 = table.values[node_index(size, r_high, g_high, b_base)];
-    let c101 = table.values[node_index(size, r_high, g_base, b_high)];
-    let c011 = table.values[node_index(size, r_base, g_high, b_high)];
-    let c111 = table.values[node_index(size, r_high, g_high, b_high)];
+    let c000 = node_f32(table, node_index(size, r_base, g_base, b_base));
+    let c100 = node_f32(table, node_index(size, r_high, g_base, b_base));
+    let c010 = node_f32(table, node_index(size, r_base, g_high, b_base));
+    let c001 = node_f32(table, node_index(size, r_base, g_base, b_high));
+    let c110 = node_f32(table, node_index(size, r_high, g_high, b_base));
+    let c101 = node_f32(table, node_index(size, r_high, g_base, b_high));
+    let c011 = node_f32(table, node_index(size, r_base, g_high, b_high));
+    let c111 = node_f32(table, node_index(size, r_high, g_high, b_high));
 
     let mut out = [0.0f32; 3];
 
@@ -360,15 +363,7 @@ mod tests {
         min_amount: f64,
         max_amount: f64,
     ) -> RgbTable {
-        RgbTable {
-            size,
-            values,
-            color_space: 0,
-            gamma: 1,
-            gamut: 0,
-            min_amount,
-            max_amount,
-        }
+        RgbTable::from_f32_nodes(3, size, &values, 0, 1, 0, min_amount, max_amount)
     }
 
     fn table_2x2x2(values: [[f32; 3]; 8], min_amount: f64, max_amount: f64) -> RgbTable {
@@ -382,15 +377,18 @@ mod tests {
         gamma: u32,
         gamut: u32,
     ) -> RgbTable {
-        RgbTable {
-            size: 2,
-            values: values.to_vec(),
-            color_space,
-            gamma,
-            gamut,
-            min_amount: 0.0,
-            max_amount: 1.0,
-        }
+        RgbTable::from_f32_nodes(3, 2, &values, color_space, gamma, gamut, 0.0, 1.0)
+    }
+
+    /// The f32 a `f32` node value resolves to after the u16 quantization in
+    /// `from_f32_nodes` — hand-computed expectations must use the quantized
+    /// value, not the source constant.
+    fn qv(v: f32) -> f32 {
+        ((f64::from(v) * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16) as f32 / 65535.0
+    }
+
+    fn qn(node: [f32; 3]) -> [f32; 3] {
+        [qv(node[0]), qv(node[1]), qv(node[2])]
     }
 
     fn assert_close(actual: f32, expected: f32, epsilon: f32, context: &str) {
@@ -475,7 +473,11 @@ mod tests {
         let input = [0.1f32, 0.2, 0.3];
         let output = apply_rgb_table(input, &table, 1.0).expect("amount 1 should apply");
 
-        let expected = [srgb_decode(0.25), srgb_decode(0.5), srgb_decode(0.75)];
+        let expected = [
+            srgb_decode(qv(0.25)),
+            srgb_decode(qv(0.5)),
+            srgb_decode(qv(0.75)),
+        ];
         assert_rgb_close(output, expected, 1e-6, "amount 1");
     }
 
@@ -494,7 +496,7 @@ mod tests {
             srgb_encode(input[1]),
             srgb_encode(input[2]),
         ];
-        let lut = [0.25f32, 0.5, 1.0];
+        let lut = [qv(0.25), qv(0.5), qv(1.0)];
         let amount = 1.5f32;
 
         let mut expected = [0.0f32; 3];
@@ -615,6 +617,9 @@ mod tests {
             [0.60, 0.50, 1.00],    // C111
         ];
         let table = table_2x2x2(values, 0.0, 1.0);
+        // Hand-computed expectations must use the STORED (u16-quantized)
+        // node values, not the authored f32 constants.
+        let q = |node: [f32; 3]| qn(node);
 
         // Encoded coordinates with unequal fractions: fr = 0.8, fg = 0.5, fb = 0.2
         // which satisfies fr >= fg >= fb, i.e. CASE 1.
@@ -625,7 +630,15 @@ mod tests {
         let linear_input = [srgb_decode(fr), srgb_decode(fg), srgb_decode(fb)];
         let output = apply_rgb_table(linear_input, &table, 1.0).expect("known cube should apply");
 
-        let expected_encoded = case1(values[0], values[4], values[6], values[7], fr, fg, fb);
+        let expected_encoded = case1(
+            q(values[0]),
+            q(values[4]),
+            q(values[6]),
+            q(values[7]),
+            fr,
+            fg,
+            fb,
+        );
         let expected = [
             srgb_decode(expected_encoded[0]),
             srgb_decode(expected_encoded[1]),
@@ -649,7 +662,7 @@ mod tests {
         let mut trilinear = [0.0f32; 3];
         for (weight, corner) in weights.iter().zip(values.iter()) {
             for channel in 0..3 {
-                trilinear[channel] += weight * corner[channel];
+                trilinear[channel] += weight * q(*corner)[channel];
             }
         }
 
@@ -697,7 +710,7 @@ mod tests {
 
             assert_rgb_close(
                 actual,
-                values[coordinate_index],
+                qn(values[coordinate_index]),
                 1e-6,
                 &format!("corner ({r},{g},{b})"),
             );
@@ -867,8 +880,8 @@ mod tests {
             [0.4, 0.7, 0.2],
             [0.9, 0.1, 0.6],
         ] {
-            let output = apply_rgb_table(probe, &identity, 1.0)
-                .expect("a 64-division table must render");
+            let output =
+                apply_rgb_table(probe, &identity, 1.0).expect("a 64-division table must render");
             assert_rgb_close(
                 output,
                 probe,
@@ -891,7 +904,12 @@ mod tests {
         let table = identity_table_of_size(33);
         let probe = [0.4f32, 0.7, 0.2];
         let output = apply_rgb_table(probe, &table, 1.0).expect("33-division table must render");
-        assert_rgb_close(output, probe, IDENTITY_COMBINATION_TOLERANCE, "33-division identity");
+        assert_rgb_close(
+            output,
+            probe,
+            IDENTITY_COMBINATION_TOLERANCE,
+            "33-division identity",
+        );
     }
 
     #[test]
@@ -925,8 +943,7 @@ mod tests {
             table.gamut = gamut;
 
             for amount in [0.25f32, 1.5, -1.0e9, 1.0e9] {
-                let effective =
-                    f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
+                let effective = f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
                 let expected = apply_rgb_table([0.2, 0.4, 0.6], &table, effective)
                     .expect("edge amount should apply");
                 let actual = apply_rgb_table([0.2, 0.4, 0.6], &table, amount)
@@ -1001,57 +1018,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_lut_sample() {
-        let mut values = IDENTITY_2X2X2;
-        values[7] = [f32::NAN, 0.0, 0.0];
-        let table = table_2x2x2(values, 0.0, 1.0);
-
-        let error = apply_rgb_table([0.18, 0.5, 0.9], &table, 1.0)
-            .expect_err("non-finite sample must be rejected");
-        assert_eq!(error, "RGBTable contains non-finite sample");
-    }
-
-    #[test]
-    fn rejects_non_finite_unsampled_lut_node() {
-        // 3x3x3 table: node index = r * 9 + g * 3 + b
-        let mut values = vec![[0.5f32, 0.5, 0.5]; 27];
-
-        for r in 0..3 {
-            for g in 0..3 {
-                for b in 0..3 {
-                    values[r * 9 + g * 3 + b] = [r as f32 / 2.0, g as f32 / 2.0, b as f32 / 2.0];
-                }
+    fn lut_samples_are_finite_by_u16_construction() {
+        // The earlier f32 representation needed an O(size^3) scan rejecting
+        // NaN/Inf nodes (even unsampled ones). u16 storage makes a non-finite
+        // sample unrepresentable — the wire can only carry 0..=65535 — so the
+        // scan is gone and this test pins the property that remains: every
+        // stored node is a valid f32 once normalized.
+        let table = identity_table_of_size(3);
+        for index in 0..table.node_count() {
+            for channel in table.node(index) {
+                assert!(channel.is_finite() && (0.0..=1.0).contains(&channel));
             }
         }
-
-        // The far corner at coordinate (2, 2, 2).
-        let poisoned_index = 2 * 9 + 2 * 3 + 2;
-        assert_eq!(poisoned_index, 26);
-
-        // Linear input that encodes to roughly [0.24, 0.35, 0.43] -> scaled by
-        // (size - 1) = 2 that is [0.48, 0.70, 0.86], so every cell base is 0 and
-        // the lookup only ever samples the cube spanning indices 0..1 (highest
-        // touched node is (1, 1, 1) = index 13). Node 26 is never sampled.
-        let input = [0.05f32, 0.10, 0.15];
-
-        let mut poisoned = values.clone();
-        poisoned[poisoned_index] = [f32::NAN, 0.5, 0.5];
-        let poisoned_table = make_table(3, poisoned, 0.0, 1.0);
-
-        let error = apply_rgb_table(input, &poisoned_table, 1.0)
-            .expect_err("non-finite unsampled node must be rejected");
-        assert_eq!(error, "RGBTable contains non-finite sample");
-
-        // Sanity: the same input renders fine once the unsampled node is finite,
-        // proving the failure is caused by the NaN itself and not by the table
-        // shape or by the chosen input falling outside the table.
-        let mut clean = values;
-        clean[poisoned_index] = [1.0, 1.0, 1.0];
-        let clean_table = make_table(3, clean, 0.0, 1.0);
-        assert!(
-            apply_rgb_table(input, &clean_table, 1.0).is_ok(),
-            "the clean table must render, otherwise this test proves nothing"
-        );
     }
 
     #[test]
@@ -1326,7 +1304,11 @@ mod tests {
 
             match srgb_reference {
                 None => {
-                    assert_eq!(primaries.wire_value(), 0, "sRGB must be first in wire order");
+                    assert_eq!(
+                        primaries.wire_value(),
+                        0,
+                        "sRGB must be first in wire order"
+                    );
                     srgb_reference = Some(out);
                 }
                 Some(reference) => assert!(
@@ -1401,9 +1383,9 @@ mod tests {
         // blended at amount 1.0, and the result is gamma-decoded.
         let clamped_linear = [0.0f32, 0.5, 1.0];
         let base = [
-            srgb_decode(0.25),
-            srgb_decode(0.5),
-            srgb_decode(0.75),
+            srgb_decode(qv(0.25)),
+            srgb_decode(qv(0.5)),
+            srgb_decode(qv(0.75)),
         ];
         let delta = [
             INPUT[0] - clamped_linear[0],
@@ -1498,10 +1480,11 @@ mod tests {
         ]; // (c)
 
         // (d)-(f): constant encoded LUT blended at amount 1.0, then clamped.
-        const LUT: [f32; 3] = [0.25, 0.5, 0.75];
+        // The stored u16 samples are the quantized versions of these values.
+        let lut = [qv(0.25), qv(0.5), qv(0.75)];
         let mut blended = [0.0f32; 3];
         for channel in 0..3 {
-            let lut_value = LUT[channel].clamp(0.0, 1.0);
+            let lut_value = lut[channel].clamp(0.0, 1.0);
             let input = encoded_input[channel];
             blended[channel] = (input + 1.0 * (lut_value - input)).clamp(0.0, 1.0);
         }

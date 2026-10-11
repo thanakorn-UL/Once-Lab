@@ -1044,12 +1044,12 @@ mod tests {
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
-    /// A well-formed, Adobe-legal profile shape that Once-Lab does not support (a
-    /// 1-D RGBTable, which `dng_rgb_table::GetStream` accepts) must not masquerade
-    /// as supported: classification returns `None`, and the neighbouring real
-    /// profile is still returned.
+    /// A 1-D RGBTable is a legal Adobe table shape
+    /// (`dng_rgb_table::GetStream`, `dng_big_table.cpp:2463-2472`), and the
+    /// evaluator now supports it — so the profile must parse, classify, and be
+    /// surfaced exactly like a 3-D one.
     #[test]
-    fn unsupported_but_well_formed_adobe_profile_is_not_surfaced() {
+    fn one_dimensional_adobe_profile_is_supported() {
         let dir = unique_temp_dir();
 
         let one_d = profile_xmp_with_table(
@@ -1059,23 +1059,21 @@ mod tests {
             &one_dimensional_rgb_table_payload(),
         );
 
-        // The rejection is specifically about the TABLE SHAPE, not a byte-length
-        // accident: the same payload reaches the dimensions check.
-        let error = parse_xmp_rgb_profile(&one_d)
-            .expect_err("a 1-D RGBTable is outside Once-Lab's supported table shapes");
-        assert!(
-            error.contains("unsupported embedded RGBTable dimensions 1"),
-            "unexpected error: {error}"
+        let profile = parse_xmp_rgb_profile(&one_d)
+            .expect("a 1-D RGBTable is an Adobe-legal supported table shape");
+        assert_eq!(
+            profile.table.as_ref().map(|t| t.dimensions),
+            Some(1),
+            "the decoded table must be 1-dimensional"
         );
 
         let path = write_file(&dir, "one-d.xmp", &one_d);
-        assert_eq!(
-            classify_xmp_profile_path(&path),
-            Ok(None),
-            "an unsupported (1-D) profile must not be surfaced as supported"
-        );
+        let entry = classify_xmp_profile_path(&path)
+            .expect("classification should succeed")
+            .expect("a supported 1-D profile must classify as a profile");
+        assert_eq!(entry.name, "One-D");
 
-        // Non-vacuity: the exact same document becomes a supported profile once
+        // Non-vacuity: the same document becomes a supported profile once
         // its table is a supported 3-D identity table.
         let three_d = profile_xmp_with_table(
             "Three-D",
@@ -1149,7 +1147,12 @@ mod tests {
         write_file(
             &dir,
             "not-the-name.xmp",
-            &profile_xmp("Authoritative Name", Some("Authoritative Group"), "UUID-V", "False"),
+            &profile_xmp(
+                "Authoritative Name",
+                Some("Authoritative Group"),
+                "UUID-V",
+                "False",
+            ),
         );
 
         let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");

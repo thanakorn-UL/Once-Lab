@@ -39,9 +39,13 @@ pub(crate) struct XmpRgbProfile {
     /// invent a gray conversion for it, so a grayscale profile renders exactly
     /// like the equivalent color profile.
     pub convert_to_grayscale: bool,
-    pub rgb_table_id: String,
+    /// The `crs:RGBTable` id, if the profile authors one. Creative profiles may
+    /// legally carry a `crs:LookTable` with no `crs:RGBTable` at all (the look
+    /// is the whole profile), so both sides are optional — a profile with
+    /// NEITHER is rejected below.
+    pub rgb_table_id: Option<String>,
     pub rgb_table_amount: Option<f32>,
-    pub table: RgbTable,
+    pub table: Option<RgbTable>,
     /// The `crs:LookTable` id, if the profile authors one.
     pub look_table_id: Option<String>,
     /// The decoded `crs:LookTable`, if the profile authors one.
@@ -172,17 +176,20 @@ pub(crate) fn parse_xmp_rgb_profile(xmp: &str) -> Result<XmpRgbProfile, String> 
     // the DNG SDK, so a grayscale profile renders exactly like the equivalent
     // color profile rather than through an invented conversion.
 
-    let rgb_table_id = collected
-        .rgb_table
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| "missing crs:RGBTable".to_string())?;
+    // `crs:RGBTable` is OPTIONAL: a creative profile may author only a
+    // LookTable. An authored id whose `crs:Table_<id>` data is absent is a
+    // broken profile — an explicit error naming it, not "no table".
+    let rgb_table_id = collected.rgb_table.filter(|id| !id.is_empty());
 
-    let encoded = collected
-        .tables
-        .get(&rgb_table_id)
-        .ok_or_else(|| "missing embedded RGBTable data".to_string())?;
-
-    let table = decode_adobe_rgb_table(encoded)?;
+    let table = match rgb_table_id.as_deref() {
+        Some(id) => {
+            let encoded = collected.tables.get(id).ok_or_else(|| {
+                format!("missing embedded RGBTable data for crs:RGBTable=\"{id}\"")
+            })?;
+            Some(decode_adobe_rgb_table(encoded)?)
+        }
+        None => None,
+    };
 
     // The LookTable rides the same `crs:Table_<id>` map as the RGBTable. An
     // authored `crs:LookTable` whose data is absent is a broken profile, not a
@@ -191,15 +198,18 @@ pub(crate) fn parse_xmp_rgb_profile(xmp: &str) -> Result<XmpRgbProfile, String> 
 
     let look_table = match look_table_id.as_deref() {
         Some(id) => {
-            let encoded = collected
-                .tables
-                .get(id)
-                .ok_or_else(|| format!("missing embedded LookTable data for crs:LookTable=\"{id}\""))?;
+            let encoded = collected.tables.get(id).ok_or_else(|| {
+                format!("missing embedded LookTable data for crs:LookTable=\"{id}\"")
+            })?;
 
             Some(decode_adobe_look_table(encoded)?)
         }
         None => None,
     };
+
+    if table.is_none() && look_table.is_none() {
+        return Err("profile authors neither crs:RGBTable nor crs:LookTable".to_string());
+    }
 
     let rgb_table_amount = match collected.rgb_table_amount {
         Some(raw) => {
@@ -458,14 +468,15 @@ mod tests {
         assert_eq!(profile.process_version, Some("11.0".to_string()));
         assert!(profile.supports_amount);
         assert!(!profile.convert_to_grayscale);
-        assert_eq!(profile.rgb_table_id, "TESTTABLE");
+        assert_eq!(profile.rgb_table_id.as_deref(), Some("TESTTABLE"));
         assert_eq!(profile.rgb_table_amount, Some(0.5));
         assert_eq!(profile.look_table_id, None);
         assert_eq!(profile.look_table, None);
-        assert_eq!(profile.table.size, 2);
-        assert_eq!(profile.table.values.len(), 8);
-        assert_eq!(profile.table.values[0], [0.0, 0.0, 0.0]);
-        assert_eq!(profile.table.values[7], [1.0, 1.0, 1.0]);
+        let table = profile.table.as_ref().expect("RGBTable decoded");
+        assert_eq!(table.size, 2);
+        assert_eq!(table.node_count(), 8);
+        assert_eq!(table.node(0), [0.0, 0.0, 0.0]);
+        assert_eq!(table.node(7), [1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -488,13 +499,22 @@ mod tests {
         let profile =
             parse_xmp_rgb_profile(&xmp).expect("a grayscale profile must now parse, not error");
 
-        assert!(profile.convert_to_grayscale, "the flag must be reported as true");
+        assert!(
+            profile.convert_to_grayscale,
+            "the flag must be reported as true"
+        );
         assert!(profile.supports_amount);
-        assert_eq!(profile.rgb_table_id, "TESTTABLE");
-        assert_eq!(profile.rgb_table_amount, None, "Fe declares no authored amount");
+        assert_eq!(profile.rgb_table_id.as_deref(), Some("TESTTABLE"));
+        assert_eq!(
+            profile.rgb_table_amount, None,
+            "Fe declares no authored amount"
+        );
 
         assert_eq!(profile.look_table_id.as_deref(), Some(LOOK_TABLE_ID));
-        let look = profile.look_table.as_ref().expect("the LookTable must be decoded");
+        let look = profile
+            .look_table
+            .as_ref()
+            .expect("the LookTable must be decoded");
         assert_eq!(look.hue_divisions, 1);
         assert_eq!(look.sat_divisions, 2);
         assert_eq!(look.val_divisions, 1);
@@ -504,10 +524,16 @@ mod tests {
 
         // Non-vacuity: the same document with the flag flipped parses identically
         // apart from the flag, proving the flag is the only thing that changed.
-        let color = xmp.replace("crs:ConvertToGrayscale=\"True\"", "crs:ConvertToGrayscale=\"False\"");
+        let color = xmp.replace(
+            "crs:ConvertToGrayscale=\"True\"",
+            "crs:ConvertToGrayscale=\"False\"",
+        );
         let color_profile = parse_xmp_rgb_profile(&color).expect("color variant must parse");
         assert!(!color_profile.convert_to_grayscale);
-        assert_eq!(color_profile.look_table.as_ref(), profile.look_table.as_ref());
+        assert_eq!(
+            color_profile.look_table.as_ref(),
+            profile.look_table.as_ref()
+        );
         assert_eq!(&color_profile.table, &profile.table);
     }
 
@@ -545,6 +571,43 @@ mod tests {
     fn rejects_xmp_when_referenced_rgb_table_is_missing() {
         let xmp = minimal_xmp(r#"crs:RGBTable="MISSING""#);
         assert!(parse_xmp_rgb_profile(&xmp).is_err());
+    }
+
+    /// A Creative profile may legally author ONLY a LookTable — Adobe's
+    /// camera-profile model treats each stage as optional. The parser must
+    /// return a profile with `table: None` and the decoded LookTable, not
+    /// reject the document.
+    #[test]
+    fn parses_look_table_only_profile() {
+        let xmp = minimal_xmp(&format!(
+            r#"crs:LookTable="{look_id}"
+      crs:Table_{look_id}="{look}""#,
+            look_id = LOOK_TABLE_ID,
+            look = look_table_base85(&look_table_entries(), 0),
+        ));
+
+        let profile = parse_xmp_rgb_profile(&xmp).expect("LookTable-only profile must parse");
+
+        assert!(profile.table.is_none(), "no RGBTable was authored");
+        assert_eq!(profile.rgb_table_id, None);
+        assert!(
+            profile.look_table.is_some(),
+            "the LookTable must be decoded"
+        );
+        assert_eq!(profile.look_table_id.as_deref(), Some(LOOK_TABLE_ID));
+    }
+
+    /// The converse bound: a profile authoring NEITHER stage is not a usable
+    /// creative profile and must still be rejected.
+    #[test]
+    fn rejects_xmp_with_neither_table() {
+        let xmp = minimal_xmp("");
+        let error = parse_xmp_rgb_profile(&xmp)
+            .expect_err("a profile with no LookTable and no RGBTable must fail");
+        assert!(
+            error.contains("neither crs:RGBTable nor crs:LookTable"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -629,9 +692,16 @@ mod tests {
         assert_eq!(parsed.process_version, None, "ProcessVersion is optional");
         assert_eq!(parsed.group, None, "Group is optional");
         assert!(!parsed.supports_amount, "SupportsAmount defaults to false");
-        assert!(!parsed.convert_to_grayscale, "ConvertToGrayscale defaults to false");
+        assert!(
+            !parsed.convert_to_grayscale,
+            "ConvertToGrayscale defaults to false"
+        );
         assert_eq!(parsed.rgb_table_amount, None, "RGBTableAmount is optional");
-        assert_eq!(parsed.table.size, 2, "the table still decodes");
+        assert_eq!(
+            parsed.table.as_ref().map(|t| t.size),
+            Some(2),
+            "the table still decodes"
+        );
 
         // Non-vacuity: supplying the optional fields changes exactly those fields.
         let present = minimal_xmp(&format!(

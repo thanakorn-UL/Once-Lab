@@ -61,11 +61,16 @@ fn is_linear_raw_format(raw_image: &RawImage) -> bool {
 }
 
 #[inline]
+/// Standard sRGB EOTF inverse (IEC 61966-2-1): linear segment below 0.04045,
+/// `((v + 0.055) / 1.055)^2.4` above. This previously used exponent 3.0, which
+/// is not the sRGB transfer curve; the Adobe DNG SDK decode
+/// (`dng_function_GammaEncode_sRGB::EvaluateInverse`,
+/// `dng_color_space.cpp:34-44`) confirms 2.4.
 fn srgb_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
-        ((value + 0.055) / 1.055).powf(3.0)
+        ((value + 0.055) / 1.055).powf(2.4)
     }
 }
 

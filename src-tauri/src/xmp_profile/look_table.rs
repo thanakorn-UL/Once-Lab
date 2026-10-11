@@ -81,10 +81,8 @@ const MIN_SAMPLES: usize = (MIN_HUE_DIVISIONS * MIN_SAT_DIVISIONS * MIN_VAL_DIVI
 const MIN_BLOCK_BYTES: usize = HEADER_BYTES + MIN_SAMPLES * ENTRY_BYTES + ENCODING_BYTES;
 
 /// Largest legal decompressed block (18432 samples plus the optional flags word).
-const MAX_BLOCK_BYTES: usize = HEADER_BYTES
-    + (MAX_TOTAL_SAMPLES as usize) * ENTRY_BYTES
-    + ENCODING_BYTES
-    + FLAGS_BYTES;
+const MAX_BLOCK_BYTES: usize =
+    HEADER_BYTES + (MAX_TOTAL_SAMPLES as usize) * ENTRY_BYTES + ENCODING_BYTES + FLAGS_BYTES;
 
 /// A decoded Adobe LookTable (a hue/saturation/value mapping grid).
 ///
@@ -113,7 +111,8 @@ pub(crate) struct LookTable {
 /// length, encoding value and entry finiteness) happens here, so the renderer can
 /// trust a successfully decoded [`LookTable`].
 pub(crate) fn decode_adobe_look_table(encoded: &str) -> Result<LookTable, String> {
-    let block = decode_big_table_payload(encoded, LOOK_TABLE_LABEL, MIN_BLOCK_BYTES, MAX_BLOCK_BYTES)?;
+    let block =
+        decode_big_table_payload(encoded, LOOK_TABLE_LABEL, MIN_BLOCK_BYTES, MAX_BLOCK_BYTES)?;
 
     parse_look_table_block(&block)
 }
@@ -365,9 +364,24 @@ mod tests {
 
         for (index, expected) in entries.iter().enumerate() {
             let actual = table.entries[index];
-            assert_close(actual[0], expected[0], 1e-6, &format!("entry {index} hue shift"));
-            assert_close(actual[1], expected[1], 1e-6, &format!("entry {index} sat scale"));
-            assert_close(actual[2], expected[2], 1e-6, &format!("entry {index} val scale"));
+            assert_close(
+                actual[0],
+                expected[0],
+                1e-6,
+                &format!("entry {index} hue shift"),
+            );
+            assert_close(
+                actual[1],
+                expected[1],
+                1e-6,
+                &format!("entry {index} sat scale"),
+            );
+            assert_close(
+                actual[2],
+                expected[2],
+                1e-6,
+                &format!("entry {index} val scale"),
+            );
         }
 
         // Non-vacuity: the wire order really is value-outermost / sat-innermost, so
@@ -408,8 +422,8 @@ mod tests {
 
         let body = build_body(1, 2, 1, &entries, 2);
         let encoded = encode_payload(body.len() as u32, &body);
-        let error = decode_adobe_look_table(&encoded)
-            .expect_err("unknown encoding must be rejected");
+        let error =
+            decode_adobe_look_table(&encoded).expect_err("unknown encoding must be rejected");
         assert!(
             error.contains("unsupported embedded LookTable encoding 2"),
             "unexpected error: {error}"
@@ -425,7 +439,8 @@ mod tests {
         // '~' is not part of Adobe's Base85 alphabet.
         encoded.replace_range(2..3, "~");
 
-        let error = decode_adobe_look_table(&encoded).expect_err("bad Base85 digit must be rejected");
+        let error =
+            decode_adobe_look_table(&encoded).expect_err("bad Base85 digit must be rejected");
         assert!(
             error.contains("invalid Adobe Base85 character '~' in embedded LookTable"),
             "unexpected error: {error}"
@@ -439,7 +454,10 @@ mod tests {
 
         let error =
             decode_adobe_look_table(&encoded).expect_err("declared/actual size mismatch must fail");
-        assert!(error.contains("LookTable size mismatch"), "unexpected error: {error}");
+        assert!(
+            error.contains("LookTable size mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -464,8 +482,7 @@ mod tests {
         payload.push(0x00);
 
         let encoded = base85_encode(&payload);
-        let error =
-            decode_adobe_look_table(&encoded).expect_err("trailing bytes must be rejected");
+        let error = decode_adobe_look_table(&encoded).expect_err("trailing bytes must be rejected");
         assert!(
             error.contains("trailing bytes after the zlib stream"),
             "unexpected error: {error}"
@@ -551,22 +568,40 @@ mod tests {
         // hue < min, hue > max
         assert!(parse_look_table_block(&build_body(0, 2, 1, &[], ENCODING_LINEAR)).is_err());
         assert!(
-            parse_look_table_block(&build_body(MAX_HUE_DIVISIONS + 1, 2, 1, &[], ENCODING_LINEAR))
-                .is_err()
+            parse_look_table_block(&build_body(
+                MAX_HUE_DIVISIONS + 1,
+                2,
+                1,
+                &[],
+                ENCODING_LINEAR
+            ))
+            .is_err()
         );
 
         // sat < min (Adobe requires >= 2), sat > max
         assert!(parse_look_table_block(&build_body(1, 1, 1, &[], ENCODING_LINEAR)).is_err());
         assert!(
-            parse_look_table_block(&build_body(1, MAX_SAT_DIVISIONS + 1, 1, &[], ENCODING_LINEAR))
-                .is_err()
+            parse_look_table_block(&build_body(
+                1,
+                MAX_SAT_DIVISIONS + 1,
+                1,
+                &[],
+                ENCODING_LINEAR
+            ))
+            .is_err()
         );
 
         // val < min, val > max
         assert!(parse_look_table_block(&build_body(1, 2, 0, &[], ENCODING_LINEAR)).is_err());
         assert!(
-            parse_look_table_block(&build_body(1, 2, MAX_VAL_DIVISIONS + 1, &[], ENCODING_LINEAR))
-                .is_err()
+            parse_look_table_block(&build_body(
+                1,
+                2,
+                MAX_VAL_DIVISIONS + 1,
+                &[],
+                ENCODING_LINEAR
+            ))
+            .is_err()
         );
 
         // Non-vacuity: the exact minimum grid (1 x 2 x 1) is accepted, proving the
@@ -578,7 +613,13 @@ mod tests {
     #[test]
     fn rejects_total_samples_above_maximum() {
         // Each dimension is individually legal, yet 360 * 256 * 2 = 184320 > 18432.
-        let block = build_body(MAX_HUE_DIVISIONS, MAX_SAT_DIVISIONS, 2, &[], ENCODING_LINEAR);
+        let block = build_body(
+            MAX_HUE_DIVISIONS,
+            MAX_SAT_DIVISIONS,
+            2,
+            &[],
+            ENCODING_LINEAR,
+        );
 
         let error =
             parse_look_table_block(&block).expect_err("product above 18432 must be rejected");
@@ -601,8 +642,8 @@ mod tests {
         let body = build_body(1, 2, 1, &entries, ENCODING_LINEAR);
         let encoded = encode_payload(body.len() as u32, &body);
 
-        let error = decode_adobe_look_table(&encoded)
-            .expect_err("a non-finite entry must be rejected");
+        let error =
+            decode_adobe_look_table(&encoded).expect_err("a non-finite entry must be rejected");
         assert!(
             error.contains("embedded LookTable entry 1 is not finite"),
             "unexpected error: {error}"

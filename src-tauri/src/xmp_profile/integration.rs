@@ -11,12 +11,63 @@
 //! ```text
 //! linear sRGB D65
 //!   -> LookTable stage   (only when the profile authors one)
-//!   -> RGBTable stage
+//!   -> RGBTable stage   (only when the profile authors one)
 //! ```
+//!
+//! Two render modes exist ([`ProfileRenderMode`]):
+//!
+//! * `Legacy` — the historical Once-Lab evaluator: analytic per-pixel gamma,
+//!   incremental-difference tetrahedral interpolation, and a generalized
+//!   clamp/gamut stage in the sRGB/D65 working space. Preserved for
+//!   regression comparison; select it with `ONCELAB_XMP_PROFILE_MODE=legacy`.
+//!
+//! * `AdobeSdk` (default) — the DNG SDK 1.7.1 scalar pipeline: a once-per-pixel
+//!   boundary conversion to **Linear ProPhoto RGB / D50**, then
+//!   `RefBaselineHueSatMap` (LookTable), then `RefRGBtoRGBTable{1,3}D`, then
+//!   the inverse boundary conversion:
+//!
+//! ```text
+//! linear sRGB D65
+//!   -> M: sRGB(D65) -> ProPhoto(D50)     (boundary, once per pixel)
+//!   -> LookTable (ProPhoto domain, sampled sRGB V codec)
+//!   -> [baseline tone stage: IDENTITY — the creative-profile tone curve is
+//!      a develop-parameter input Once-Lab does not model; see report]
+//!   -> RGBTable  (ProPhoto domain, sampled gamma, u16 tetra kernel)
+//!   -> M: ProPhoto(D50) -> sRGB(D65)     (boundary, once per pixel)
+//! ```
+//!
+//! Creative XMP profiles carry no `ProfileDynamicRange`, so the production
+//! pipeline is SDR; the HDR overrange machinery exists in the evaluator and
+//! is exercised by fixtures/tests via [`apply_profile_adobe`].
 
+use super::adobe_apply::PreparedRgbTable;
 use super::apply::RgbTableApplyContext;
-use super::look_table_apply::LookTableApplyContext;
+use super::linear_rgb::mul3;
+use super::look_table_apply::{
+    LookTableAdobeContext, LookTableApplyContext, linear_prophoto_to_linear_srgb,
+    linear_srgb_to_linear_prophoto,
+};
 use crate::xmp_profile::XmpRgbProfile;
+
+/// Which evaluator applies the XMP profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileRenderMode {
+    /// The pre-SDK-fidelity renderer (see module docs).
+    Legacy,
+    /// The Adobe DNG SDK 1.7.1 scalar pipeline.
+    AdobeSdk,
+}
+
+/// Resolves the production render mode. `ONCELAB_XMP_PROFILE_MODE=legacy`
+/// selects the legacy evaluator; anything else (including unset) selects the
+/// Adobe-SDK pipeline — it is the production default now that the kernel,
+/// sampled gamma and ProPhoto working-space boundary are fully implemented.
+fn profile_render_mode() -> ProfileRenderMode {
+    match std::env::var("ONCELAB_XMP_PROFILE_MODE").as_deref() {
+        Ok("legacy") => ProfileRenderMode::Legacy,
+        _ => ProfileRenderMode::AdobeSdk,
+    }
+}
 
 /// Resolves the runtime RGBTable amount for `profile`.
 ///
@@ -47,7 +98,13 @@ pub(crate) fn effective_profile_amount(
         return Err("invalid XMP profile amount percent".to_string());
     }
 
-    let (min_amount, max_amount) = (profile.table.min_amount, profile.table.max_amount);
+    // A LookTable-only profile has no amount-bearing stage: the slider is
+    // rejected, never silently ignored.
+    let Some(table) = &profile.table else {
+        return Err("XMP profile does not support Amount adjustment".to_string());
+    };
+
+    let (min_amount, max_amount) = (table.min_amount, table.max_amount);
 
     if !min_amount.is_finite()
         || !max_amount.is_finite()
@@ -73,12 +130,44 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
     profile: &XmpRgbProfile,
     ui_percent: Option<f32>,
 ) -> Result<(), String> {
+    apply_profile_to_three_color_pixels_with_mode(
+        pixels,
+        profile,
+        ui_percent,
+        profile_render_mode(),
+    )
+}
+
+/// Applies `profile` with an explicit render mode — used by tests and by the
+/// `ONCELAB_XMP_PROFILE_MODE` env override.
+pub(crate) fn apply_profile_to_three_color_pixels_with_mode(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    ui_percent: Option<f32>,
+    mode: ProfileRenderMode,
+) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
+    match mode {
+        ProfileRenderMode::Legacy => apply_profile_legacy(pixels, profile, amount),
+        ProfileRenderMode::AdobeSdk => apply_profile_adobe(pixels, profile, amount, false),
+    }
+}
+
+/// The `Legacy` evaluator: sRGB/D65 working space, analytic gamma, the
+/// historical stage order — LookTable then RGBTable.
+fn apply_profile_legacy(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    amount: f32,
+) -> Result<(), String> {
     // Both stage contexts are built - and therefore fully validated, with the
     // amount resolved - before the first pixel is touched, so an invalid profile
     // or amount can never leave the image partially processed.
-    let rgb_context = RgbTableApplyContext::new(&profile.table, amount)?;
+    let rgb_context = match &profile.table {
+        Some(table) => Some(RgbTableApplyContext::new(table, amount)?),
+        None => None,
+    };
     let look_context = match &profile.look_table {
         Some(table) => Some(LookTableApplyContext::new(table)?),
         None => None,
@@ -92,7 +181,82 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
             None => *pixel,
         };
 
-        *pixel = rgb_context.apply(staged)?;
+        if let Some(context) = &rgb_context {
+            *pixel = context.apply(staged)?;
+        } else {
+            *pixel = staged;
+        }
+    }
+
+    Ok(())
+}
+
+/// The `AdobeSdk` evaluator: one boundary conversion into Linear ProPhoto D50,
+/// then the SDK-ordered stages, then back. `is_hdr` selects the overrange
+/// (`supportOverrange`) machinery; creative XMP profiles never set it in
+/// production (they carry no `ProfileDynamicRange`), so callers pass `false`
+/// and the HDR paths are exercised by tests.
+pub(crate) fn apply_profile_adobe(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    amount: f32,
+    is_hdr: bool,
+) -> Result<(), String> {
+    // Every stage context is built — and therefore fully validated, with the
+    // amount resolved — before the first pixel is touched.
+    let rgb_context = match &profile.table {
+        Some(table) => {
+            let context = if is_hdr {
+                PreparedRgbTable::new_overrange(table, f64::from(amount))?
+            } else {
+                PreparedRgbTable::new(table, f64::from(amount))?
+            };
+            Some(context)
+        }
+        None => None,
+    };
+    let look_context = match &profile.look_table {
+        Some(table) => Some(LookTableAdobeContext::new(table, is_hdr)?),
+        None => None,
+    };
+
+    let srgb_to_prophoto = linear_srgb_to_linear_prophoto();
+    let prophoto_to_srgb = linear_prophoto_to_linear_srgb();
+
+    for pixel in pixels.iter_mut() {
+        for value in *pixel {
+            if !value.is_finite() {
+                return Err("XMP profile input contains non-finite value".to_string());
+            }
+        }
+
+        // Boundary: working space -> Linear ProPhoto D50, once.
+        let mut staged = mul3(srgb_to_prophoto, *pixel);
+
+        if let Some(context) = &look_context {
+            staged = context.apply(staged);
+        }
+
+        // Baseline tone stage: identity. The Adobe baseline tone curve is a
+        // develop-parameters input (`dng_tone_curve` driven by contrast/
+        // exposure settings), not profile data; substituting Once-Lab's
+        // highlight compressor or an invented S-curve would be unfaithful.
+
+        if let Some(context) = &rgb_context {
+            staged = context.apply(staged);
+        }
+
+        // Boundary back to the working space. In SDR the kernel output is
+        // already pinned, but the boundary matrix can introduce ~1e-8
+        // excursions; the SDK's own pipeline clamps downstream, so pin here
+        // to keep the stage output in contract. HDR never pins.
+        let mut out = mul3(prophoto_to_srgb, staged);
+        if !is_hdr {
+            for channel in out.iter_mut() {
+                *channel = channel.clamp(0.0, 1.0);
+            }
+        }
+        *pixel = out;
     }
 
     Ok(())
@@ -178,7 +342,6 @@ mod acceptance {
         worst
     }
 
-
     /// Raw float pixels with NO conversion, so values outside [0,1] stay visible
     /// (`DynamicImage::to_rgb32f` clamps, which would hide linear overrange).
     fn raw_f32(img: &image::DynamicImage) -> Vec<[f32; 3]> {
@@ -187,7 +350,11 @@ mod acceptance {
         match img {
             D::ImageRgba32F(buffer) => buffer.pixels().map(|p| [p[0], p[1], p[2]]).collect(),
             D::ImageRgb32F(buffer) => buffer.pixels().map(|p| [p[0], p[1], p[2]]).collect(),
-            other => other.to_rgb32f().pixels().map(|p| [p[0], p[1], p[2]]).collect(),
+            other => other
+                .to_rgb32f()
+                .pixels()
+                .map(|p| [p[0], p[1], p[2]])
+                .collect(),
         }
     }
 
@@ -314,8 +481,7 @@ mod acceptance {
             } else {
                 reproduction.in_range_count += 1;
                 reproduction.in_range_worst = reproduction.in_range_worst.max(clamped_worst);
-                reproduction.in_range_raw_worst =
-                    reproduction.in_range_raw_worst.max(raw_worst);
+                reproduction.in_range_raw_worst = reproduction.in_range_raw_worst.max(raw_worst);
             }
         }
 
@@ -745,7 +911,10 @@ mod acceptance {
         // ----------------------------------------------------------------
         assert!(profile.convert_to_grayscale, "Fe is a monochrome profile");
         assert!(profile.supports_amount, "Fe declares SupportsAmount");
-        assert_eq!(profile.rgb_table_amount, None, "Fe authors no RGBTableAmount");
+        assert_eq!(
+            profile.rgb_table_amount, None,
+            "Fe authors no RGBTableAmount"
+        );
 
         let look_table = profile.look_table.as_ref().expect("Fe authors a LookTable");
 
@@ -758,13 +927,13 @@ mod acceptance {
             profile.convert_to_grayscale,
             profile.supports_amount,
             profile.rgb_table_amount,
-            profile.table.size,
-            profile.table.values.len(),
-            profile.table.color_space,
-            profile.table.gamma,
-            profile.table.gamut,
-            profile.table.min_amount,
-            profile.table.max_amount,
+            profile.table.as_ref().map_or(0, |t| t.size),
+            profile.table.as_ref().map_or(0, |t| t.node_count()),
+            profile.table.as_ref().map_or(0, |t| t.color_space),
+            profile.table.as_ref().map_or(0, |t| t.gamma),
+            profile.table.as_ref().map_or(0, |t| t.gamut),
+            profile.table.as_ref().map_or(0.0, |t| t.min_amount),
+            profile.table.as_ref().map_or(0.0, |t| t.max_amount),
             look_table.hue_divisions,
             look_table.sat_divisions,
             look_table.val_divisions,
@@ -787,18 +956,19 @@ mod acceptance {
             36 * 16 * 16,
             "Fe LookTable must carry one entry per 36x16x16 cell"
         );
-        assert_eq!(profile.table.size, 32, "Fe RGBTable must be 32^3");
+        let fe_table = profile.table.as_ref().expect("Fe authors an RGBTable");
+        assert_eq!(fe_table.size, 32, "Fe RGBTable must be 32^3");
         assert_eq!(
-            profile.table.values.len(),
+            fe_table.node_count(),
             32 * 32 * 32,
             "Fe RGBTable must carry one entry per 32^3 node"
         );
         assert_eq!(
-            profile.table.color_space, 0,
+            fe_table.color_space, 0,
             "Fe RGBTable color space must be 0 (sRGB)"
         );
-        assert_eq!(profile.table.gamma, 1, "Fe RGBTable gamma must be 1 (linear)");
-        assert_eq!(profile.table.gamut, 0, "Fe RGBTable gamut must be 0 (sRGB)");
+        assert_eq!(fe_table.gamma, 1, "Fe RGBTable gamma must be 1 (linear)");
+        assert_eq!(fe_table.gamut, 0, "Fe RGBTable gamut must be 0 (sRGB)");
 
         // ----------------------------------------------------------------
         // 2. Representative output probes. The renderer runs once over the
@@ -831,8 +1001,8 @@ mod acceptance {
                 changed = true;
             }
 
-            let spread = output[0].max(output[1]).max(output[2])
-                - output[0].min(output[1]).min(output[2]);
+            let spread =
+                output[0].max(output[1]).max(output[2]) - output[0].min(output[1]).min(output[2]);
             if spread > MEANINGFUL_DEVIATION {
                 stayed_chromatic = true;
             }
@@ -884,7 +1054,17 @@ mod acceptance {
 
         println!(
             "FE|nef|ok=true|center={:?}|mean=[{:.6},{:.6},{:.6}]|baseline_center={:?}|baseline_mean=[{:.6},{:.6},{:.6}]|finite={}|ms={}|max_delta_vs_baseline={}",
-            c, r, g, b, bc, br, bg, bb, finite, elapsed.as_millis(), delta
+            c,
+            r,
+            g,
+            b,
+            bc,
+            br,
+            bg,
+            bb,
+            finite,
+            elapsed.as_millis(),
+            delta
         );
 
         assert!(finite, "the Fe NEF render must be finite at every pixel");
@@ -902,7 +1082,7 @@ mod tests {
 
     use crate::xmp_profile::RgbTable;
     use crate::xmp_profile::apply_rgb_table;
-    use crate::xmp_profile::look_table::LookTable;
+    use crate::xmp_profile::look_table::{ENCODING_LINEAR, LookTable};
     use crate::xmp_profile::look_table_apply::apply_look_table;
 
     /// Non-identity: every node maps to a constant encoded value.
@@ -926,17 +1106,11 @@ mod tests {
             process_version: None,
             supports_amount,
             convert_to_grayscale: false,
-            rgb_table_id: "TESTTABLE".to_string(),
+            rgb_table_id: Some("TESTTABLE".to_string()),
             rgb_table_amount: amount,
-            table: RgbTable {
-                size: 2,
-                values: values.to_vec(),
-                color_space: 0,
-                gamma: 1,
-                gamut: 0,
-                min_amount,
-                max_amount,
-            },
+            table: Some(RgbTable::from_f32_nodes(
+                3, 2, &values, 0, 1, 0, min_amount, max_amount,
+            )),
             look_table_id: None,
             look_table: None,
         }
@@ -1001,15 +1175,7 @@ mod tests {
                 }
             }
         }
-        RgbTable {
-            size: 2,
-            values,
-            color_space: 0,
-            gamma: 1,
-            gamut: 0,
-            min_amount: 0.0,
-            max_amount: 1.0,
-        }
+        RgbTable::from_f32_nodes(3, 2, &values, 0, 1, 0, 0.0, 1.0)
     }
 
     /// Channel-swapping RGBTable: node (r,g,b) maps to [b,g,r]. A linear but
@@ -1023,15 +1189,7 @@ mod tests {
                 }
             }
         }
-        RgbTable {
-            size: 2,
-            values,
-            color_space: 0,
-            gamma: 1,
-            gamut: 0,
-            min_amount: 0.0,
-            max_amount: 1.0,
-        }
+        RgbTable::from_f32_nodes(3, 2, &values, 0, 1, 0, 0.0, 1.0)
     }
 
     fn profile_with_look_table(table: RgbTable, look_table: LookTable) -> XmpRgbProfile {
@@ -1042,9 +1200,9 @@ mod tests {
             process_version: None,
             supports_amount: true,
             convert_to_grayscale: false,
-            rgb_table_id: "RGBTABLEID".to_string(),
+            rgb_table_id: Some("RGBTABLEID".to_string()),
             rgb_table_amount: None,
-            table,
+            table: Some(table),
             look_table_id: Some("LOOKTABLEID".to_string()),
             look_table: Some(look_table),
         }
@@ -1097,8 +1255,15 @@ mod tests {
         );
 
         // The renderer must produce the LookTable-first result...
+        // (Legacy mode: this test compares against the legacy primitives.)
         let mut pixels = vec![input];
-        apply_profile_to_three_color_pixels(&mut pixels, &profile).expect("render");
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::Legacy,
+        )
+        .expect("render");
 
         for channel in 0..3 {
             assert_close(
@@ -1120,10 +1285,8 @@ mod tests {
 
     #[test]
     fn identity_look_table_is_a_near_no_op_through_the_renderer() {
-        let profile = profile_with_look_table(
-            identity_rgb_table(),
-            constant_look_table([0.0, 1.0, 1.0]),
-        );
+        let profile =
+            profile_with_look_table(identity_rgb_table(), constant_look_table([0.0, 1.0, 1.0]));
 
         for probe in PROBES {
             let mut pixels = vec![probe];
@@ -1185,12 +1348,20 @@ mod tests {
         let profile = profile_with_look_table(identity_rgb_table(), look.clone());
         let probe = [0.6f32, 0.2, 0.1];
 
-        let look_only =
-            LookTableApplyContext::new(&look).expect("look context").apply(probe).expect("apply");
+        let look_only = LookTableApplyContext::new(&look)
+            .expect("look context")
+            .apply(probe)
+            .expect("apply");
 
         let mut pixels = vec![probe];
-        apply_profile_to_three_color_pixels_with_amount(&mut pixels, &profile, Some(0.0))
-            .expect("0% render");
+        // Legacy mode: `look_only` is the legacy LookTableApplyContext result.
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut pixels,
+            &profile,
+            Some(0.0),
+            ProfileRenderMode::Legacy,
+        )
+        .expect("0% render");
 
         for channel in 0..3 {
             assert_close(
@@ -1213,15 +1384,7 @@ mod tests {
     fn convert_to_grayscale_does_not_change_the_render() {
         // Per ruling 5A-R1 the flag is carried, never rendered: a grayscale
         // profile must render bit-for-bit like its color twin.
-        let rgb = RgbTable {
-            size: 2,
-            values: CONSTANT_2X2X2.to_vec(),
-            color_space: 0,
-            gamma: 1,
-            gamut: 0,
-            min_amount: 0.0,
-            max_amount: 1.0,
-        };
+        let rgb = RgbTable::from_f32_nodes(3, 2, &CONSTANT_2X2X2, 0, 1, 0, 0.0, 1.0);
         let look = constant_look_table([45.0, 1.2, 1.0]);
 
         let mut grayscale = profile_with_look_table(rgb.clone(), look.clone());
@@ -1266,10 +1429,8 @@ mod tests {
     fn fe_class_profile_defaults_amount_to_one() {
         // Fe declares SupportsAmount="True" but authors no crs:RGBTableAmount, so
         // the `unwrap_or(1.0)` default applies and the control stays meaningful.
-        let mut fe = profile_with_look_table(
-            identity_rgb_table(),
-            constant_look_table([0.0, 1.0, 1.0]),
-        );
+        let mut fe =
+            profile_with_look_table(identity_rgb_table(), constant_look_table([0.0, 1.0, 1.0]));
         fe.supports_amount = true;
         fe.rgb_table_amount = None;
 
@@ -1304,8 +1465,8 @@ mod tests {
                 return;
             }
 
-            let profile =
-                crate::xmp_profile::load_xmp_rgb_profile_from_path(&path).expect("load real profile");
+            let profile = crate::xmp_profile::load_xmp_rgb_profile_from_path(&path)
+                .expect("load real profile");
             assert!(
                 profile.look_table.is_none(),
                 "{name} must author no LookTable, otherwise this regression is meaningless"
@@ -1313,13 +1474,22 @@ mod tests {
 
             let amount = profile.rgb_table_amount.unwrap_or(1.0);
             let mut rendered = PROBES.to_vec();
-            apply_profile_to_three_color_pixels(&mut rendered, &profile).expect("render");
+            // LEGACY mode: this test is the regression contract for the
+            // historical evaluator, comparing against its own primitive.
+            apply_profile_to_three_color_pixels_with_mode(
+                &mut rendered,
+                &profile,
+                None,
+                ProfileRenderMode::Legacy,
+            )
+            .expect("render");
 
             let mut max_delta = 0.0f32;
             let mut saw_change = false;
+            let rgb_table = profile.table.as_ref().expect("profile has an RGBTable");
             for (index, probe) in PROBES.iter().enumerate() {
                 let reference =
-                    apply_rgb_table(*probe, &profile.table, amount).expect("reference apply");
+                    apply_rgb_table(*probe, rgb_table, amount).expect("reference apply");
                 if max_channel_delta(reference, *probe) > 1e-4 {
                     saw_change = true;
                 }
@@ -1360,7 +1530,10 @@ mod tests {
 
         assert!(profile.convert_to_grayscale, "Fe is a monochrome profile");
         assert!(profile.supports_amount, "Fe declares SupportsAmount");
-        assert_eq!(profile.rgb_table_amount, None, "Fe authors no RGBTableAmount");
+        assert_eq!(
+            profile.rgb_table_amount, None,
+            "Fe authors no RGBTableAmount"
+        );
         assert!(profile.look_table.is_some(), "Fe authors a LookTable");
         assert_eq!(
             effective_profile_amount(&profile, None).unwrap(),
@@ -1373,7 +1546,10 @@ mod tests {
 
         for probe in &pixels {
             for channel in probe {
-                assert!(channel.is_finite(), "Fe render produced a non-finite pixel: {probe:?}");
+                assert!(
+                    channel.is_finite(),
+                    "Fe render produced a non-finite pixel: {probe:?}"
+                );
             }
         }
     }
@@ -1514,10 +1690,11 @@ mod tests {
 
         // Non-vacuity: the table has to change at least one sample pixel,
         // otherwise every equivalence below would hold for an identity table.
+        let rgb_table = profile.table.as_ref().expect("test table");
         let mut changes_a_pixel = false;
         for pixel in inputs.iter() {
-            let reference = apply_rgb_table(*pixel, &profile.table, authored_amount)
-                .expect("reference apply");
+            let reference =
+                apply_rgb_table(*pixel, rgb_table, authored_amount).expect("reference apply");
             if (0..3).any(|channel| (reference[channel] - pixel[channel]).abs() > 1e-4) {
                 changes_a_pixel = true;
                 break;
@@ -1529,11 +1706,18 @@ mod tests {
         );
 
         // The no-amount path must equal the untouched pre-3C primitive.
+        // (Legacy mode: `apply_rgb_table` IS the legacy primitive.)
         let mut no_amount = inputs.clone();
-        apply_profile_to_three_color_pixels(&mut no_amount, &profile).expect("no-amount render");
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut no_amount,
+            &profile,
+            None,
+            ProfileRenderMode::Legacy,
+        )
+        .expect("no-amount render");
         for (index, pixel) in inputs.iter().enumerate() {
-            let reference = apply_rgb_table(*pixel, &profile.table, authored_amount)
-                .expect("reference apply");
+            let reference =
+                apply_rgb_table(*pixel, rgb_table, authored_amount).expect("reference apply");
             for channel in 0..3 {
                 assert_close(
                     no_amount[index][channel],
@@ -1547,11 +1731,16 @@ mod tests {
         // 100% is defined to *be* the authored render, so it must reproduce the
         // same untouched primitive rather than merely the no-amount path.
         let mut at_100 = inputs.clone();
-        apply_profile_to_three_color_pixels_with_amount(&mut at_100, &profile, Some(100.0))
-            .expect("100% render");
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut at_100,
+            &profile,
+            Some(100.0),
+            ProfileRenderMode::Legacy,
+        )
+        .expect("100% render");
         for (index, pixel) in inputs.iter().enumerate() {
-            let reference = apply_rgb_table(*pixel, &profile.table, authored_amount)
-                .expect("reference apply");
+            let reference =
+                apply_rgb_table(*pixel, rgb_table, authored_amount).expect("reference apply");
             for channel in 0..3 {
                 assert_close(
                     at_100[index][channel],
@@ -1620,7 +1809,8 @@ mod tests {
 
         for (index, input) in inputs.iter().enumerate() {
             let expected =
-                apply_rgb_table(*input, &profile.table, 1.0).expect("direct apply should succeed");
+                apply_rgb_table(*input, profile.table.as_ref().expect("test table"), 1.0)
+                    .expect("direct apply should succeed");
 
             for channel in 0..3 {
                 assert!(
@@ -1638,7 +1828,7 @@ mod tests {
         // 5B supports gamma 0 (Linear) through 4 (Rec2020); 5 is the first
         // genuinely unsupported value, so it is the invalid sentinel here.
         let mut profile = make_profile(CONSTANT_2X2X2, Some(1.0));
-        profile.table.gamma = 5;
+        profile.table.as_mut().expect("test table").gamma = 5;
 
         let mut pixels = vec![[0.18f32, 0.5, 0.9], [0.9, 0.4, 0.1], [0.25, 0.25, 0.25]];
         let original = pixels.clone();
@@ -1712,7 +1902,7 @@ mod tests {
         // 5B supports gamut 0 (clip) and 1 (extend); 2 is the first genuinely
         // unsupported value, so it is the invalid sentinel here.
         let mut invalid = make_profile(CONSTANT_2X2X2, Some(1.0));
-        invalid.table.gamut = 2;
+        invalid.table.as_mut().expect("test table").gamut = 2;
 
         assert!(
             apply_profile_to_three_color_pixels(&mut empty, &invalid).is_err(),
@@ -1735,7 +1925,12 @@ mod tests {
         color.convert_to_grayscale = false;
 
         // Includes an out-of-gamut probe so the stage's clamping is exercised.
-        let inputs = [[-0.1f32, 0.2, 1.4], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.6, 0.2, 0.1]];
+        let inputs = [
+            [-0.1f32, 0.2, 1.4],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.6, 0.2, 0.1],
+        ];
 
         let mut gray_pixels = inputs.to_vec();
         let mut color_pixels = inputs.to_vec();
@@ -1774,21 +1969,22 @@ mod tests {
         apply_profile_to_three_color_pixels(&mut guessed, &defaults).expect("default render");
         assert!(
             (0..original.len())
-                .any(|index| max_channel_delta(guessed[index], original[index]) > MATERIAL_DIFFERENCE),
+                .any(|index| max_channel_delta(guessed[index], original[index])
+                    > MATERIAL_DIFFERENCE),
             "the guessed-default render must materially change the probe, else this test is vacuous"
         );
 
         let cases: [(fn(&mut XmpRgbProfile), &str); 3] = [
             (
-                |profile| profile.table.color_space = 5,
+                |profile| profile.table.as_mut().expect("test table").color_space = 5,
                 "unsupported RGBTable primaries: 5",
             ),
             (
-                |profile| profile.table.gamma = 5,
+                |profile| profile.table.as_mut().expect("test table").gamma = 5,
                 "unsupported RGBTable gamma: 5",
             ),
             (
-                |profile| profile.table.gamut = 2,
+                |profile| profile.table.as_mut().expect("test table").gamut = 2,
                 "unsupported RGBTable gamut: 2",
             ),
         ];
@@ -1806,6 +2002,183 @@ mod tests {
                 pixels, original,
                 "no pixel may be rendered under a guessed default ({expected})"
             );
+        }
+    }
+
+    // ------------------------------------------------------- Adobe-SDK mode
+
+    /// A minimal 2x2x1 identity LookTable (hueShift=0, satScale=1, valScale=1).
+    fn identity_look_table() -> LookTable {
+        LookTable {
+            hue_divisions: 2,
+            sat_divisions: 2,
+            val_divisions: 1,
+            encoding: ENCODING_LINEAR,
+            entries: vec![[0.0f32, 1.0, 1.0]; 4],
+            flags: None,
+        }
+    }
+
+    /// Builds a profile that authors ONLY a LookTable (no RGBTable) — a legal
+    /// Adobe creative-profile shape.
+    fn look_table_only_profile(look: LookTable) -> XmpRgbProfile {
+        XmpRgbProfile {
+            name: "LookOnly".to_string(),
+            group: None,
+            uuid: "LOOKONLY".to_string(),
+            process_version: None,
+            supports_amount: false,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: None,
+            table: None,
+            look_table_id: Some("LOOKTABLEID".to_string()),
+            look_table: Some(look),
+        }
+    }
+
+    /// A LookTable-only profile must render the LookTable stage in Adobe mode
+    /// without needing a dummy identity RGBTable.
+    #[test]
+    fn adobe_mode_renders_look_table_only_profile() {
+        // Identity-offset table: every cell shifts hue by 0, scales sat/val
+        // by 1 — a strict identity LookTable.
+        let look = identity_look_table();
+        let profile = look_table_only_profile(look);
+
+        let input = [0.2f32, 0.5, 0.8];
+        let mut pixels = vec![input];
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+        )
+        .expect("Adobe-mode LookTable-only render");
+
+        // Identity look -> only the ProPhoto boundary round-trip remains.
+        for channel in 0..3 {
+            assert_close(
+                pixels[0][channel],
+                input[channel],
+                1e-6,
+                &format!("identity-look channel {channel}"),
+            );
+        }
+
+        // Non-vacuity: a look that doubles saturation must move the pixel.
+        let look = LookTable {
+            entries: vec![[0.0f32, 2.0, 1.0]; 4],
+            ..identity_look_table()
+        };
+        let profile = look_table_only_profile(look);
+        let mut pixels = vec![input];
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+        )
+        .expect("sat-doubling render");
+        assert!(
+            (0..3).any(|c| (pixels[0][c] - input[c]).abs() > 1e-3),
+            "a non-identity LookTable must visibly change the pixel"
+        );
+    }
+
+    /// The amount slider is meaningless for a LookTable-only profile: the
+    /// renderer must reject it rather than silently ignore it.
+    #[test]
+    fn adobe_mode_rejects_amount_on_look_table_only_profile() {
+        let profile = look_table_only_profile(identity_look_table());
+
+        let mut pixels = vec![[0.2f32, 0.5, 0.8]];
+        let error = apply_profile_to_three_color_pixels_with_mode(
+            &mut pixels,
+            &profile,
+            Some(50.0),
+            ProfileRenderMode::AdobeSdk,
+        )
+        .expect_err("amount on a LookTable-only profile must fail");
+        assert_eq!(error, "XMP profile does not support Amount adjustment");
+    }
+
+    /// Adobe mode: an in-range identity-render stays identity through the full
+    /// ProPhoto boundary round-trip, and the HDR path (via
+    /// [`apply_profile_adobe`]) does NOT clamp above 1.0.
+    #[test]
+    fn adobe_mode_preserves_hdr_range_through_pipeline() {
+        // Identity RGBTable in ProPhoto primaries.
+        let t = identity_rgb_table();
+        let mut profile = make_profile(CONSTANT_2X2X2, Some(1.0));
+        *profile.table.as_mut().unwrap() = RgbTable {
+            color_space: 2, // ProPhoto
+            ..t
+        };
+
+        // SDR mode: overrange input is pinned by the boundary contract.
+        let mut pixels = vec![[4.0f32, 2.0, 0.5]];
+        apply_profile_adobe(&mut pixels, &profile, 1.0, false).expect("sdr");
+        assert!(
+            pixels[0].iter().all(|v| *v <= 1.0),
+            "SDR pipeline must pin at 1.0: {:?}",
+            pixels[0]
+        );
+
+        // HDR mode: overrange values must survive (identity table + identity
+        // ProPhoto matrix round-trips them through the overrange codec).
+        let mut pixels = vec![[4.0f32, 2.0, 0.5]];
+        apply_profile_adobe(&mut pixels, &profile, 1.0, true).expect("hdr");
+        assert!(
+            pixels[0][0] > 1.0 && pixels[0][1] > 1.0,
+            "HDR pipeline must preserve overrange: {:?}",
+            pixels[0]
+        );
+        assert_close(pixels[0][0], 4.0, 1e-3, "HDR red");
+        assert_close(pixels[0][1], 2.0, 1e-3, "HDR green");
+    }
+
+    /// Adobe and Legacy modes must agree closely on in-range content for the
+    /// canonical sRGB-primaries profile — they differ mainly in the working
+    /// space and float-order, not in structure.
+    #[test]
+    fn adobe_and_legacy_modes_track_on_in_range_content() {
+        let profile = make_profile(CONSTANT_2X2X2, Some(1.0));
+        let inputs: Vec<[f32; 3]> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.5, 0.2, 0.8],
+            [0.9, 0.6, 0.1],
+        ];
+
+        let mut legacy = inputs.clone();
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut legacy,
+            &profile,
+            None,
+            ProfileRenderMode::Legacy,
+        )
+        .expect("legacy");
+
+        let mut adobe = inputs;
+        apply_profile_to_three_color_pixels_with_mode(
+            &mut adobe,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+        )
+        .expect("adobe");
+
+        for (index, (l, a)) in legacy.iter().zip(adobe.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (l[c] - a[c]).abs() < 5e-3,
+                    "pixel {index} channel {c}: legacy={} adobe={}",
+                    l[c],
+                    a[c]
+                );
+            }
         }
     }
 }

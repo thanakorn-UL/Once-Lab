@@ -117,8 +117,9 @@ mod tests {
         assert_eq!(profile.name, "Test Profile");
         assert_eq!(profile.uuid, "TEST123");
         assert_eq!(profile.rgb_table_amount, Some(0.5));
-        assert_eq!(profile.table.size, 2);
-        assert_eq!(profile.table.values.len(), 8);
+        let table = profile.table.as_ref().expect("RGBTable decoded");
+        assert_eq!(table.size, 2);
+        assert_eq!(table.node_count(), 8);
 
         fs::remove_file(&path).expect("remove temp xmp");
     }
@@ -202,7 +203,7 @@ mod tests {
             "error should contain the path: {error}"
         );
         assert!(
-            error.contains("missing crs:RGBTable"),
+            error.contains("profile authors neither crs:RGBTable nor crs:LookTable"),
             "underlying parser error must be preserved: {error}"
         );
 

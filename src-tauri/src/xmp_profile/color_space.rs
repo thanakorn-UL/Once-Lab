@@ -46,8 +46,8 @@
 //! required sRGB bit-identity if the sampled table were used.
 
 use super::linear_rgb::{
-    compose_working_to_primaries, invert3, mul3, to_f32, Matrix3, Matrix3F64, ADOBE_RGB_RAW,
-    DISPLAY_P3_RAW, PROPHOTO_RAW, REC2020_RAW, SRGB_RAW,
+    ADOBE_RGB_RAW, DISPLAY_P3_RAW, Matrix3, Matrix3F64, PROPHOTO_RAW, REC2020_RAW, SRGB_RAW,
+    compose_working_to_primaries, invert3, mul3, to_f32,
 };
 use super::srgb_transfer::{srgb_decode, srgb_encode};
 
@@ -232,7 +232,7 @@ impl Gamut {
 // the `Primaries` enum -> raw-constant mapping and the composition call.
 
 /// The raw device->PCS matrix Adobe passes to `SetMatrixToPCS` for `primaries`.
-fn raw_primaries_matrix(primaries: Primaries) -> Matrix3F64 {
+pub(super) fn raw_primaries_matrix(primaries: Primaries) -> Matrix3F64 {
     match primaries {
         Primaries::Srgb => SRGB_RAW,
         Primaries::AdobeRgb => ADOBE_RGB_RAW,
@@ -346,19 +346,12 @@ const REC2020_GAMMA: f64 = 0.45;
 
 /// `EvaluateSplineSegment` (`dng_spline.h:22-50`): one cubic Hermite segment
 /// between `(x0, y0, slope s0)` and `(x1, y1, slope s1)`.
-fn evaluate_spline_segment(
-    x: f64,
-    x0: f64,
-    y0: f64,
-    s0: f64,
-    x1: f64,
-    y1: f64,
-    s1: f64,
-) -> f64 {
+fn evaluate_spline_segment(x: f64, x0: f64, y0: f64, s0: f64, x1: f64, y1: f64, s1: f64) -> f64 {
     let a = x1 - x0;
     let b = (x - x0) / a;
     let c = (x1 - x) / a;
-    ((y0 * (2.0 - c + b) + (s0 * a * b)) * (c * c)) + ((y1 * (2.0 - b + c) - (s1 * a * c)) * (b * b))
+    ((y0 * (2.0 - c + b) + (s0 * a * b)) * (c * c))
+        + ((y1 * (2.0 - b + c) - (s1 * a * c)) * (b * b))
 }
 
 /// `dng_function_GammaEncode_1_8::Evaluate` (`dng_color_space.cpp:51-69`).
@@ -592,8 +585,20 @@ mod tests {
         // the pure power and the straight `slope0 * x` toe. A pure-power or
         // linear-toe implementation would fail these.
         for &(x, x1, y1, power, name) in &[
-            (GAMMA_1_8_X1 * 0.5, GAMMA_1_8_X1, GAMMA_1_8_Y1, GAMMA_1_8_EXPONENT, "1.8"),
-            (GAMMA_2_2_X1 * 0.5, GAMMA_2_2_X1, GAMMA_2_2_Y1, GAMMA_2_2_EXPONENT, "2.2"),
+            (
+                GAMMA_1_8_X1 * 0.5,
+                GAMMA_1_8_X1,
+                GAMMA_1_8_Y1,
+                GAMMA_1_8_EXPONENT,
+                "1.8",
+            ),
+            (
+                GAMMA_2_2_X1 * 0.5,
+                GAMMA_2_2_X1,
+                GAMMA_2_2_Y1,
+                GAMMA_2_2_EXPONENT,
+                "2.2",
+            ),
         ] {
             let toe = if name == "1.8" {
                 gamma_1_8_encode(x)
@@ -703,7 +708,11 @@ mod tests {
         let cases: [(Gamma, f32, f32); 5] = [
             (Gamma::Linear, 0.5, 0.5),
             (Gamma::Srgb, 0.0031308, 0.04045),
-            (Gamma::OnePointEight, GAMMA_1_8_X1 as f32, GAMMA_1_8_Y1 as f32),
+            (
+                Gamma::OnePointEight,
+                GAMMA_1_8_X1 as f32,
+                GAMMA_1_8_Y1 as f32,
+            ),
             (Gamma::TwoPointTwo, GAMMA_2_2_X1 as f32, GAMMA_2_2_Y1 as f32),
             (
                 Gamma::Rec2020,
@@ -717,8 +726,13 @@ mod tests {
             let below = gamma.encode(linear_bp * (1.0 - SIDE));
             let above = gamma.encode(linear_bp * (1.0 + SIDE));
 
-            for value in [0.0f32, 1.0, linear_bp, linear_bp * (1.0 - SIDE), linear_bp * (1.0 + SIDE)]
-            {
+            for value in [
+                0.0f32,
+                1.0,
+                linear_bp,
+                linear_bp * (1.0 - SIDE),
+                linear_bp * (1.0 + SIDE),
+            ] {
                 let encoded = gamma.encode(value);
                 assert!(
                     encoded.is_finite(),
@@ -737,7 +751,11 @@ mod tests {
             let decode_below = gamma.decode(encoded_bp * (1.0 - SIDE));
             let decode_above = gamma.decode(encoded_bp * (1.0 + SIDE));
 
-            for value in [encoded_bp, encoded_bp * (1.0 - SIDE), encoded_bp * (1.0 + SIDE)] {
+            for value in [
+                encoded_bp,
+                encoded_bp * (1.0 - SIDE),
+                encoded_bp * (1.0 + SIDE),
+            ] {
                 let linear = gamma.decode(value);
                 assert!(
                     linear.is_finite(),
@@ -783,7 +801,12 @@ mod tests {
 
             // Neutrals and white must map to themselves across the hop: the
             // normalisation exists precisely to make that true.
-            for neutral in [[0.0f32, 0.0, 0.0], [0.18, 0.18, 0.18], [0.5, 0.5, 0.5], [1.0, 1.0, 1.0]] {
+            for neutral in [
+                [0.0f32, 0.0, 0.0],
+                [0.18, 0.18, 0.18],
+                [0.5, 0.5, 0.5],
+                [1.0, 1.0, 1.0],
+            ] {
                 let forward = transform.encode(neutral);
                 assert_close_vec(forward, neutral, ROUND_TRIP_TOLERANCE, "forward neutral");
 
@@ -795,7 +818,12 @@ mod tests {
             // is not part of the hop).
             let chromatic = [0.4f32, 0.7, 0.2];
             let back = transform.decode(transform.encode(chromatic));
-            assert_close_vec(back, chromatic, ROUND_TRIP_TOLERANCE, "chromatic round trip");
+            assert_close_vec(
+                back,
+                chromatic,
+                ROUND_TRIP_TOLERANCE,
+                "chromatic round trip",
+            );
 
             // Non-vacuity: only sRGB may be the identity; the other four must
             // genuinely move a saturated primary.

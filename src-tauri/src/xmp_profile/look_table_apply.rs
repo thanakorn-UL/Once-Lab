@@ -28,13 +28,15 @@
 //! encode is confined to the `valDivisions >= 2` branch: the "2.5-D" branch
 //! leaves `vEncoded = v` (`dng_reference.cpp:1584`) yet still decodes.
 
+use super::adobe_apply::{decode_overrange, encode_overrange, pin_real32_unit};
 use super::linear_rgb::{
-    compose_working_to_primaries, invert3, mul3, to_f32, Matrix3, PROPHOTO_RAW, SRGB_RAW,
+    Matrix3, PROPHOTO_RAW, SRGB_RAW, compose_working_to_primaries, invert3, mul3, to_f32,
 };
 use super::look_table::{
     ENCODING_LINEAR, ENCODING_SRGB, LookTable, MAX_HUE_DIVISIONS, MAX_SAT_DIVISIONS,
     MAX_TOTAL_SAMPLES, MAX_VAL_DIVISIONS, MIN_HUE_DIVISIONS, MIN_SAT_DIVISIONS, MIN_VAL_DIVISIONS,
 };
+use super::sampled_gamma::{SampledTable, gamma_decode_srgb, gamma_encode_srgb};
 use super::srgb_transfer::{srgb_decode, srgb_encode};
 
 #[cfg(test)]
@@ -131,7 +133,10 @@ impl<'a> LookTableApplyContext<'a> {
             v_out = srgb_decode(v_out);
         }
 
-        Ok(mul3(self.prophoto_to_srgb, hsv_to_linear_rgb(h_out, s_out, v_out)))
+        Ok(mul3(
+            self.prophoto_to_srgb,
+            hsv_to_linear_rgb(h_out, s_out, v_out),
+        ))
     }
 }
 
@@ -139,8 +144,288 @@ impl<'a> LookTableApplyContext<'a> {
 ///
 /// For more than a handful of pixels prefer [`LookTableApplyContext`], which
 /// validates once and then renders many pixels.
+#[cfg(test)]
 pub(crate) fn apply_look_table(rgb: [f32; 3], table: &LookTable) -> Result<[f32; 3], String> {
     LookTableApplyContext::new(table)?.apply(rgb)
+}
+
+// ----------------------------------------------------------------- Adobe mode
+//
+// `LookTableAdobeContext` is the Adobe-SDK-faithful variant of the stage:
+// the pixel already lives in Linear ProPhoto D50 (no per-stage space hop),
+// the V encode/decode use 4096-knot sampled `dng_1d_table`s exactly like
+// `BuildHueSatMapEncodingTable` (`dng_render.cpp:983-1000`), the interpolation
+// uses the SDK's nesting order (hue innermost, value, then saturation — see
+// `RefBaselineHueSatMap`, `dng_reference.cpp:1657-1731`), and `overrange`
+// adds the HDR shell: `Max(c, 0)` on all channels, `EncodeOverrange` only
+// when `valDivisions > 1`, `DecodeOverrange` after HSV->RGB under the same
+// gate (`dng_reference.cpp:1562-1579, 1745-1753`).
+
+/// Prepared LookTable evaluator for Adobe-SDK mode. Validated once, applied
+/// per pixel in Linear ProPhoto D50.
+pub(crate) struct LookTableAdobeContext<'a> {
+    table: &'a LookTable,
+    /// Sampled V encode/decode — present iff `encoding == encoding_sRGB`,
+    /// mirroring `hasTable` (both tables built or neither).
+    v_encode: Option<SampledTable>,
+    v_decode: Option<SampledTable>,
+    overrange: bool,
+}
+
+impl<'a> LookTableAdobeContext<'a> {
+    pub(crate) fn new(table: &'a LookTable, overrange: bool) -> Result<Self, String> {
+        validate_render_metadata(table)?;
+        validate_table_structure(table)?;
+
+        let (v_encode, v_decode) = if table.encoding == ENCODING_SRGB {
+            (
+                Some(SampledTable::build(gamma_encode_srgb)),
+                Some(SampledTable::build(gamma_decode_srgb)),
+            )
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            table,
+            v_encode,
+            v_decode,
+            overrange,
+        })
+    }
+
+    /// `RefBaselineHueSatMap` for one Linear ProPhoto D50 pixel.
+    pub(crate) fn apply(&self, prophoto: [f32; 3]) -> [f32; 3] {
+        let mut r = prophoto[0];
+        let mut g = prophoto[1];
+        let mut b = prophoto[2];
+
+        if self.overrange {
+            r = if r > 0.0 { r } else { 0.0 };
+            g = if g > 0.0 { g } else { 0.0 };
+            b = if b > 0.0 { b } else { 0.0 };
+
+            if self.table.val_divisions > 1 {
+                r = encode_overrange(r);
+                g = encode_overrange(g);
+                b = encode_overrange(b);
+            }
+        }
+
+        let [mut h, mut s, v] = linear_rgb_to_hsv([r, g, b]);
+
+        let has_table = self.v_encode.is_some() && self.v_decode.is_some();
+
+        let mut v_encoded = v;
+
+        let [hue_shift, sat_scale, val_scale] = if self.table.val_divisions < 2 {
+            lookup_2_5d(self.table, h, s)
+        } else {
+            if has_table {
+                // `encodeTable->Interpolate (Pin_real32 (v))` — pinned input
+                // cannot trip the SDK's bounds check.
+                let pinned = pin_real32_unit(v);
+                v_encoded = self
+                    .v_encode
+                    .as_ref()
+                    .expect("hasTable implies v_encode")
+                    .interpolate(pinned, "LookTable V encode")
+                    .unwrap_or(v_encoded);
+            }
+            lookup_3d(self.table, h, s, v_encoded)
+        };
+
+        h += hue_shift * (6.0 / 360.0);
+        s = {
+            let scaled = s * sat_scale;
+            if scaled > 1.0 { 1.0 } else { scaled }
+        };
+
+        // `Pin_real32 (vEncoded * valScale)` — SDK comparison-chain order
+        // (Min first, then Max): NaN -> 1.0, matching Min(NaN,1)=1.
+        v_encoded = {
+            let x = v_encoded * val_scale;
+            let min = if x < 1.0 { x } else { 1.0 };
+            if min > 0.0 { min } else { 0.0 }
+        };
+
+        let v_out = match &self.v_decode {
+            Some(dec) if has_table => dec
+                .interpolate(v_encoded, "LookTable V decode")
+                .unwrap_or(v_encoded),
+            _ => v_encoded,
+        };
+
+        let [mut r, mut g, mut b] = hsv_to_linear_rgb(h, s, v_out);
+
+        if self.overrange && self.table.val_divisions > 1 {
+            r = decode_overrange(r);
+            g = decode_overrange(g);
+            b = decode_overrange(b);
+        }
+
+        [r, g, b]
+    }
+}
+
+/// The "2.5-D" branch of `RefBaselineHueSatMap` (`dng_reference.cpp:1584-1648`):
+/// no value axis, so bilinear over (hue, sat) with wrap-around hue.
+fn lookup_2_5d(table: &LookTable, h: f32, s: f32) -> [f32; 3] {
+    let hue_divisions = table.hue_divisions;
+    let sat_divisions = table.sat_divisions;
+
+    let h_scale = if hue_divisions < 2 {
+        0.0
+    } else {
+        hue_divisions as f32 * (1.0 / 6.0)
+    };
+    let s_scale = (sat_divisions - 1) as f32;
+
+    let max_hue_index0 = hue_divisions as i32 - 1;
+    let max_sat_index0 = sat_divisions as i32 - 2;
+
+    let hue_step = sat_divisions as usize;
+
+    let h_scaled = h * h_scale;
+    let s_scaled = s * s_scale;
+
+    let mut h_index0 = h_scaled as i32;
+    let mut s_index0 = s_scaled as i32;
+    if s_index0 > max_sat_index0 {
+        s_index0 = max_sat_index0;
+    }
+    if s_index0 < 0 {
+        s_index0 = 0;
+    }
+
+    let mut h_index1 = h_index0 + 1;
+    if h_index0 >= max_hue_index0 {
+        h_index0 = max_hue_index0;
+        h_index1 = 0;
+    }
+    if h_index0 < 0 {
+        h_index0 = 0;
+        h_index1 = 1;
+    }
+
+    let h_index0 = h_index0 as usize;
+    let h_index1 = h_index1 as usize;
+    let s_index0 = s_index0 as usize;
+
+    let h_fract1 = h_scaled - h_index0 as f32;
+    let s_fract1 = s_scaled - s_index0 as f32;
+    let h_fract0 = 1.0 - h_fract1;
+    let s_fract0 = 1.0 - s_fract1;
+
+    let entry = |hue: usize, sat: usize| table.entries[hue * hue_step + sat];
+
+    let e00 = entry(h_index0, s_index0);
+    let e01 = entry(h_index1, s_index0);
+    let e10 = entry(h_index0, s_index0 + 1);
+    let e11 = entry(h_index1, s_index0 + 1);
+
+    let mut out = [0.0f32; 3];
+    for channel in 0..3 {
+        let lo0 = h_fract0 * e00[channel] + h_fract1 * e01[channel];
+        let lo1 = h_fract0 * e10[channel] + h_fract1 * e11[channel];
+        out[channel] = s_fract0 * lo0 + s_fract1 * lo1;
+    }
+    out
+}
+
+/// The 3-D branch of `RefBaselineHueSatMap` (`dng_reference.cpp:1650-1731`):
+/// trilinear with the SDK's nesting — hue-lerp pairs combined over value,
+/// then over saturation.
+fn lookup_3d(table: &LookTable, h: f32, s: f32, v_encoded: f32) -> [f32; 3] {
+    let hue_divisions = table.hue_divisions;
+    let sat_divisions = table.sat_divisions;
+    let val_divisions = table.val_divisions;
+
+    let h_scale = if hue_divisions < 2 {
+        0.0
+    } else {
+        hue_divisions as f32 * (1.0 / 6.0)
+    };
+    let s_scale = (sat_divisions - 1) as f32;
+    let v_scale = (val_divisions - 1) as f32;
+
+    let max_hue_index0 = hue_divisions as i32 - 1;
+    let max_sat_index0 = sat_divisions as i32 - 2;
+    let max_val_index0 = val_divisions as i32 - 2;
+
+    let hue_step = sat_divisions as usize;
+    let val_step = (hue_divisions as usize) * hue_step;
+
+    let h_scaled = h * h_scale;
+    let s_scaled = s * s_scale;
+    let v_scaled = v_encoded * v_scale;
+
+    let mut h_index0 = h_scaled as i32;
+    let mut s_index0 = s_scaled as i32;
+    let mut v_index0 = v_scaled as i32;
+
+    if s_index0 > max_sat_index0 {
+        s_index0 = max_sat_index0;
+    }
+    if s_index0 < 0 {
+        s_index0 = 0;
+    }
+    if v_index0 > max_val_index0 {
+        v_index0 = max_val_index0;
+    }
+    if v_index0 < 0 {
+        v_index0 = 0;
+    }
+
+    let mut h_index1 = h_index0 + 1;
+    if h_index0 >= max_hue_index0 {
+        h_index0 = max_hue_index0;
+        h_index1 = 0;
+    }
+    if h_index0 < 0 {
+        h_index0 = 0;
+        h_index1 = 1;
+    }
+
+    let h_index0 = h_index0 as usize;
+    let h_index1 = h_index1 as usize;
+    let s_index0 = s_index0 as usize;
+    let v_index0 = v_index0 as usize;
+
+    let h_fract1 = h_scaled - h_index0 as f32;
+    let s_fract1 = s_scaled - s_index0 as f32;
+    let v_fract1 = v_scaled - v_index0 as f32;
+
+    let h_fract0 = 1.0 - h_fract1;
+    let s_fract0 = 1.0 - s_fract1;
+    let v_fract0 = 1.0 - v_fract1;
+
+    // entry(v, h, s): value-outermost layout, sat innermost.
+    let entry =
+        |v_i: usize, h_i: usize, s_i: usize| table.entries[v_i * val_step + h_i * hue_step + s_i];
+
+    let e00 = entry(v_index0, h_index0, s_index0);
+    let e01 = entry(v_index0, h_index1, s_index0);
+    let e10 = entry(v_index0 + 1, h_index0, s_index0);
+    let e11 = entry(v_index0 + 1, h_index1, s_index0);
+
+    let f00 = entry(v_index0, h_index0, s_index0 + 1);
+    let f01 = entry(v_index0, h_index1, s_index0 + 1);
+    let f10 = entry(v_index0 + 1, h_index0, s_index0 + 1);
+    let f11 = entry(v_index0 + 1, h_index1, s_index0 + 1);
+
+    let mut out = [0.0f32; 3];
+    for channel in 0..3 {
+        // SDK nesting (dng_reference.cpp:1695-1731): each "hueShiftN" is a
+        // value-lerp of hue-lerps at one saturation slice; the result is the
+        // saturation lerp of the two.
+        let lo0 = v_fract0 * (h_fract0 * e00[channel] + h_fract1 * e01[channel])
+            + v_fract1 * (h_fract0 * e10[channel] + h_fract1 * e11[channel]);
+        let lo1 = v_fract0 * (h_fract0 * f00[channel] + h_fract1 * f01[channel])
+            + v_fract1 * (h_fract0 * f10[channel] + h_fract1 * f11[channel]);
+        out[channel] = s_fract0 * lo0 + s_fract1 * lo1;
+    }
+    out
 }
 
 /// Checks the fields that decide whether the table can be rendered at all.
@@ -150,7 +435,10 @@ pub(crate) fn apply_look_table(rgb: [f32; 3], table: &LookTable) -> Result<[f32;
 /// `RgbTableApplyContext` rejects unsupported primaries/gamma/gamut first.
 fn validate_render_metadata(table: &LookTable) -> Result<(), String> {
     if table.encoding != ENCODING_LINEAR && table.encoding != ENCODING_SRGB {
-        return Err(format!("unsupported LookTable encoding: {}", table.encoding));
+        return Err(format!(
+            "unsupported LookTable encoding: {}",
+            table.encoding
+        ));
     }
 
     Ok(())
@@ -193,7 +481,9 @@ fn validate_table_structure(table: &LookTable) -> Result<(), String> {
     for (index, entry) in table.entries.iter().enumerate() {
         for component in entry {
             if !component.is_finite() {
-                return Err(format!("LookTable contains non-finite entry at index {index}"));
+                return Err(format!(
+                    "LookTable contains non-finite entry at index {index}"
+                ));
             }
         }
     }
@@ -463,7 +753,12 @@ mod tests {
         let forward = linear_srgb_to_linear_prophoto();
         let inverse = linear_prophoto_to_linear_srgb();
 
-        for neutral in [[1.0f32, 1.0, 1.0], [0.18, 0.18, 0.18], [0.5, 0.5, 0.5], [0.0, 0.0, 0.0]] {
+        for neutral in [
+            [1.0f32, 1.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.5, 0.5, 0.5],
+            [0.0, 0.0, 0.0],
+        ] {
             let prophoto = mul3(forward, neutral);
             // The normalisation exists precisely so that a neutral maps to itself
             // across the hop; anything else would mean the matrices disagree on
@@ -506,7 +801,12 @@ mod tests {
 
         for probe in probes {
             let output = context.apply(probe).expect("identity apply");
-            assert_rgb_close(output, probe, IDENTITY_NO_OP_TOLERANCE, &format!("identity {probe:?}"));
+            assert_rgb_close(
+                output,
+                probe,
+                IDENTITY_NO_OP_TOLERANCE,
+                &format!("identity {probe:?}"),
+            );
         }
     }
 
@@ -620,7 +920,12 @@ mod tests {
         // so the last saturation sample (cell 2, value 30) is used. Saturation
         // CLAMPS: unlike hue it never wraps back to cell 0 (10).
         let high = lookup(&table, 0.0, 1.0, 0.0);
-        assert_close(high[1], 30.0, LOOKUP_TOLERANCE, "sat clamped to last sample");
+        assert_close(
+            high[1],
+            30.0,
+            LOOKUP_TOLERANCE,
+            "sat clamped to last sample",
+        );
         assert!(
             (high[1] - 10.0).abs() > 1.0,
             "saturation must clamp to the last sample, not wrap to cell 0"
@@ -650,7 +955,12 @@ mod tests {
         // v = 1 -> vScaled = 2 clamps the base to maxValIndex0 = 1 with fract 1.0,
         // so the last value sample (value 30) is used. Value CLAMPS.
         let high = lookup(&table, 0.0, 0.0, 1.0);
-        assert_close(high[2], 30.0, LOOKUP_TOLERANCE, "val clamped to last sample");
+        assert_close(
+            high[2],
+            30.0,
+            LOOKUP_TOLERANCE,
+            "val clamped to last sample",
+        );
         assert!(
             (high[2] - 10.0).abs() > 1.0,
             "value must clamp to the last sample, not wrap to cell 0"
@@ -681,7 +991,12 @@ mod tests {
         // And the full pipeline renders (the previous panic would surface here).
         let context = LookTableApplyContext::new(&table).expect("2.5-D context");
         let output = context.apply([0.5, 0.5, 0.5]).expect("2.5-D apply");
-        assert_rgb_close(output, [0.5, 0.5, 0.5], IDENTITY_NO_OP_TOLERANCE, "2.5-D no-op");
+        assert_rgb_close(
+            output,
+            [0.5, 0.5, 0.5],
+            IDENTITY_NO_OP_TOLERANCE,
+            "2.5-D no-op",
+        );
     }
 
     // -------------------------------------------------------------- encoding
@@ -695,7 +1010,10 @@ mod tests {
         // stage must therefore compute decode(clamp(v * valScale)) and never
         // decode(clamp(encode(v) * valScale)).
         let table = make_table(1, 2, 1, vec![[0.0, 1.0, 1.0]; 2], ENCODING_SRGB);
-        assert_eq!(table.val_divisions, 1, "this test must exercise the 2.5-D branch");
+        assert_eq!(
+            table.val_divisions, 1,
+            "this test must exercise the 2.5-D branch"
+        );
 
         let output = LookTableApplyContext::new(&table)
             .expect("2.5-D sRGB context")
@@ -706,7 +1024,12 @@ mod tests {
         // stage as decode(0.5) = ((0.5 + 0.055) / 1.055)^2.4 = 0.2140411.
         let expected = srgb_decode(0.5);
         assert_close(expected, 0.2140411, 1e-5, "hand-computed decode(0.5)");
-        assert_rgb_close(output, [expected; 3], IDENTITY_NO_OP_TOLERANCE, "unencoded 2.5-D grey");
+        assert_rgb_close(
+            output,
+            [expected; 3],
+            IDENTITY_NO_OP_TOLERANCE,
+            "unencoded 2.5-D grey",
+        );
 
         // Non-vacuity: encoding 0 skips the decode entirely, so the two encodings
         // must not agree. The old behaviour (encode *then* decode) collapsed back to
@@ -716,7 +1039,12 @@ mod tests {
             .expect("2.5-D linear context")
             .apply([0.5, 0.5, 0.5])
             .expect("apply");
-        assert_rgb_close(linear_out, [0.5; 3], IDENTITY_NO_OP_TOLERANCE, "linear 2.5-D grey");
+        assert_rgb_close(
+            linear_out,
+            [0.5; 3],
+            IDENTITY_NO_OP_TOLERANCE,
+            "linear 2.5-D grey",
+        );
         assert!(
             (output[0] - linear_out[0]).abs() > 0.2,
             "the 2.5-D sRGB branch must decode V ({} vs linear {}); an encode round trip \
@@ -731,7 +1059,12 @@ mod tests {
         // The transfer curve must round-trip on the V coordinate...
         for value in [0.0f32, 0.0031308, 0.04045, 0.18, 0.5, 1.0] {
             let round_trip = srgb_decode(srgb_encode(value));
-            assert_close(round_trip, value, 1e-6, &format!("sRGB round trip of {value}"));
+            assert_close(
+                round_trip,
+                value,
+                1e-6,
+                &format!("sRGB round trip of {value}"),
+            );
         }
 
         // ...and the stage must feed the ENCODED V into a value-varying table.
@@ -744,7 +1077,10 @@ mod tests {
         ];
 
         let encoded = make_table(1, 2, 2, entries.clone(), ENCODING_SRGB);
-        assert_eq!(encoded.val_divisions, 2, "the value axis must be interpolated");
+        assert_eq!(
+            encoded.val_divisions, 2,
+            "the value axis must be interpolated"
+        );
         let output = LookTableApplyContext::new(&encoded)
             .expect("sRGB context")
             .apply([0.25, 0.25, 0.25])
@@ -753,7 +1089,12 @@ mod tests {
         // Hand-computed: V == 0.25, encode(0.25) = 0.5370987, so valScale =
         // 1 + 0.5370987 = 1.5370987, the encoded value becomes 0.8255738 and
         // decode(0.8255738) = 0.6480849.
-        assert_rgb_close(output, [0.6480849; 3], 1e-4, "encoded V through a value-varying table");
+        assert_rgb_close(
+            output,
+            [0.6480849; 3],
+            1e-4,
+            "encoded V through a value-varying table",
+        );
 
         // encoding == 0 indexes the SAME table with V unencoded: valScale = 1.25
         // and no decode, so the stage must land on 0.25 * 1.25 = 0.3125.
@@ -762,7 +1103,12 @@ mod tests {
             .expect("linear context")
             .apply([0.25, 0.25, 0.25])
             .expect("apply");
-        assert_rgb_close(linear_out, [0.3125; 3], 1e-4, "unencoded V through the same table");
+        assert_rgb_close(
+            linear_out,
+            [0.3125; 3],
+            1e-4,
+            "unencoded V through the same table",
+        );
 
         // Non-vacuity: the two encodings disagree materially and both moved the
         // grey, so neither assertion above can hold for a stage that ignored
@@ -792,14 +1138,24 @@ mod tests {
         // r == V, so H = (g - b) / gap = -0.3 / 0.7 -> 5.5714286 and S = gap / V = 1.4.
         let [h, s, v] = linear_rgb_to_hsv([0.5, -0.2, 0.1]);
         assert_close(v, 0.5, 1e-6, "V is the maximum component");
-        assert_close(s, 1.4, 1e-5, "S = gap / V exceeds 1 for a below-zero component");
+        assert_close(
+            s,
+            1.4,
+            1e-5,
+            "S = gap / V exceeds 1 for a below-zero component",
+        );
         assert_close(h, 5.5714286, 1e-5, "H is built from the signed gap");
 
         // Non-vacuity: pinning the negative to zero first (i.e.
         // DNG_PinnedNonnegativeRGBtoHSV, dng_utils.h:915) would cap S at 1.0 and
         // move H to 5.8, so this distinguishes the pinned and unpinned paths.
         assert!(s > 1.0, "a pinned negative would cap S at 1.0, got {s}");
-        assert_close(linear_rgb_to_hsv([0.5, 0.0, 0.1])[0], 5.8, 1e-5, "pinned H would differ");
+        assert_close(
+            linear_rgb_to_hsv([0.5, 0.0, 0.1])[0],
+            5.8,
+            1e-5,
+            "pinned H would differ",
+        );
     }
 
     #[test]
@@ -810,7 +1166,10 @@ mod tests {
         assert_close(v, -0.1, 1e-6, "V is the maximum (least-negative) component");
         assert_close(s, -2.0, 1e-6, "S = gap / V is negative when V < 0");
         assert_close(h, 5.5, 1e-6, "H folds the negative (g-b)/gap into [0,6)");
-        assert!(s < 0.0, "an all-negative vector must yield a negative S, got {s}");
+        assert!(
+            s < 0.0,
+            "an all-negative vector must yield a negative S, got {s}"
+        );
 
         // Equal-negative vector: gap == 0 takes the `[0, 0, V]` branch.
         let [h, s, v] = linear_rgb_to_hsv([-0.1, -0.1, -0.1]);
@@ -893,7 +1252,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_encoding() {
         let table = make_table(1, 2, 1, vec![[0.0, 1.0, 1.0]; 2], 2);
-        let error = LookTableApplyContext::new(&table).err().expect("encoding 2 must be rejected");
+        let error = LookTableApplyContext::new(&table)
+            .err()
+            .expect("encoding 2 must be rejected");
         assert_eq!(error, "unsupported LookTable encoding: 2");
     }
 
@@ -927,7 +1288,9 @@ mod tests {
     fn rejects_malformed_entry_count() {
         let mut table = identity_table(2, 2, 2);
         table.entries.pop();
-        let error = LookTableApplyContext::new(&table).err().expect("short entry list");
+        let error = LookTableApplyContext::new(&table)
+            .err()
+            .expect("short entry list");
         assert!(
             error.contains("malformed LookTable: expected 8 entries, got 7"),
             "unexpected error: {error}"
@@ -939,8 +1302,9 @@ mod tests {
         let mut table = identity_table(2, 2, 2);
         table.entries[5] = [f32::NAN, 1.0, 1.0];
 
-        let error =
-            LookTableApplyContext::new(&table).err().expect("non-finite entry must be rejected");
+        let error = LookTableApplyContext::new(&table)
+            .err()
+            .expect("non-finite entry must be rejected");
         assert_eq!(error, "LookTable contains non-finite entry at index 5");
     }
 
