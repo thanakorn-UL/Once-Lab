@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::xmp_profile::loader::load_xmp_rgb_profile_from_path;
 use crate::xmp_profile::XmpRgbProfile;
+use crate::xmp_profile::loader::load_xmp_rgb_profile_from_path;
 
 /// Minimal, serializable description of a profile for the profile picker.
 ///
@@ -118,7 +118,8 @@ mod tests {
     fn profile_summary_exposes_amount_support_from_the_parsed_profile() {
         for (declared, expected) in [("True", true), ("False", false)] {
             let path = unique_temp_path("xmp");
-            fs::write(&path, named_profile_xmp_with_amount_support(declared)).expect("write temp xmp");
+            fs::write(&path, named_profile_xmp_with_amount_support(declared))
+                .expect("write temp xmp");
 
             let summary = inspect_xmp_profile(&path.to_string_lossy()).expect("inspect");
 
