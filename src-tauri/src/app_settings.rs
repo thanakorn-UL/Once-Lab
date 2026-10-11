@@ -550,6 +550,12 @@ pub struct AppSettings {
     /// headless runs.
     #[serde(default)]
     pub adobe_comparison_mode: Option<bool>,
+    /// Optional path to a user-supplied `.dcp` camera profile used by the
+    /// Adobe comparison pipeline for the camera transform, HueSatMap,
+    /// LookTable and ProfileToneCurve stages. `None` keeps the Rawler
+    /// color-matrix fallback (explicitly not "Adobe Standard" parity).
+    #[serde(default)]
+    pub adobe_camera_profile_path: Option<String>,
     #[serde(default)]
     pub workspace: WorkspaceState,
 }
@@ -658,6 +664,7 @@ impl Default for AppSettings {
             group_preferred_type: Some("raw".to_string()),
             always_decode_raw_thumbnails: Some(false),
             adobe_comparison_mode: Some(false),
+            adobe_camera_profile_path: None,
             workspace: WorkspaceState::default(),
         }
     }

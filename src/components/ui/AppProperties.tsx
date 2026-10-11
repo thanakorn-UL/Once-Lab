@@ -72,6 +72,8 @@ export enum Invokes {
   HandleImportPresetsFromFiles = 'handle_import_presets_from_files',
   HandleImportLegacyPresetsFromFile = 'handle_import_legacy_presets_from_file',
   ImportFiles = 'import_files',
+  InspectCameraProfile = 'inspect_camera_profile',
+  GetAdobePipelineReport = 'get_adobe_pipeline_report',
   InspectXmpProfile = 'inspect_xmp_profile',
   InvokeGenerativeReplaseWithMaskDef = 'invoke_generative_replace_with_mask_def',
   IsTetheringSupported = 'is_tethering_supported',
@@ -259,6 +261,7 @@ export interface AppSettings {
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
   adobeComparisonMode?: boolean;
+  adobeCameraProfilePath?: string | null;
   xmpProfileRoots?: string[];
   workspace?: WorkspaceState;
 }

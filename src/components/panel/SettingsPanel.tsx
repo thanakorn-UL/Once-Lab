@@ -45,8 +45,22 @@ import Text from '../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { useOsPlatform } from '../../hooks/useOsPlatform';
 import { open } from '@tauri-apps/plugin-shell';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { RotateCcw } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
+
+interface DcpSummary {
+  path: string;
+  profileName?: string | null;
+  uniqueCameraModel?: string | null;
+  illuminants: string[];
+  hasForwardMatrix: boolean;
+  hasHueSatMap: boolean;
+  hasLookTable: boolean;
+  hasToneCurve: boolean;
+  warnings: string[];
+  unsupported: string[];
+}
 
 interface ConfirmModalState {
   confirmText: string;
@@ -541,6 +555,71 @@ export default function SettingsPanel({
 
   const [isResettingLayout, setIsResettingLayout] = useState(false);
   const [layoutResetMessage, setLayoutResetMessage] = useState('');
+
+  // Adobe comparison: DCP camera profile selection + pipeline diagnostics.
+  const [dcpInspecting, setDcpInspecting] = useState(false);
+  const [dcpSummary, setDcpSummary] = useState<DcpSummary | null>(null);
+  const [dcpError, setDcpError] = useState<string | null>(null);
+  const [pipelineReport, setPipelineReport] = useState<unknown | null>(null);
+  const [reportOpen, setReportOpen] = useState(false);
+
+  const handleChooseDcp = async () => {
+    try {
+      const selection = await openDialog({
+        multiple: false,
+        filters: [{ name: 'DCP', extensions: ['dcp', 'DCP'] }],
+      });
+      if (typeof selection !== 'string') return;
+      setDcpInspecting(true);
+      setDcpError(null);
+      try {
+        const summary = await invoke<DcpSummary>(Invokes.InspectCameraProfile, { path: selection });
+        setDcpSummary(summary);
+        await onSettingsChange({ ...appSettings, adobeCameraProfilePath: selection });
+      } catch (err) {
+        setDcpSummary(null);
+        setDcpError(String(err));
+      } finally {
+        setDcpInspecting(false);
+      }
+    } catch (err) {
+      setDcpInspecting(false);
+    }
+  };
+
+  const handleClearDcp = async () => {
+    setDcpSummary(null);
+    setDcpError(null);
+    await onSettingsChange({ ...appSettings, adobeCameraProfilePath: null });
+  };
+
+  const handleToggleReport = async () => {
+    const next = !reportOpen;
+    setReportOpen(next);
+    if (next) {
+      try {
+        setPipelineReport(await invoke(Invokes.GetAdobePipelineReport, { path: null }));
+      } catch {
+        setPipelineReport(null);
+      }
+    }
+  };
+
+  // Re-inspect the stored DCP path whenever it changes (e.g. after restart)
+  // so the summary shown matches what the pipeline will actually use.
+  const dcpPath = appSettings?.adobeCameraProfilePath || null;
+  useEffect(() => {
+    if (!dcpPath || dcpSummary?.path === dcpPath) return;
+    invoke<DcpSummary>(Invokes.InspectCameraProfile, { path: dcpPath })
+      .then((summary) => {
+        setDcpSummary(summary);
+        setDcpError(null);
+      })
+      .catch((err) => {
+        setDcpSummary(null);
+        setDcpError(String(err));
+      });
+  }, [dcpPath, dcpSummary?.path]);
 
   const osPlatform = useOsPlatform();
   const [processingSettings, setProcessingSettings] = useState({
@@ -2199,6 +2278,77 @@ export default function SettingsPanel({
                           onChange={(checked) => onSettingsChange({ ...appSettings, adobeComparisonMode: checked })}
                         />
                       </SettingItem>
+
+                      <AnimatePresence>
+                        {(appSettings?.adobeComparisonMode ?? false) && (
+                          <motion.div
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.3, ease: 'easeInOut' }}
+                          >
+                            <div className="pl-4 border-l-2 border-border-color ml-1 space-y-3">
+                              <SettingItem
+                                label={t('settings.processing.preprocessing.cameraProfileDcp')}
+                                description={t('settings.processing.preprocessing.cameraProfileDcpDesc')}
+                              >
+                                <div className="flex items-center gap-2">
+                                  <Button onClick={handleChooseDcp} disabled={dcpInspecting}>
+                                    {dcpPath ? t('settings.processing.preprocessing.changeDcp') : t('settings.processing.preprocessing.chooseDcp')}
+                                  </Button>
+                                  {dcpPath && (
+                                    <Button onClick={handleClearDcp}>
+                                      {t('settings.processing.preprocessing.clearDcp')}
+                                    </Button>
+                                  )}
+                                </div>
+                              </SettingItem>
+
+                              {dcpPath && (
+                                <div className="text-xs text-text-secondary space-y-1">
+                                  <div className="truncate" title={dcpPath}>
+                                    {dcpSummary?.profileName || dcpSummary?.uniqueCameraModel || dcpPath.split('/').pop()}
+                                    {dcpSummary?.uniqueCameraModel ? ` — ${dcpSummary.uniqueCameraModel}` : ''}
+                                  </div>
+                                  {dcpSummary && (
+                                    <div>
+                                      {dcpSummary.illuminants.join(' / ')}
+                                      {dcpSummary.hasForwardMatrix ? ' · FM' : ''}
+                                      {dcpSummary.hasHueSatMap ? ' · HSM' : ''}
+                                      {dcpSummary.hasLookTable ? ' · Look' : ''}
+                                      {dcpSummary.hasToneCurve ? ' · Tone' : ''}
+                                    </div>
+                                  )}
+                                  {dcpSummary?.warnings.map((w) => (
+                                    <div key={w} className="text-yellow-500">{w}</div>
+                                  ))}
+                                  {dcpSummary?.unsupported.map((w) => (
+                                    <div key={w} className="text-yellow-500">{w}</div>
+                                  ))}
+                                  {dcpError && <div className="text-red-500">{dcpError}</div>}
+                                </div>
+                              )}
+
+                              <SettingItem
+                                label={t('settings.processing.preprocessing.dcpDiagnostics')}
+                                description={t('settings.processing.preprocessing.dcpDiagnosticsDesc')}
+                              >
+                                <Button onClick={handleToggleReport}>
+                                  {reportOpen ? t('settings.processing.preprocessing.hideReport') : t('settings.processing.preprocessing.showReport')}
+                                </Button>
+                              </SettingItem>
+
+                              {reportOpen && (
+                                <pre className="text-xs text-text-secondary bg-bg-primary rounded-md p-2 overflow-x-auto max-h-64 whitespace-pre-wrap">
+                                  {pipelineReport
+                                    ? JSON.stringify(pipelineReport, null, 2)
+                                    : t('settings.processing.preprocessing.noReport')}
+                                </pre>
+                              )}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   </div>
 

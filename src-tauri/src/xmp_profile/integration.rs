@@ -32,8 +32,9 @@
 //! linear sRGB D65
 //!   -> M: sRGB(D65) -> ProPhoto(D50)     (boundary, once per pixel)
 //!   -> LookTable (ProPhoto domain, sampled sRGB V codec)
-//!   -> [baseline tone stage: IDENTITY — the creative-profile tone curve is
-//!      a develop-parameter input Once-Lab does not model; see report]
+//!   -> baseline tone stage: the camera DCP's `ProfileToneCurve` when a DCP
+//!      is loaded (`crate::camera_profile`), otherwise the documented identity
+//!      fallback — it is evaluated here, never in the GPU curves pass
 //!   -> RGBTable  (ProPhoto domain, sampled gamma, u16 tetra kernel)
 //!   -> M: ProPhoto(D50) -> sRGB(D65)     (boundary, once per pixel)
 //! ```
@@ -164,12 +165,37 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_mode(
 /// The RAW camera calibration can deliver Linear ProPhoto D50 directly in
 /// AdobeSdk mode. When `input_is_prophoto` is true, do not re-encode the
 /// already-converted image as if it were linear sRGB.
+#[allow(dead_code)]
 pub(crate) fn apply_profile_to_three_color_pixels_with_mode_and_space(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
     ui_percent: Option<f32>,
     mode: ProfileRenderMode,
     input_is_prophoto: bool,
+) -> Result<(), String> {
+    apply_profile_to_three_color_pixels_with_mode_space_and_tone(
+        pixels,
+        profile,
+        ui_percent,
+        mode,
+        input_is_prophoto,
+        None,
+    )
+}
+
+/// The same as [`apply_profile_to_three_color_pixels_with_mode_and_space`]
+/// plus an optional baseline tone stage (the camera profile's
+/// `ProfileToneCurve`), which the DNG SDK places between the LookTable stage
+/// and the RGBTables (`dng_render.cpp:1974-1996`). `None` is the explicit
+/// identity fallback for a curve-less render.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_profile_to_three_color_pixels_with_mode_space_and_tone(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    ui_percent: Option<f32>,
+    mode: ProfileRenderMode,
+    input_is_prophoto: bool,
+    baseline_tone_curve: Option<&crate::camera_profile::spline::DngSpline>,
 ) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
@@ -180,9 +206,14 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_mode_and_space(
             }
             apply_profile_legacy(pixels, profile, amount)
         }
-        ProfileRenderMode::AdobeSdk => {
-            apply_profile_adobe_with_space(pixels, profile, amount, false, input_is_prophoto)
-        }
+        ProfileRenderMode::AdobeSdk => apply_profile_adobe_with_space(
+            pixels,
+            profile,
+            amount,
+            false,
+            input_is_prophoto,
+            baseline_tone_curve,
+        ),
     }
 }
 
@@ -244,7 +275,7 @@ pub(crate) fn apply_profile_adobe(
     amount: f32,
     is_hdr: bool,
 ) -> Result<(), String> {
-    apply_profile_adobe_with_space(pixels, profile, amount, is_hdr, false)
+    apply_profile_adobe_with_space(pixels, profile, amount, is_hdr, false, None)
 }
 
 /// Adobe scalar profile rendering from either linear sRGB (old boundary
@@ -255,6 +286,7 @@ fn apply_profile_adobe_with_space(
     amount: f32,
     is_hdr: bool,
     input_is_prophoto: bool,
+    baseline_tone_curve: Option<&crate::camera_profile::spline::DngSpline>,
 ) -> Result<(), String> {
     // Every stage context is built — and therefore fully validated, with the
     // amount resolved — before the first pixel is touched.
@@ -296,10 +328,17 @@ fn apply_profile_adobe_with_space(
             staged = context.apply(staged);
         }
 
-        // Baseline tone stage: identity. The Adobe baseline tone curve is a
-        // develop-parameters input (`dng_tone_curve` driven by contrast/
-        // exposure settings), not profile data; substituting Once-Lab's
-        // highlight compressor or an invented S-curve would be unfaithful.
+        // Baseline tone stage (`dng_render.cpp:1974-1996`: LookTable ->
+        // ProfileToneCurve -> RGBTables). Currently fed by the camera DCP's
+        // `ProfileToneCurve`; `None` is the explicit identity fallback for a
+        // curve-less render, NOT Lightroom's private PV2012 tone mapping.
+        // This stage must stay out of the GPU curves pass: the comparison
+        // output path encodes linear->sRGB only.
+        if let Some(curve) = baseline_tone_curve {
+            // `RefBaselineRGBTone` — the SDK's ratio-preserving application
+            // (`dng_render.cpp`'s `fToneCurve` dispatch), not a per-channel map.
+            curve.apply_rgb(&mut staged);
+        }
 
         if let Some(context) = &rgb_context {
             staged = context.apply(staged);
@@ -691,7 +730,7 @@ mod acceptance {
             linear_mode.clone(),
             None,
             None,
-            false,
+            None,
             None,
         )
         .expect("stage input develop");
@@ -814,7 +853,7 @@ mod acceptance {
                         linear_mode.clone(),
                         Some(&profile),
                         Some(0.0),
-                        false,
+                        None,
                         None,
                     )
                     .expect("stage 0% develop");
@@ -1272,6 +1311,121 @@ mod tests {
 
     fn max_channel_delta(a: [f32; 3], b: [f32; 3]) -> f32 {
         (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0f32, f32::max)
+    }
+
+    // --------------------------------------------------------- tone stage
+
+    /// The baseline tone stage sits BETWEEN LookTable and RGBTable
+    /// (`dng_render.cpp:1974-1996`), never after the RGBTable and never
+    /// twice. A non-commuting table (channel swap) makes the order
+    /// observable; a non-linear curve makes a double application observable.
+    #[test]
+    fn baseline_tone_curve_runs_before_rgb_table_exactly_once() {
+        use crate::camera_profile::spline::DngSpline;
+
+        // An S-shaped, strictly non-linear curve.
+        let curve = DngSpline::solve(&[(0.0, 0.0), (0.3, 0.1), (0.7, 0.9), (1.0, 1.0)])
+            .expect("tone spline");
+        let profile = XmpRgbProfile {
+            name: "Tone Test".to_string(),
+            group: None,
+            uuid: "TONE".to_string(),
+            process_version: None,
+            supports_amount: true,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: Some(1.0),
+            table: Some(channel_swap_rgb_table()),
+            look_table_id: None,
+            look_table: None,
+        };
+        let input = [0.6f32, 0.2, 0.45];
+
+        let mut pixels = vec![input];
+        apply_profile_to_three_color_pixels_with_mode_space_and_tone(
+            &mut pixels,
+            &profile,
+            Some(100.0),
+            ProfileRenderMode::AdobeSdk,
+            false,
+            Some(&curve),
+        )
+        .expect("tone pipeline");
+
+        let srgb_to_pp = crate::xmp_profile::adobe_linear_srgb_to_prophoto_matrix();
+        let pp_to_srgb = crate::xmp_profile::adobe_linear_prophoto_to_srgb_matrix();
+        let mul = |m: [[f32; 3]; 3], p: [f32; 3]| -> [f32; 3] {
+            [
+                m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2],
+                m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2],
+                m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2],
+            ]
+        };
+        let apply_tone = |mut p: [f32; 3]| {
+            curve.apply_rgb(&mut p);
+            p
+        };
+        let back = |p: [f32; 3]| mul(pp_to_srgb, p).map(|v| v.clamp(0.0, 1.0));
+
+        let rgb_context = PreparedRgbTable::new(profile.table.as_ref().unwrap(), f64::from(1.0f32))
+            .expect("rgb context");
+
+        // Staged ProPhoto input after the boundary hop.
+        let staged = mul(srgb_to_pp, input);
+
+        // Correct order: tone -> RGBTable -> boundary back.
+        let expected = back(rgb_context.apply(apply_tone(staged)));
+        assert!(
+            max_channel_delta(pixels[0], expected) < 1e-6,
+            "pipeline vs manual tone->rgb: {:?} vs {:?}",
+            pixels[0],
+            expected
+        );
+
+        // Wrong order: RGBTable -> tone.
+        let wrong = back(apply_tone(rgb_context.apply(staged)));
+        assert!(
+            max_channel_delta(pixels[0], wrong) > MATERIAL_DIFFERENCE,
+            "tone-after-rgb must differ: {:?} vs {:?}",
+            pixels[0],
+            wrong
+        );
+
+        // Double tone: tone -> tone -> RGBTable.
+        let twice = back(rgb_context.apply(apply_tone(apply_tone(staged))));
+        assert!(
+            max_channel_delta(pixels[0], twice) > MATERIAL_DIFFERENCE,
+            "double tone must differ: {:?} vs {:?}",
+            pixels[0],
+            twice
+        );
+    }
+
+    /// With no tone stage the pipeline is byte-identical to before —
+    /// the documented identity fallback must not perturb pixels.
+    #[test]
+    fn absent_tone_stage_is_exact_identity() {
+        let profile = make_profile(CONSTANT_2X2X2, Some(0.5));
+        let mut with_none = SAMPLE_PIXELS.to_vec();
+        let mut legacy = SAMPLE_PIXELS.to_vec();
+        apply_profile_to_three_color_pixels_with_mode_space_and_tone(
+            &mut with_none,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+            false,
+            None,
+        )
+        .unwrap();
+        apply_profile_to_three_color_pixels_with_mode_and_space(
+            &mut legacy,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+            false,
+        )
+        .unwrap();
+        assert_eq!(with_none, legacy);
     }
 
     // ------------------------------------------------------------ stage order

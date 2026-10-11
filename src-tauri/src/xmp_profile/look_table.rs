@@ -43,25 +43,25 @@ const LOOK_TABLE_TYPE: u32 = 0;
 const LOOK_TABLE_VERSION: u32 = 1;
 
 /// `dng_look_table::kMaxHueSamples`.
-pub(super) const MAX_HUE_DIVISIONS: u32 = 360;
+pub(crate) const MAX_HUE_DIVISIONS: u32 = 360;
 /// `dng_look_table::kMaxSatSamples`.
-pub(super) const MAX_SAT_DIVISIONS: u32 = 256;
+pub(crate) const MAX_SAT_DIVISIONS: u32 = 256;
 /// `dng_look_table::kMaxValSamples`.
-pub(super) const MAX_VAL_DIVISIONS: u32 = 256;
+pub(crate) const MAX_VAL_DIVISIONS: u32 = 256;
 /// `dng_look_table::kMaxTotalSamples` = 36 * 32 * 16.
-pub(super) const MAX_TOTAL_SAMPLES: u32 = 18432;
+pub(crate) const MAX_TOTAL_SAMPLES: u32 = 18432;
 
 /// Lower bounds mirror `dng_hue_sat_map::SetDivisions`, which Adobe calls while
 /// reading the table: at least one hue division, at least two saturation
 /// divisions, and a value-division count of zero folded up to one.
-pub(super) const MIN_HUE_DIVISIONS: u32 = 1;
-pub(super) const MIN_SAT_DIVISIONS: u32 = 2;
-pub(super) const MIN_VAL_DIVISIONS: u32 = 1;
+pub(crate) const MIN_HUE_DIVISIONS: u32 = 1;
+pub(crate) const MIN_SAT_DIVISIONS: u32 = 2;
+pub(crate) const MIN_VAL_DIVISIONS: u32 = 1;
 
 /// `encoding_Linear`.
-pub(super) const ENCODING_LINEAR: u32 = 0;
+pub(crate) const ENCODING_LINEAR: u32 = 0;
 /// `encoding_sRGB`.
-pub(super) const ENCODING_SRGB: u32 = 1;
+pub(crate) const ENCODING_SRGB: u32 = 1;
 
 /// Label woven into every LookTable error string.
 const LOOK_TABLE_LABEL: &str = "LookTable";
