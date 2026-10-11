@@ -127,6 +127,7 @@ pub(crate) fn effective_profile_amount(
 /// and the scaling all stay owned by the backend. The Amount control scales only
 /// the RGBTable amount: a LookTable is always applied at its fixed full strength,
 /// because its version-1 format carries no authored amount.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -142,6 +143,7 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
 
 /// Applies `profile` with an explicit render mode — used by tests and by the
 /// `ONCELAB_XMP_PROFILE_MODE` env override.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels_with_mode(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -229,6 +231,7 @@ fn validate_adobe_input_pixels(pixels: &[[f32; 3]]) -> Result<(), String> {
 /// (`supportOverrange`) machinery; creative XMP profiles never set it in
 /// production (they carry no `ProfileDynamicRange`), so callers pass `false`
 /// and the HDR paths are exercised by tests.
+#[cfg(test)]
 pub(crate) fn apply_profile_adobe(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -318,6 +321,7 @@ fn apply_profile_adobe_with_space(
 /// touched, so an invalid profile can never leave the image partially
 /// processed and the O(size^3) table validation never runs per pixel. No
 /// second image buffer is allocated.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
