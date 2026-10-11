@@ -1732,6 +1732,9 @@
       },
       "nativeDpi": "Renderitzar a la DPI nativa",
       "preprocessing": {
+        "adobeComparison": "Mode de comparació d'Adobe",
+        "adobeComparisonDesc": "Processa els fitxers RAW mitjançant la canonada aïllada compatible amb Adobe (espai de treball ProPhoto, sense preenfocament ni reducció de soroll, codificació de sortida simple) per a comparacions de perfils de Lightroom. S'aplica a les imatges carregades de nou.",
+        "enableAdobeComparison": "Activa el mode de comparació d'Adobe",
         "applyPreprocessing": "Aplicar preprocessament als No-RAW",
         "applyPreprocessingDesc": "Si està activat, la reducció del soroll de color base i la pre-nitidesa esmentades abans també s'aplicaran als formats estàndard.",
         "colorNr": "Reducció de soroll de color base",

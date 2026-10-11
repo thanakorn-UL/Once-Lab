@@ -1730,6 +1730,9 @@
       },
       "nativeDpi": "以原生 DPI 渲染",
       "preprocessing": {
+        "adobeComparison": "Adobe 对比模式",
+        "adobeComparisonDesc": "通过隔离的 Adobe 兼容管线处理 RAW 文件（ProPhoto 工作色彩空间，不应用预锐化或降噪，使用普通输出编码），用于 Lightroom 配置文件对比。对新加载的图像生效。",
+        "enableAdobeComparison": "启用 Adobe 对比模式",
         "applyPreprocessing": "对非 RAW 图像应用预处理",
         "applyPreprocessingDesc": "如果启用，上述基础颜色降噪和预锐化也将应用于标准格式。",
         "colorNr": "基础颜色降噪",

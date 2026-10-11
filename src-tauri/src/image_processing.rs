@@ -1897,6 +1897,14 @@ fn calculate_agx_matrices() -> (GpuMat3, GpuMat3) {
 }
 
 pub fn resolve_tonemapper_override(settings: &crate::AppSettings, is_raw: bool) -> Option<u32> {
+    // The isolated Adobe comparison pipeline owns tone processing for RAW
+    // input (RAW stage + XMP profile stages). Running the legacy RAW
+    // brightness-gamma/contrast-mix emulation - or AgX - on top of it would be
+    // a second, non-Adobe tone transform, so the plain output encoding is
+    // forced here for every preview/thumbnail/export render of a RAW file.
+    if is_raw && settings.adobe_comparison_enabled() {
+        return Some(2);
+    }
     if !settings.tonemapper_override_enabled.unwrap_or(false) {
         return None;
     }
@@ -3568,5 +3576,41 @@ mod tests {
 
         let back: ImageMetadata = serde_json::from_str(&text).expect("deserialize sidecar");
         assert_eq!(back.develop_state(), state);
+    }
+
+    // ------------------------------------------------ Adobe comparison mode
+
+    fn settings_with_adobe_comparison(enabled: bool) -> crate::AppSettings {
+        crate::AppSettings {
+            adobe_comparison_mode: Some(enabled),
+            ..crate::AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn adobe_comparison_forces_plain_output_encoding_for_raw() {
+        let settings = settings_with_adobe_comparison(true);
+        assert_eq!(
+            resolve_tonemapper_override(&settings, true),
+            Some(2),
+            "RAW in Adobe comparison mode must use the plain output encoding"
+        );
+    }
+
+    #[test]
+    fn adobe_comparison_does_not_change_non_raw_tonemapper() {
+        let settings = settings_with_adobe_comparison(true);
+        assert_eq!(
+            resolve_tonemapper_override(&settings, false),
+            None,
+            "non-RAW images are outside the comparison pipeline"
+        );
+    }
+
+    #[test]
+    fn adobe_comparison_off_leaves_tonemapper_resolution_unchanged() {
+        let settings = settings_with_adobe_comparison(false);
+        assert_eq!(resolve_tonemapper_override(&settings, true), None);
+        assert_eq!(resolve_tonemapper_override(&settings, false), None);
     }
 }

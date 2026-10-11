@@ -74,3 +74,10 @@ pub fn discover_default_xmp_profile_roots(
 pub(crate) fn adobe_linear_srgb_to_prophoto_matrix() -> [[f32; 3]; 3] {
     look_table_apply::linear_srgb_to_linear_prophoto()
 }
+
+/// Inverse of [`adobe_linear_srgb_to_prophoto_matrix`], used by the profile-less
+/// Adobe comparison baseline to hop back into the linear-sRGB working buffer
+/// at the same boundary the profiled render uses.
+pub(crate) fn adobe_linear_prophoto_to_srgb_matrix() -> [[f32; 3]; 3] {
+    look_table_apply::linear_prophoto_to_linear_srgb()
+}

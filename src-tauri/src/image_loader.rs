@@ -118,6 +118,12 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
 
     let is_raw = is_raw_file(path_for_ext_check);
 
+    // The isolated Adobe comparison pipeline controls the whole RAW stage:
+    // no highlight compressor, no post-develop noise reduction/sharpening,
+    // and (when no profile is selected) the unclipped ProPhoto calibration
+    // baseline. The normal editor path is unchanged when it is off.
+    let adobe_comparison = is_raw && settings.adobe_comparison_enabled();
+
     // A supplied profile is only meaningful for RAW input. Reject it explicitly
     // rather than silently ignoring it; this happens before any file read.
     if !is_raw && xmp_profile_path.is_some() {
@@ -154,11 +160,15 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
                 linear_mode,
                 profile_ref,
                 profile_amount_percent,
+                adobe_comparison,
                 cancel_token,
             )
         }) {
             Ok(Ok(mut image)) => {
-                if !use_fast_raw_dev && (color_nr_amount > 0.0 || sharpening_amount > 0.0) {
+                if !use_fast_raw_dev
+                    && !adobe_comparison
+                    && (color_nr_amount > 0.0 || sharpening_amount > 0.0)
+                {
                     let start = Instant::now();
                     remove_raw_artifacts_and_enhance(
                         &mut image,

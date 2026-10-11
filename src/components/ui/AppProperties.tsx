@@ -258,6 +258,7 @@ export interface AppSettings {
   groupEditedFiles?: boolean;
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
+  adobeComparisonMode?: boolean;
   xmpProfileRoots?: string[];
   workspace?: WorkspaceState;
 }

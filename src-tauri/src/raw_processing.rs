@@ -33,12 +33,20 @@ pub fn develop_raw_image(
         linear_mode,
         None,
         None,
+        false,
         cancel_token,
     )
 }
 
 /// Develops a RAW image, applying `profile` (with the optional Amount control)
 /// when one is supplied.
+///
+/// `adobe_baseline` selects the isolated Adobe comparison RAW stage for a
+/// profile-less develop: the unclipped camera -> Linear ProPhoto calibration,
+/// no highlight compression, and a ProPhoto -> linear sRGB conversion at the
+/// working-space boundary. With a profile it has no additional effect - the
+/// profile's own render mode already selects the matching upstream stage.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn develop_raw_image_with_profile(
     file_bytes: &[u8],
     fast_demosaic: bool,
@@ -46,6 +54,7 @@ pub(crate) fn develop_raw_image_with_profile(
     linear_mode: String,
     profile: Option<&crate::xmp_profile::XmpRgbProfile>,
     profile_amount_percent: Option<f32>,
+    adobe_baseline: bool,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
     let (developed_image, orientation) = develop_internal(
@@ -55,6 +64,7 @@ pub(crate) fn develop_raw_image_with_profile(
         linear_mode,
         profile,
         profile_amount_percent,
+        adobe_baseline,
         cancel_token,
     )?;
     Ok(apply_orientation(developed_image, orientation))
@@ -227,6 +237,7 @@ fn prepare_three_color_input(
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
@@ -234,6 +245,7 @@ fn develop_internal(
     linear_mode: String,
     profile: Option<&crate::xmp_profile::XmpRgbProfile>,
     profile_amount_percent: Option<f32>,
+    adobe_baseline: bool,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<(DynamicImage, Orientation)> {
     let check_cancel = || -> Result<()> {
@@ -273,10 +285,15 @@ fn develop_internal(
     // profile evaluator must use the same mode even if the environment is
     // changed while a RAW file is being developed.
     let profile_render_mode = profile.map(|_| crate::xmp_profile::profile_render_mode());
-    let preserve_for_adobe_profile = matches!(
-        profile_render_mode,
-        Some(crate::xmp_profile::ProfileRenderMode::AdobeSdk)
-    );
+    // The Adobe RAW stage runs whenever the Adobe evaluator will run, and for
+    // the profile-less baseline when the comparison mode is enabled.
+    let preserve_for_adobe_profile = match profile {
+        Some(_) => matches!(
+            profile_render_mode,
+            Some(crate::xmp_profile::ProfileRenderMode::AdobeSdk)
+        ),
+        None => adobe_baseline,
+    };
 
     let original_white_level = raw_image
         .whitelevel
@@ -411,6 +428,29 @@ fn develop_internal(
             }
             _ => {
                 return Err(anyhow!("XMP RGB profile requires ThreeColor intermediate"));
+            }
+        }
+    } else if profile_input_is_prophoto {
+        // Profile-less Adobe comparison baseline: the pixels were calibrated
+        // straight into Linear ProPhoto/D50 (signed out-of-sRGB-gamut values
+        // and highlight excursions retained). The working buffer is linear
+        // sRGB/D65, so hop there now WITHOUT clamping - the output stage's
+        // encoding owns the final pin, matching how the profiled render
+        // keeps its headroom until the same boundary.
+        if let Intermediate::ThreeColor(pixels) = &mut developed_intermediate {
+            let prophoto_to_srgb = crate::xmp_profile::adobe_linear_prophoto_to_srgb_matrix();
+            for p in &mut pixels.data {
+                *p = [
+                    prophoto_to_srgb[0][0] * p[0]
+                        + prophoto_to_srgb[0][1] * p[1]
+                        + prophoto_to_srgb[0][2] * p[2],
+                    prophoto_to_srgb[1][0] * p[0]
+                        + prophoto_to_srgb[1][1] * p[1]
+                        + prophoto_to_srgb[1][2] * p[2],
+                    prophoto_to_srgb[2][0] * p[0]
+                        + prophoto_to_srgb[2][1] * p[1]
+                        + prophoto_to_srgb[2][2] * p[2],
+                ];
             }
         }
     }

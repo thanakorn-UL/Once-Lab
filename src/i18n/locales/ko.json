@@ -1730,6 +1730,9 @@
       },
       "nativeDpi": "네이티브 DPI로 렌더링",
       "preprocessing": {
+        "adobeComparison": "Adobe 비교 모드",
+        "adobeComparisonDesc": "RAW 파일을 격리된 Adobe 호환 파이프라인(ProPhoto 작업 색 공간, 사전 선명화·노이즈 감소 없음, 단순 출력 인코딩)으로 현상하여 Lightroom 프로필 비교에 사용합니다. 새로 불러온 이미지에 적용됩니다.",
+        "enableAdobeComparison": "Adobe 비교 모드 활성화",
         "applyPreprocessing": "RAW가 아닌 이미지에 전처리 적용",
         "applyPreprocessingDesc": "활성화하면 위의 기본 색상 노이즈 감소와 사전 선명도 향상이 표준 포맷에도 적용됩니다.",
         "colorNr": "기본 색상 노이즈 감소",
