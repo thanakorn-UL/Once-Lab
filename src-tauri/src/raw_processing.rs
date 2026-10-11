@@ -78,7 +78,6 @@ fn srgb_to_linear(value: f32) -> f32 {
     }
 }
 
-
 /// Rawler's camera-matrix calibration without its final negative-channel
 /// floor. Use the same Rawler camera-to-sRGB inverse and white balance, but
 /// precompose its sRGB->ProPhoto/D50 transform ONCE, before evaluating pixels.
@@ -301,14 +300,12 @@ fn develop_internal(
     // Only Adobe mode can bypass Rawler's sRGB negative-channel clip.
     // For cameras without a standard 3-component color matrix, or when
     // calibration is intentionally disabled, keep Rawler's existing path.
-    let unclipped_calibration = if preserve_for_adobe_profile
-        && !is_linear_format
-        && apply_calibration
-    {
-        UnclippedProPhotoCalibration::for_raw(&raw_image)
-    } else {
-        None
-    };
+    let unclipped_calibration =
+        if preserve_for_adobe_profile && !is_linear_format && apply_calibration {
+            UnclippedProPhotoCalibration::for_raw(&raw_image)
+        } else {
+            None
+        };
 
     let mut developer = RawDevelop::default();
 
@@ -326,7 +323,9 @@ fn develop_internal(
     }
 
     if unclipped_calibration.is_some() {
-        developer.steps.retain(|step| *step != ProcessingStep::Calibrate);
+        developer
+            .steps
+            .retain(|step| *step != ProcessingStep::Calibrate);
     }
 
     check_cancel()?;
@@ -476,8 +475,14 @@ mod adobe_profile_upstream_tests {
         let adobe = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, true);
         let legacy = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, false);
 
-        assert_eq!(adobe, source, "Adobe profile must receive uncompressed linear highlights");
-        assert_ne!(adobe, legacy, "Legacy path must retain its existing compressor");
+        assert_eq!(
+            adobe, source,
+            "Adobe profile must receive uncompressed linear highlights"
+        );
+        assert_ne!(
+            adobe, legacy,
+            "Legacy path must retain its existing compressor"
+        );
         assert!(legacy.iter().all(|v| *v <= 3.0));
     }
 
@@ -487,7 +492,10 @@ mod adobe_profile_upstream_tests {
         let adobe = prepare_three_color_input(source, 1.0, 3.0, 3.0, true, true);
         let legacy = prepare_three_color_input(source, 1.0, 3.0, 3.0, true, false);
 
-        assert!(adobe[0] > 1.0, "do not clip encoded highlights before Adobe stage");
+        assert!(
+            adobe[0] > 1.0,
+            "do not clip encoded highlights before Adobe stage"
+        );
         assert!(legacy[0] <= 1.0, "Legacy encoded input is still pinned");
         assert!((adobe[1] - srgb_to_linear(0.5)).abs() < 1e-6);
         assert_eq!(adobe[2], 0.0);
