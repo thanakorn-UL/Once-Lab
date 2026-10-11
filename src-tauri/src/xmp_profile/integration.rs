@@ -2,8 +2,10 @@
 //!
 //! The RAW layer never reads or parses XMP itself; it receives an
 //! [`XmpRgbProfile`] as data. Application happens on the developed
-//! `Intermediate::ThreeColor` buffer, whose values are LINEAR sRGB / D65, which
-//! is exactly the domain of the Adobe RGBTable renderer.
+//! `Intermediate::ThreeColor` buffer, whose values are LINEAR sRGB / D65 after Rawler calibration. Adobe SDK
+//! mode converts them at the profile boundary to LINEAR ProPhoto / D50;
+//! Rawler's calibration and its out-of-gamut handling remain distinct from
+//! Adobe's native camera-to-ProPhoto rendering pipeline.
 //!
 //! The stage order is the one the DNG SDK uses (`dng_render.cpp`: HueSatMap ->
 //! **LookTable** -> tone curve -> **RGBTables**):
@@ -62,7 +64,7 @@ pub(crate) enum ProfileRenderMode {
 /// selects the legacy evaluator; anything else (including unset) selects the
 /// Adobe-SDK pipeline — it is the production default now that the kernel,
 /// sampled gamma and ProPhoto working-space boundary are fully implemented.
-fn profile_render_mode() -> ProfileRenderMode {
+pub(crate) fn profile_render_mode() -> ProfileRenderMode {
     match std::env::var("ONCELAB_XMP_PROFILE_MODE").as_deref() {
         Ok("legacy") => ProfileRenderMode::Legacy,
         _ => ProfileRenderMode::AdobeSdk,
@@ -191,6 +193,15 @@ fn apply_profile_legacy(
     Ok(())
 }
 
+/// Validate every source pixel up front so invalid input cannot partially
+/// transform the caller's buffer.
+fn validate_adobe_input_pixels(pixels: &[[f32; 3]]) -> Result<(), String> {
+    if pixels.iter().flat_map(|p| p.iter()).any(|v| !v.is_finite()) {
+        return Err("XMP profile input contains non-finite value".to_string());
+    }
+    Ok(())
+}
+
 /// The `AdobeSdk` evaluator: one boundary conversion into Linear ProPhoto D50,
 /// then the SDK-ordered stages, then back. `is_hdr` selects the overrange
 /// (`supportOverrange`) machinery; creative XMP profiles never set it in
@@ -223,13 +234,13 @@ pub(crate) fn apply_profile_adobe(
     let srgb_to_prophoto = linear_srgb_to_linear_prophoto();
     let prophoto_to_srgb = linear_prophoto_to_linear_srgb();
 
-    for pixel in pixels.iter_mut() {
-        for value in *pixel {
-            if !value.is_finite() {
-                return Err("XMP profile input contains non-finite value".to_string());
-            }
-        }
+    // Preflight the full input buffer *before* mutating the first pixel.
+    // The old per-pixel check could error at pixel N after pixels 0..N-1
+    // had already been changed, despite the documented atomic validation
+    // contract of the profile renderer.
+    validate_adobe_input_pixels(pixels)?;
 
+    for pixel in pixels.iter_mut() {
         // Boundary: working space -> Linear ProPhoto D50, once.
         let mut staged = mul3(srgb_to_prophoto, *pixel);
 
@@ -2180,5 +2191,26 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adobe_input_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_finite_values_in_later_pixels() {
+        let pixels = [[0.18, 0.5, 0.9], [0.3, f32::NAN, 0.8]];
+        assert_eq!(
+            validate_adobe_input_pixels(&pixels),
+            Err("XMP profile input contains non-finite value".to_string())
+        );
+        assert_eq!(pixels[0], [0.18, 0.5, 0.9]);
+    }
+
+    #[test]
+    fn accepts_finite_hdr_range_without_premature_clipping() {
+        let pixels = [[4.0, 2.0, 0.5], [16.0, 0.18, 1.25]];
+        assert_eq!(validate_adobe_input_pixels(&pixels), Ok(()));
     }
 }
