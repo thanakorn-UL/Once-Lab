@@ -114,7 +114,11 @@ impl<'a> RgbTableApplyContext<'a> {
             return Err("invalid RGBTable amount bounds".to_string());
         }
 
-        let effective_amount = f64::from(amount).clamp(table.min_amount, table.max_amount) as f32;
+        // Adobe DNG SDK dng_rgb_table::SetAmount resolves the runtime Amount
+        // in hundredth steps before applying the table's authored bounds.
+        // Resolve once per profile, never inside the per-pixel hot loop.
+        let rounded_amount = (f64::from(amount) * 100.0).round() * 0.01;
+        let effective_amount = rounded_amount.clamp(table.min_amount, table.max_amount) as f32;
 
         validate_table_structure(table)?;
 
@@ -530,6 +534,22 @@ mod tests {
         let below_min = apply_rgb_table([0.1, 0.2, 0.3], &table, -10.0).expect("amount -10.0");
 
         assert_rgb_close(below_min, at_min, 1e-6, "amount clamp to min");
+    }
+
+    #[test]
+    fn adobe_amount_rounds_to_hundredths_before_rendering() {
+        let table = table_2x2x2(CONSTANT_2X2X2, 0.0, 1.5);
+        let pixel = [0.18, 0.4, 0.7];
+
+        // The SDK's SetAmount(0.437) resolves to 0.44, not 0.437.
+        let requested = apply_rgb_table(pixel, &table, 0.437).unwrap();
+        let rounded = apply_rgb_table(pixel, &table, 0.44).unwrap();
+        assert_eq!(requested, rounded);
+
+        // Resolving to hundredths must precede clamping to min/max.
+        let min_table = table_2x2x2(CONSTANT_2X2X2, 0.257, 1.5);
+        let context = RgbTableApplyContext::new(&min_table, 0.254).unwrap();
+        assert_eq!(context.effective_amount, 0.257_f32);
     }
 
     // ------------------------------------------------------------- clipping
