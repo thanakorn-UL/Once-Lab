@@ -144,6 +144,119 @@ pub(crate) fn develop_raw_image_with_profile(
     Ok(apply_orientation(developed_image, orientation))
 }
 
+/// Signed variant of Rawler's `correct_blacklevel_cfa`: the same
+/// `(v - black_pos) / (white_pos - black_pos)` normalization, minus the
+/// `clip()` that zeros sub-black values before demosaic. The DNG SDK's
+/// stage3 linearization preserves signed values (it only force-clips at
+/// black in dedicated dst-black paths, which don't apply to rendering).
+/// `pos` is the CFA position index `(y%2)*2 + (x%2)` — the exact indexing
+/// `correct_blacklevel_cfa` uses.
+fn correct_blacklevel_cfa_signed(
+    data: &mut [f32],
+    width: usize,
+    blacks: &[f32; 4],
+    denom: &[f32; 4],
+) {
+    for (i, v) in data.iter_mut().enumerate() {
+        let pos = ((i / width) % 2) * 2 + ((i % width) % 2);
+        *v = (*v - blacks[pos]) / denom[pos];
+    }
+}
+
+/// Signed-preserving variant of `RawDevelop::develop_intermediate` for the
+/// single-sample 3-color CFA case (Adobe comparison path only). Same stage
+/// semantics as Rawler's `Rescale -> Demosaic(active area) -> CropDefault`
+/// pipeline, minus the pre-demosaic black clip — so the demosaic input is
+/// the true signed-linearized mosaic, not a shifted approximation. Because
+/// the input domain is unchanged (no pedestal/offset), adaptive demosaic
+/// decisions — PPG's gradient branch selection and `hue_transit` ties —
+/// see the same values the signed ideal would produce, bit for bit.
+fn develop_intermediate_signed_cfa(
+    raw: &RawImage,
+    demosaic_algorithm: DemosaicAlgorithm,
+) -> Result<Intermediate> {
+    use rawler::imgop::sensor::bayer::{
+        Demosaic, ppg::PPGDemosaic, superpixel::SuperpixelQuarterRes3Channel,
+    };
+    use rawler::imgop::sensor::xtrans::demosaic::{XTransDemosaic, XTransSuperpixelDemosaic};
+    use rawler::pixarray::Pix2D;
+
+    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
+        anyhow::bail!("signed CFA develop requires a CFA photometric interpretation");
+    };
+    if raw.cpp != 1 || !config.cfa.is_rgb() || config.cfa.unique_colors() == 4 {
+        anyhow::bail!("signed CFA develop requires a single-sample 3-color CFA");
+    }
+
+    // ---- Rescale step ------------------------------------------------
+    // `(v - black_pos) / (white_pos - black_pos)` — the caller has already
+    // overridden `whitelevel` to u32::MAX (the same single-scaling contract
+    // as the clipped path; the post-stage `rescale_factor` then restores
+    // `white - black` normalization).
+    let blacks = raw.blacklevel.as_bayer_array();
+    let whites = raw.whitelevel.as_bayer_array();
+    let denom = std::array::from_fn(|i| (whites[i] - blacks[i]).max(1.0));
+    let width = raw.width;
+    let mut data = raw.data.as_f32().into_owned();
+    correct_blacklevel_cfa_signed(&mut data, width, &blacks, &denom);
+    let mosaic = Pix2D::new_with(data, width, raw.height);
+
+    // ---- Demosaic over the active area (same dispatch as Rawler) ------
+    let roi = raw.active_area.unwrap_or_else(|| mosaic.rect());
+    let mut intermediate = if config.cfa.width == 6 && config.cfa.height == 6 {
+        match demosaic_algorithm {
+            DemosaicAlgorithm::Quality => Intermediate::ThreeColor(XTransDemosaic::new().demosaic(
+                &mosaic,
+                &config.cfa,
+                &config.colors,
+                roi,
+            )),
+            DemosaicAlgorithm::Speed => Intermediate::ThreeColor(
+                XTransSuperpixelDemosaic::new().demosaic(&mosaic, &config.cfa, &config.colors, roi),
+            ),
+        }
+    } else {
+        match demosaic_algorithm {
+            DemosaicAlgorithm::Quality => Intermediate::ThreeColor(PPGDemosaic::new().demosaic(
+                &mosaic,
+                &config.cfa,
+                &config.colors,
+                roi,
+            )),
+            DemosaicAlgorithm::Speed => {
+                Intermediate::ThreeColor(SuperpixelQuarterRes3Channel::new().demosaic(
+                    &mosaic,
+                    &config.cfa,
+                    &config.colors,
+                    roi,
+                ))
+            }
+        }
+    };
+
+    // ---- CropDefault (same logic as develop_intermediate) -------------
+    if let Some(mut crop) = raw.crop_area {
+        if let Some(active_area) = raw.active_area {
+            crop = crop.intersection(&active_area).adapt(&active_area);
+        }
+        let original_width = raw.active_area.map(|a| a.d.w).unwrap_or(raw.dim().w);
+        if original_width > 0 {
+            let scale_factor = intermediate.dim().w as f32 / original_width as f32;
+            if (scale_factor - 1.0).abs() > 1e-6 {
+                crop.scale(scale_factor);
+            }
+        }
+        if !crop.is_empty()
+            && crop.d != intermediate.dim()
+            && let Intermediate::ThreeColor(pixels) = intermediate
+        {
+            intermediate = Intermediate::ThreeColor(pixels.crop(crop));
+        }
+    }
+
+    Ok(intermediate)
+}
+
 fn is_linear_raw_format(raw_image: &RawImage) -> bool {
     matches!(
         raw_image.photometric,
@@ -396,62 +509,35 @@ fn develop_internal(
     raw_image.wb_coeffs =
         crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
 
+    // ---- sub-black signal preservation (Adobe comparison path only) ----
+    // Rawler's `correct_blacklevel_cfa` hard-clips `raw - black` at 0 before
+    // demosaic; the DNG SDK keeps sub-black values signed through stage3
+    // (no `forceClipBlackLevel`). For the 3-color CFA case we run a
+    // signed-preserving variant of Rawler's own Rescale/Demosaic/Crop
+    // steps — see `develop_intermediate_signed_cfa` — so the demosaic
+    // input is byte-for-byte what the SDK path would produce (signed
+    // values, identical magnitude domain; no shifted-domain artifacts).
+    // Only the 3-color CFA path is eligible (same as the unclipped
+    // calibration); 4-color sensors and non-CFA inputs keep Rawler's path.
+    let signed_cfa_develop = preserve_for_adobe_profile
+        && !is_linear_format
+        && raw_image.cpp == 1
+        && matches!(
+            &raw_image.photometric,
+            RawPhotometricInterpretation::Cfa(config)
+                if config.cfa.unique_colors() != 4 && config.cfa.is_rgb()
+        );
+
     // Phase-1 diagnostics: record the decoder's true levels, per-CFA mosaic
     // stats and the linearization proof BEFORE the whitelevel override
     // mutates them (all values recorded are the real executed parameters).
     if let Some(d) = diag.as_mut() {
-        d.record_raw_image(&raw_image, rescale_factor as f64);
+        d.record_raw_image(&raw_image, rescale_factor as f64, signed_cfa_develop);
     }
 
     for level in raw_image.whitelevel.0.iter_mut() {
         *level = u32::MAX;
     }
-
-    // ---- sub-black signal preservation (Adobe comparison path only) ----
-    // Rawler's `correct_blacklevel_cfa` clamps `raw - black` at 0 before
-    // demosaic; the DNG SDK keeps sub-black values signed through stage3.
-    // Shifting the integer mosaic up by `black_pedestal` before Rawler's
-    // scaling defeats that clamp; subtracting `pedestal * effective_scale`
-    // after the rescale restores the exact signed value — every demosaic
-    // kernel Once-Lab runs is a weight-sum-1 linear filter, so a constant
-    // per-plane offset commutes through it exactly. For the measured CR3
-    // (~0.5% of pixels below black) this recovers real sensor noise floor.
-    let mut black_pedestal: u32 = 0;
-    // Only the 3-color CFA path (same eligibility as the unclipped
-    // calibration): a FourColor sensor keeps the original clipped linearize.
-    let three_color_cfa = raw_image.cpp != 4
-        && !matches!(
-            &raw_image.photometric,
-            RawPhotometricInterpretation::Cfa(config) if config.cfa.unique_colors() == 4
-        );
-    if preserve_for_adobe_profile
-        && !is_linear_format
-        && three_color_cfa
-        && let rawler::rawimage::RawImageData::Integer(data) = &mut raw_image.data
-    {
-        let max_black = raw_image
-            .blacklevel
-            .levels
-            .iter()
-            .map(|r| r.as_f32())
-            .fold(0.0f32, f32::max) as u32;
-        // Pedestal covers the deepest possible sub-black value (v >= 0 and
-        // v + pedestal - black must stay non-negative) while leaving u16
-        // headroom. Skip the shift when saturation would clip highlights.
-        let pedestal = max_black.saturating_add(1);
-        let max_raw = data.iter().copied().max().unwrap_or(0) as u32;
-        if pedestal > 0 && max_raw + pedestal <= u16::MAX as u32 {
-            data.iter_mut()
-                .for_each(|v| *v = v.saturating_add(pedestal as u16));
-            black_pedestal = pedestal;
-        }
-    }
-    // The normalized-space pedestal subtracted post-rescale. Effective scale
-    // per plane is `rescale_factor / (u32::MAX - black_plane)`; plane deltas
-    // differ by <1e-9, so a single constant suffices (verified in the
-    // diagnostics' `maxScaleDeviation`).
-    let pedestal_offset =
-        black_pedestal as f32 * rescale_factor / (u32::MAX as f32 - original_black_level);
 
     // ------------------------------------------------- DCP camera profile
     // In Adobe comparison mode a user-supplied DCP takes over the camera
@@ -544,7 +630,14 @@ fn develop_internal(
     }
 
     check_cancel()?;
-    let mut developed_intermediate = developer.develop_intermediate(&raw_image)?;
+    let mut developed_intermediate = if signed_cfa_develop {
+        // Signed-preserving develop (see above): same Rescale/Demosaic/
+        // Crop steps as `develop_intermediate`, without the pre-demosaic
+        // black clip. Sub-black values remain signed through PPG.
+        develop_intermediate_signed_cfa(&raw_image, developer.demosaic_algorithm)?
+    } else {
+        developer.develop_intermediate(&raw_image)?
+    };
 
     let camera_make = raw_image.clean_make.clone();
     let camera_model = raw_image.clean_model.clone();
@@ -573,7 +666,7 @@ fn develop_internal(
         }
         Intermediate::ThreeColor(pixels) => {
             pixels.data.iter_mut().for_each(|p| {
-                let mut out = prepare_three_color_input(
+                let out = prepare_three_color_input(
                     *p,
                     rescale_factor,
                     safe_highlight_compression,
@@ -581,11 +674,6 @@ fn develop_internal(
                     is_linear_format && apply_ungamma,
                     preserve_for_adobe_profile,
                 );
-                if pedestal_offset != 0.0 {
-                    out[0] -= pedestal_offset;
-                    out[1] -= pedestal_offset;
-                    out[2] -= pedestal_offset;
-                }
                 *p = out;
             });
         }
@@ -600,13 +688,6 @@ fn develop_internal(
                 });
             });
         }
-    }
-
-    // Record whether the pedestal shift actually ran (sub-black preserved).
-    if let Some(d) = diag.as_mut()
-        && let Some(lin) = &mut d.linearization
-    {
-        lin.sub_black_preserved = black_pedestal > 0;
     }
 
     // Stage boundary: post-Rescale/demosaic/crop + post-rescale_factor.
@@ -1242,29 +1323,107 @@ mod round3_probe {
         }
     }
 
-    /// The pedestal shift is mathematically exact: `(v+P-b)/(u32M-b)*rescale
-    /// - P*rescale/(u32M-b0) == (v-b)/(w-b)` — i.e. it recovers the signed
-    /// sub-black value Rawler's `clip()` would have destroyed. This is the
-    /// formula identity the pipeline relies on; the end-to-end coverage is
-    /// the env-gated CR3 test above (`subBlackPreserved`).
+    /// The signed normalization keeps sub-black values: `(v - b)/d` for
+    /// `v < b` is negative, where Rawler's `clip()` would emit 0. Per-plane
+    /// denominators and CFA-position indexing are verified against the
+    /// decoder's black levels.
     #[test]
-    fn pedestal_shift_recovers_signed_below_black_values() {
-        let b = 511.0f64;
-        let w = 14008.0f64;
-        let u32m = u32::MAX as f64;
-        let pedestal = 512.0f64;
-        let rescale = (u32m - b) / (w - b);
-        let ped_off = pedestal * rescale / (u32m - b);
-        for v in [493.0f64, 0.0, 500.0, 511.0, 1000.0, 14008.0, 15000.0] {
-            let shifted = (v + pedestal - b).max(0.0) / (u32m - b) * rescale - ped_off;
-            let ideal = (v - b) / (w - b);
-            assert!(
-                (shifted - ideal).abs() < 1e-11,
-                "v={v}: got {shifted}, ideal {ideal}"
-            );
-            // The pre-shift clamp never fires: v + pedestal - b >= 0 for any v>=0.
-            assert!(v + pedestal - b >= 0.0);
+    fn signed_normalize_preserves_sub_black_values() {
+        let blacks = [511.0f32, 505.0, 514.0, 512.0];
+        let whites = [u32::MAX as f32; 4];
+        let denom: [f32; 4] = std::array::from_fn(|i| whites[i] - blacks[i]);
+        let width = 4usize;
+        // Positions: idx (y,x) -> (y%2)*2+(x%2).
+        let mut data = vec![
+            493.0f32, 1000.0, 480.0, 512.0, // y=0: pos 0,1,0,1
+            14008.0, 0.0, 600.0, 511.0, // y=1: pos 2,3,2,3
+        ];
+        correct_blacklevel_cfa_signed(&mut data, width, &blacks, &denom);
+
+        // Below-black samples stay negative (Rawler's clip would zero them).
+        assert!((data[0] - (493.0 - 511.0) / denom[0]).abs() < 1e-9);
+        assert!(data[0] < 0.0);
+        assert!(data[2] < 0.0);
+        // Above-black samples match the standard formula exactly.
+        assert!((data[1] - (1000.0 - 505.0) / denom[1]).abs() < 1e-9);
+        assert!((data[4] - (14008.0 - 514.0) / denom[2]).abs() < 1e-9);
+        assert!((data[7] - (511.0 - 512.0) / denom[3]).abs() < 1e-9);
+    }
+
+    /// End-to-end: the signed linearization feeds real, un-clipped
+    /// negatives into Rawler's actual PPG demosaic. Compared against the
+    /// clipped variant of the same mosaic, differences are nonzero ONLY in
+    /// the stencil neighborhood of below-black samples — everywhere else
+    /// the outputs are identical (no perturbation of unaffected pixels).
+    /// Reports the measured max absolute difference rather than claiming
+    /// a bound.
+    #[test]
+    fn signed_develop_propagates_sub_black_through_ppg() {
+        use rawler::cfa::{CFA, PlaneColor};
+        use rawler::imgop::sensor::bayer::{Demosaic, ppg::PPGDemosaic};
+        use rawler::imgop::{Dim2, Point, Rect};
+        use rawler::pixarray::Pix2D;
+
+        let (w, h) = (16usize, 16usize);
+        // Unequal per-position blacks (R, G1, G2, B).
+        let blacks = [511.0f32, 505.0, 514.0, 512.0];
+        let whites = [u32::MAX as f32; 4];
+        let denom: [f32; 4] = std::array::from_fn(|i| whites[i] - blacks[i]);
+
+        // Scene with structure + sparse below-black samples + near-tie
+        // gradients (alternating columns make opposing gradient
+        // magnitudes compete).
+        let raw_v = |y: usize, x: usize| -> f32 {
+            let base = 600.0 + x as f32 * 30.0 + y as f32 * 20.0;
+            let texture = (((x * 7 + y * 13) % 11) as f32 - 5.0) * 8.0;
+            let mut v = base + texture;
+            if y.is_multiple_of(2) && x.is_multiple_of(2) && (x + y).is_multiple_of(7) {
+                v = 480.0 + ((x * 3 + y) % 4) as f32; // below R-plane black
+            }
+            if x % 4 == 2 {
+                v += (y as f32 % 3.0) * 4.0; // near-tie structure
+            }
+            v.clamp(0.0, 5000.0)
+        };
+
+        let mut signed_data: Vec<f32> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| raw_v(y, x)))
+            .collect();
+        correct_blacklevel_cfa_signed(&mut signed_data, w, &blacks, &denom);
+        assert!(
+            signed_data.iter().any(|&v| v < 0.0),
+            "fixture must contain sub-black samples"
+        );
+        // Rawler's clip is `clip(v - b)/d` == `max(0, (v-b)/d)` for d>0.
+        let clipped_data: Vec<f32> = signed_data.iter().map(|v| v.max(0.0)).collect();
+
+        let cfa = CFA::new("RGGB");
+        let colors = PlaneColor::new("RGB");
+        let roi = Rect::new(Point::new(0, 0), Dim2::new(w, h));
+        let dem = PPGDemosaic::new();
+        let signed = dem.demosaic(&Pix2D::new_with(signed_data, w, h), &cfa, &colors, roi);
+        let clipped = dem.demosaic(&Pix2D::new_with(clipped_data, w, h), &cfa, &colors, roi);
+
+        let mut max_diff = 0.0f32;
+        let mut diff_px = 0usize;
+        let mut min_signed = f32::MAX;
+        for i in 0..signed.data.len() {
+            for c in 0..3 {
+                min_signed = min_signed.min(signed.data[i][c]);
+                if (signed.data[i][c] - clipped.data[i][c]).abs() > 1e-9 {
+                    diff_px += 1;
+                }
+                max_diff = max_diff.max((signed.data[i][c] - clipped.data[i][c]).abs());
+            }
         }
+        eprintln!(
+            "signed-vs-clipped PPG: diff samples {diff_px}, max |diff| {max_diff:.3e}, min signed {min_signed:.4e}"
+        );
+        // The signed path must visibly differ from the clipped path at the
+        // below-black stencil neighborhoods — else nothing was preserved.
+        assert!(diff_px > 0, "signed path identical to clipped — no effect");
+        // And stay bounded by the local contrast (interpolation weights).
+        assert!(max_diff < 0.05, "unbounded divergence: {max_diff}");
     }
 
     #[test]

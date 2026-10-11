@@ -161,19 +161,29 @@ pub struct LinearizationProof {
     /// Per-plane `(white - black)` denominator the SDK would use.
     pub sdk_denominator_per_plane: Vec<f64>,
     /// Per-plane effective scale after Rawler's correction + Once-Lab's
-    /// rescale: `rescale_factor / (u32::MAX - black)` — must equal
-    /// `1/sdk_denominator_per_plane` up to float error for correctness.
+    /// rescale: `rescale_factor / (u32::MAX - black)`. Approximates
+    /// `1/sdk_denominator_per_plane` — see `max_scale_deviation`.
     pub effective_scale_per_plane: Vec<f64>,
-    /// Max |effective_scale - 1/denominator| across planes.
+    /// Max |effective_scale - 1/denominator| across planes. This is an
+    /// ABSOLUTE scale difference; the relative error is
+    /// `deviation / ideal_scale`, dominated by the rescale applying the
+    /// plane-0 denominator `(white_0 - black_0)` to every plane while the
+    /// SDK uses each plane's own `(white_cfa - black_cfa)`. On the R5
+    /// fixture (denominators ~13497/13498) the relative error is ≈0.0074%
+    /// — a small deterministic approximation to the SDK normalization,
+    /// NOT floating-point rounding alone and distinct from the
+    /// sub-black preservation fix.
     pub max_scale_deviation: f64,
     pub single_black_subtraction: bool,
     pub single_white_scaling: bool,
-    /// Rawler clamps negatives to zero inside `correct_blacklevel_cfa`
-    /// before demosaic — the SDK preserves signed values. The count in
+    /// Whether the EXECUTED path clips `raw - black` at zero before
+    /// demosaic (Rawler's `correct_blacklevel_cfa` behavior, used by the
+    /// legacy path). The SDK preserves signed values. The count in
     /// `cfa_planes[].belowBlack` quantifies the actual impact.
     pub pre_demosaic_negative_clip: bool,
-    /// Whether Once-Lab's pedestal shift preserved the sub-black values
-    /// through that clamp (Adobe path only; `false` = pixels hit zero).
+    /// Whether the executed path ran the signed-preserving develop
+    /// (`correct_blacklevel_cfa_signed`, Adobe path only): sub-black
+    /// samples reach the demosaic input un-clipped.
     pub sub_black_preserved: bool,
     /// Count of mosaic values below their plane's black level.
     pub below_black_total: u64,
@@ -236,7 +246,9 @@ impl RawPipelineDiagnostics {
 
     /// Record the decoder-level provenance and the linearization proof.
     /// Must run BEFORE the caller mutates `whitelevel`/`blacklevel`.
-    pub fn record_raw_image(&mut self, raw: &RawImage, rescale_factor: f64) {
+    /// `signed_develop` reports whether the executed path preserved
+    /// sub-black values (signed develop) or clipped them (Rawler default).
+    pub fn record_raw_image(&mut self, raw: &RawImage, rescale_factor: f64, signed_develop: bool) {
         let blacks: Vec<f64> = raw
             .blacklevel
             .levels
@@ -321,8 +333,8 @@ impl RawPipelineDiagnostics {
                 max_scale_deviation: dev,
                 single_black_subtraction: true,
                 single_white_scaling: whites.len() == 1,
-                pre_demosaic_negative_clip: true,
-                sub_black_preserved: false,
+                pre_demosaic_negative_clip: !signed_develop,
+                sub_black_preserved: signed_develop,
                 below_black_total: below,
             });
             let _ = white0;
@@ -340,7 +352,7 @@ impl RawPipelineDiagnostics {
     ) {
         let stats = three_color_stats(name, color_space, pixels, width, height);
         self.stages.push(stats.clone());
-        self.maybe_dump_tiff(name, pixels, width, height);
+        self.maybe_dump_stage(name, color_space, pixels, width, height);
     }
 
     /// Record which tone curve actually executed at the baseline stage.
@@ -363,39 +375,97 @@ impl RawPipelineDiagnostics {
         });
     }
 
-    /// Optionally dump a stage buffer as a 16-bit sRGB-tagged TIFF so the
-    /// numbers can be inspected in a viewer. Encoding uses the shared export
-    /// encoder (same ICC + precision semantics as real exports).
-    fn maybe_dump_tiff(&mut self, name: &str, pixels: &[[f32; 3]], width: u32, height: u32) {
+    /// Optionally dump a stage buffer for inspection. Writes THREE artifacts
+    /// per boundary, because the numerical dump and a viewable image have
+    /// different colorimetric contracts:
+    ///
+    ///   `stage-<name>.f32`   — numerical dump: raw little-endian f32,
+    ///                        interleaved RGB, FULL SIGNED/RANGE content
+    ///                        (negatives and >1.0 preserved verbatim).
+    ///   `stage-<name>.json`  — sidecar: dtype, layout, dims, source
+    ///                        color space and subsampling factor.
+    ///   `stage-<name>-preview.png` — a *display preview only*: linear
+    ///                        values pinned to [0,1] then run through the
+    ///                        sRGB EOTF and tagged sRGB. NOT a pixel dump —
+    ///                        clamping and the transfer encode are applied.
+    ///
+    /// Both are downsampled to ≤1024 px on the long edge (nearest sample).
+    fn maybe_dump_stage(
+        &mut self,
+        name: &str,
+        color_space: &str,
+        pixels: &[[f32; 3]],
+        width: u32,
+        height: u32,
+    ) {
         let Some(dir) = &self.dump_dir else { return };
         let _ = std::fs::create_dir_all(dir);
-        let path = dir.join(format!("stage-{}.tiff", sanitize_name(name)));
+        let base = dir.join(format!("stage-{}", sanitize_name(name)));
 
-        // Downsample to at most 1024 px on the long edge: stage dumps are
-        // for visual inspection of the boundary, not pixel-exact archival.
         let scale = (width.max(height) as f32 / 1024.0).max(1.0);
         let dw = (width as f32 / scale).round().max(1.0) as u32;
         let dh = (height as f32 / scale).round().max(1.0) as u32;
-        let mut img = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(dw, dh);
         let sx = width as f32 / dw as f32;
         let sy = height as f32 / dh as f32;
+        let sample = |x: u32, y: u32| -> [f32; 3] {
+            pixels[((y as f32 * sy) as u32 * width + (x as f32 * sx) as u32) as usize]
+        };
+
+        // -- numerical dump: verbatim f32 (signed, unclamped) --------------
+        let mut raw = Vec::with_capacity((dw * dh * 3) as usize * 4);
         for y in 0..dh {
             for x in 0..dw {
-                let p = pixels[((y as f32 * sy) as u32 * width + (x as f32 * sx) as u32) as usize];
+                for c in sample(x, y) {
+                    raw.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        let _ = std::fs::write(base.with_extension("f32"), &raw);
+        let meta = serde_json::json!({
+            "dtype": "float32-little-endian",
+            "layout": "interleaved RGB, row-major",
+            "width": dw,
+            "height": dh,
+            "channels": 3,
+            "sourceColorSpace": color_space,
+            "sourceWidth": width,
+            "sourceHeight": height,
+            "subsample": scale,
+            "valueRange": "linear, SIGNED (negatives and >1.0 preserved)",
+            "previewNote": "the -preview.png companion is sRGB-encoded and clamped for viewing only",
+        });
+        let _ = std::fs::write(base.with_extension("json"), meta.to_string());
+
+        // -- display preview: linear -> sRGB EOTF, tagged sRGB -------------
+        let mut img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::new(dw, dh);
+        let srgb_encode = |v: f32| -> u8 {
+            let x = v.clamp(0.0, 1.0);
+            let s = if x <= 0.0031308 {
+                12.92 * x
+            } else {
+                1.055 * x.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0 + 0.5) as u8
+        };
+        for y in 0..dh {
+            for x in 0..dw {
+                let p = sample(x, y);
                 img.put_pixel(
                     x,
                     y,
-                    image::Rgb([
-                        (p[0].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16,
-                        (p[1].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16,
-                        (p[2].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16,
-                    ]),
+                    image::Rgb([srgb_encode(p[0]), srgb_encode(p[1]), srgb_encode(p[2])]),
                 );
             }
         }
-        let dyn_img = image::DynamicImage::ImageRgb16(img);
-        if let Ok(bytes) = crate::export_processing::encode_image_to_bytes(&dyn_img, "tiff", 90) {
-            let _ = std::fs::write(&path, bytes);
+        let dyn_img = image::DynamicImage::ImageRgb8(img);
+        if let Ok(bytes) = crate::export_processing::encode_image_to_bytes(&dyn_img, "png", 90) {
+            let _ = std::fs::write(
+                base.with_file_name(format!(
+                    "{}-preview.png",
+                    base.file_name().unwrap().to_string_lossy()
+                )),
+                bytes,
+            );
         }
     }
 }

@@ -2162,8 +2162,9 @@ mod tests {
                 !upscaled_only,
                 "every u16 value equal to its own u8 upscale implies an 8-bit source"
             );
-            // Exact value preservation for authored data.
-            let expected = (0 * 3000 + 1 * 700 + 1234) as u16;
+            // Exact value preservation for authored data — the authored R
+            // at (0,1) is x*3000 + y*700 + 1234 = 1934.
+            let expected: u16 = 1934;
             assert_eq!(rgb.get_pixel(0, 1).0[0], expected);
         }
     }
