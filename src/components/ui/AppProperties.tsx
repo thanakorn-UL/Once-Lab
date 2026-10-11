@@ -262,6 +262,7 @@ export interface AppSettings {
   alwaysDecodeRawThumbnails?: boolean;
   adobeComparisonMode?: boolean;
   adobeCameraProfilePath?: string | null;
+  adobeDngBaselineTone?: boolean;
   xmpProfileRoots?: string[];
   workspace?: WorkspaceState;
 }

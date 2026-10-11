@@ -556,6 +556,13 @@ pub struct AppSettings {
     /// color-matrix fallback (explicitly not "Adobe Standard" parity).
     #[serde(default)]
     pub adobe_camera_profile_path: Option<String>,
+    /// Opt-in: when the camera profile has no `ProfileToneCurve`, substitute
+    /// the DNG SDK's baked `dng_tone_curve_acr3_default` table at the baseline
+    /// tone stage. This is the documented SDK fallback — it is NOT Lightroom
+    /// Classic's private PV2012 adaptive tone mapping. Default `false` keeps
+    /// the established identity baseline.
+    #[serde(default)]
+    pub adobe_dng_baseline_tone: Option<bool>,
     #[serde(default)]
     pub workspace: WorkspaceState,
 }
@@ -568,6 +575,14 @@ impl AppSettings {
     pub fn adobe_comparison_enabled(&self) -> bool {
         self.adobe_comparison_mode.unwrap_or(false)
             || std::env::var("ONCELAB_ADOBE_COMPARISON").as_deref() == Ok("1")
+    }
+
+    /// Whether the baseline tone stage substitutes the SDK's baked
+    /// `dng_tone_curve_acr3_default` when the camera profile has none.
+    /// Off by default — opt-in only (documented, not PV2012).
+    pub fn adobe_dng_baseline_tone(&self) -> bool {
+        self.adobe_dng_baseline_tone.unwrap_or(false)
+            || std::env::var("ONCELAB_ADOBE_DNG_TONE").as_deref() == Ok("1")
     }
 }
 
@@ -665,6 +680,7 @@ impl Default for AppSettings {
             always_decode_raw_thumbnails: Some(false),
             adobe_comparison_mode: Some(false),
             adobe_camera_profile_path: None,
+            adobe_dng_baseline_tone: Some(false),
             workspace: WorkspaceState::default(),
         }
     }
