@@ -28,6 +28,8 @@
 //! encode is confined to the `valDivisions >= 2` branch: the "2.5-D" branch
 //! leaves `vEncoded = v` (`dng_reference.cpp:1584`) yet still decodes.
 
+// Some test landmarks deliberately reproduce Adobe SDK decimal constants.
+#![cfg_attr(test, allow(clippy::excessive_precision))]
 use super::adobe_apply::{decode_overrange, encode_overrange, pin_real32_unit};
 use super::linear_rgb::{
     Matrix3, PROPHOTO_RAW, SRGB_RAW, compose_working_to_primaries, invert3, mul3, to_f32,
