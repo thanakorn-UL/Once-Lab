@@ -16,6 +16,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+// Retain the public no-profile development entry point for callers outside
+// this crate, even though the current internal path uses the profile-aware API.
+#[allow(dead_code)]
 pub fn develop_raw_image(
     file_bytes: &[u8],
     fast_demosaic: bool,
