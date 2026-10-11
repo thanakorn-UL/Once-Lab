@@ -2271,8 +2271,8 @@ mod adobe_input_preflight_tests {
             look_table: None,
         };
         let prophoto = [0.18, 0.3, 0.5];
-        let expected = mul3(linear_prophoto_to_linear_srgb(), prophoto)
-            .map(|channel| channel.clamp(0.0, 1.0));
+        let expected =
+            mul3(linear_prophoto_to_linear_srgb(), prophoto).map(|channel| channel.clamp(0.0, 1.0));
         let mut pixels = [prophoto];
         apply_profile_to_three_color_pixels_with_mode_and_space(
             &mut pixels,
@@ -2283,7 +2283,10 @@ mod adobe_input_preflight_tests {
         )
         .expect("native ProPhoto Adobe pipeline");
 
-        assert_eq!(pixels[0], expected, "must not apply the sRGB boundary twice");
+        assert_eq!(
+            pixels[0], expected,
+            "must not apply the sRGB boundary twice"
+        );
     }
 
     #[test]
