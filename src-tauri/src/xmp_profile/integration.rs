@@ -453,9 +453,9 @@ mod acceptance {
         };
 
         for (pa, pr) in ra.iter().zip(rr.iter()) {
-            for c in 0..3 {
-                d.peak = d.peak.max(pr[c]);
-                d.trough = d.trough.min(pr[c]);
+            for &component in pr {
+                d.peak = d.peak.max(component);
+                d.trough = d.trough.min(component);
             }
 
             let outside = pr.iter().any(|c| *c > 1.0 || *c < 0.0);
@@ -1838,9 +1838,9 @@ mod tests {
             .expect("valid profile should apply");
 
         for (index, pixel) in pixels.iter().enumerate() {
-            for channel in 0..3 {
+            for (channel, value) in pixel.iter().enumerate() {
                 assert!(
-                    pixel[channel].is_finite(),
+                    value.is_finite(),
                     "pixel {index} channel {channel} is not finite"
                 );
             }
@@ -2028,7 +2028,8 @@ mod tests {
             "the guessed-default render must materially change the probe, else this test is vacuous"
         );
 
-        let cases: [(fn(&mut XmpRgbProfile), &str); 3] = [
+        type InvalidMetadataCase = (fn(&mut XmpRgbProfile), &'static str);
+        let cases: [InvalidMetadataCase; 3] = [
             (
                 |profile| profile.table.as_mut().expect("test table").color_space = 5,
                 "unsupported RGBTable primaries: 5",
