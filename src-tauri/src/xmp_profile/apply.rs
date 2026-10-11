@@ -661,8 +661,8 @@ mod tests {
 
         let mut trilinear = [0.0f32; 3];
         for (weight, corner) in weights.iter().zip(values.iter()) {
-            for channel in 0..3 {
-                trilinear[channel] += weight * q(*corner)[channel];
+            for (channel, value) in trilinear.iter_mut().enumerate() {
+                *value += weight * q(*corner)[channel];
             }
         }
 
