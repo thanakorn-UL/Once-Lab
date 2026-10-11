@@ -45,6 +45,10 @@
 //! Any nonzero difference, even the smallest of these, would *break* the
 //! required sRGB bit-identity if the sampled table were used.
 
+// These decimal constants reproduce Adobe's SDK transfer curves. Preserve the
+// full source precision instead of rounding constants for style lints.
+#![allow(clippy::excessive_precision)]
+#![cfg_attr(test, allow(clippy::needless_range_loop))]
 use super::linear_rgb::{
     ADOBE_RGB_RAW, DISPLAY_P3_RAW, Matrix3, Matrix3F64, PROPHOTO_RAW, REC2020_RAW, SRGB_RAW,
     compose_working_to_primaries, invert3, mul3, to_f32,
