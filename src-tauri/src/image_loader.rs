@@ -1186,7 +1186,9 @@ fn commit_loaded_image(
 mod tests {
     use super::*;
 
-    use crate::app_state::{CachedPreview, MetadataManager, ThumbnailManager, ThumbnailProgressTracker};
+    use crate::app_state::{
+        CachedPreview, MetadataManager, ThumbnailManager, ThumbnailProgressTracker,
+    };
     use crate::cache_utils::DecodedImageCache;
     use crate::camera_tethering::CameraSession;
     use image::{GrayImage, Rgb, RgbImage};
@@ -1217,7 +1219,10 @@ mod tests {
             initial_file_path: Mutex::new(None),
             pending_edit_session: Mutex::new(None),
             thumbnail_cancellation_token: Arc::new(AtomicBool::new(false)),
-            thumbnail_progress: Mutex::new(ThumbnailProgressTracker { total: 0, completed: 0 }),
+            thumbnail_progress: Mutex::new(ThumbnailProgressTracker {
+                total: 0,
+                completed: 0,
+            }),
             preview_worker_tx: Mutex::new(None),
             analytics_worker_tx: Mutex::new(None),
             mask_cache: Mutex::new(HashMap::new()),
@@ -1267,7 +1272,11 @@ mod tests {
             preview_dim: 512,
             interactive_divisor: 1.0,
         });
-        state.mask_cache.lock().unwrap().insert(7, GrayImage::new(2, 2));
+        state
+            .mask_cache
+            .lock()
+            .unwrap()
+            .insert(7, GrayImage::new(2, 2));
 
         previous
     }
@@ -1397,7 +1406,9 @@ mod tests {
         .expect("the winning request must be able to commit");
 
         let guard = state.original_image.lock().unwrap();
-        let loaded = guard.as_ref().expect("the profiled image must be installed");
+        let loaded = guard
+            .as_ref()
+            .expect("the profiled image must be installed");
         assert!(
             Arc::ptr_eq(&loaded.image, &candidate),
             "the profiled candidate must become the loaded image"

@@ -2,8 +2,10 @@
 //!
 //! The RAW layer never reads or parses XMP itself; it receives an
 //! [`XmpRgbProfile`] as data. Application happens on the developed
-//! `Intermediate::ThreeColor` buffer, whose values are LINEAR sRGB / D65, which
-//! is exactly the domain of the Adobe RGBTable renderer.
+//! `Intermediate::ThreeColor` buffer, whose values are LINEAR sRGB / D65 after Rawler calibration. Adobe SDK
+//! mode converts them at the profile boundary to LINEAR ProPhoto / D50;
+//! Rawler's calibration and its out-of-gamut handling remain distinct from
+//! Adobe's native camera-to-ProPhoto rendering pipeline.
 //!
 //! The stage order is the one the DNG SDK uses (`dng_render.cpp`: HueSatMap ->
 //! **LookTable** -> tone curve -> **RGBTables**):
@@ -62,7 +64,7 @@ pub(crate) enum ProfileRenderMode {
 /// selects the legacy evaluator; anything else (including unset) selects the
 /// Adobe-SDK pipeline — it is the production default now that the kernel,
 /// sampled gamma and ProPhoto working-space boundary are fully implemented.
-fn profile_render_mode() -> ProfileRenderMode {
+pub(crate) fn profile_render_mode() -> ProfileRenderMode {
     match std::env::var("ONCELAB_XMP_PROFILE_MODE").as_deref() {
         Ok("legacy") => ProfileRenderMode::Legacy,
         _ => ProfileRenderMode::AdobeSdk,
@@ -125,6 +127,7 @@ pub(crate) fn effective_profile_amount(
 /// and the scaling all stay owned by the backend. The Amount control scales only
 /// the RGBTable amount: a LookTable is always applied at its fixed full strength,
 /// because its version-1 format carries no authored amount.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -140,17 +143,40 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_amount(
 
 /// Applies `profile` with an explicit render mode — used by tests and by the
 /// `ONCELAB_XMP_PROFILE_MODE` env override.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels_with_mode(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
     ui_percent: Option<f32>,
     mode: ProfileRenderMode,
 ) -> Result<(), String> {
+    apply_profile_to_three_color_pixels_with_mode_and_space(
+        pixels, profile, ui_percent, mode, false,
+    )
+}
+
+/// The RAW camera calibration can deliver Linear ProPhoto D50 directly in
+/// AdobeSdk mode. When `input_is_prophoto` is true, do not re-encode the
+/// already-converted image as if it were linear sRGB.
+pub(crate) fn apply_profile_to_three_color_pixels_with_mode_and_space(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    ui_percent: Option<f32>,
+    mode: ProfileRenderMode,
+    input_is_prophoto: bool,
+) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
     match mode {
-        ProfileRenderMode::Legacy => apply_profile_legacy(pixels, profile, amount),
-        ProfileRenderMode::AdobeSdk => apply_profile_adobe(pixels, profile, amount, false),
+        ProfileRenderMode::Legacy => {
+            if input_is_prophoto {
+                return Err("Legacy XMP profile expects linear sRGB input".to_string());
+            }
+            apply_profile_legacy(pixels, profile, amount)
+        }
+        ProfileRenderMode::AdobeSdk => {
+            apply_profile_adobe_with_space(pixels, profile, amount, false, input_is_prophoto)
+        }
     }
 }
 
@@ -191,16 +217,38 @@ fn apply_profile_legacy(
     Ok(())
 }
 
+/// Validate every source pixel up front so invalid input cannot partially
+/// transform the caller's buffer.
+fn validate_adobe_input_pixels(pixels: &[[f32; 3]]) -> Result<(), String> {
+    if pixels.iter().flat_map(|p| p.iter()).any(|v| !v.is_finite()) {
+        return Err("XMP profile input contains non-finite value".to_string());
+    }
+    Ok(())
+}
+
 /// The `AdobeSdk` evaluator: one boundary conversion into Linear ProPhoto D50,
 /// then the SDK-ordered stages, then back. `is_hdr` selects the overrange
 /// (`supportOverrange`) machinery; creative XMP profiles never set it in
 /// production (they carry no `ProfileDynamicRange`), so callers pass `false`
 /// and the HDR paths are exercised by tests.
+#[cfg(test)]
 pub(crate) fn apply_profile_adobe(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
     amount: f32,
     is_hdr: bool,
+) -> Result<(), String> {
+    apply_profile_adobe_with_space(pixels, profile, amount, is_hdr, false)
+}
+
+/// Adobe scalar profile rendering from either linear sRGB (old boundary
+/// conversion) or native camera-calibrated Linear ProPhoto/D50.
+fn apply_profile_adobe_with_space(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    amount: f32,
+    is_hdr: bool,
+    input_is_prophoto: bool,
 ) -> Result<(), String> {
     // Every stage context is built — and therefore fully validated, with the
     // amount resolved — before the first pixel is touched.
@@ -223,15 +271,20 @@ pub(crate) fn apply_profile_adobe(
     let srgb_to_prophoto = linear_srgb_to_linear_prophoto();
     let prophoto_to_srgb = linear_prophoto_to_linear_srgb();
 
-    for pixel in pixels.iter_mut() {
-        for value in *pixel {
-            if !value.is_finite() {
-                return Err("XMP profile input contains non-finite value".to_string());
-            }
-        }
+    // Preflight the full input buffer *before* mutating the first pixel.
+    // The old per-pixel check could error at pixel N after pixels 0..N-1
+    // had already been changed, despite the documented atomic validation
+    // contract of the profile renderer.
+    validate_adobe_input_pixels(pixels)?;
 
-        // Boundary: working space -> Linear ProPhoto D50, once.
-        let mut staged = mul3(srgb_to_prophoto, *pixel);
+    for pixel in pixels.iter_mut() {
+        // Adobe native camera path already has ProPhoto D50 values.
+        // The compatibility/fallback path converts from linear sRGB.
+        let mut staged = if input_is_prophoto {
+            *pixel
+        } else {
+            mul3(srgb_to_prophoto, *pixel)
+        };
 
         if let Some(context) = &look_context {
             staged = context.apply(staged);
@@ -268,6 +321,7 @@ pub(crate) fn apply_profile_adobe(
 /// touched, so an invalid profile can never leave the image partially
 /// processed and the O(size^3) table validation never runs per pixel. No
 /// second image buffer is allocated.
+#[cfg(test)]
 pub(crate) fn apply_profile_to_three_color_pixels(
     pixels: &mut [[f32; 3]],
     profile: &XmpRgbProfile,
@@ -399,9 +453,9 @@ mod acceptance {
         };
 
         for (pa, pr) in ra.iter().zip(rr.iter()) {
-            for c in 0..3 {
-                d.peak = d.peak.max(pr[c]);
-                d.trough = d.trough.min(pr[c]);
+            for &component in pr {
+                d.peak = d.peak.max(component);
+                d.trough = d.trough.min(component);
             }
 
             let outside = pr.iter().any(|c| *c > 1.0 || *c < 0.0);
@@ -1784,9 +1838,9 @@ mod tests {
             .expect("valid profile should apply");
 
         for (index, pixel) in pixels.iter().enumerate() {
-            for channel in 0..3 {
+            for (channel, value) in pixel.iter().enumerate() {
                 assert!(
-                    pixel[channel].is_finite(),
+                    value.is_finite(),
                     "pixel {index} channel {channel} is not finite"
                 );
             }
@@ -1974,7 +2028,8 @@ mod tests {
             "the guessed-default render must materially change the probe, else this test is vacuous"
         );
 
-        let cases: [(fn(&mut XmpRgbProfile), &str); 3] = [
+        type InvalidMetadataCase = (fn(&mut XmpRgbProfile), &'static str);
+        let cases: [InvalidMetadataCase; 3] = [
             (
                 |profile| profile.table.as_mut().expect("test table").color_space = 5,
                 "unsupported RGBTable primaries: 5",
@@ -2180,5 +2235,91 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adobe_input_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_finite_values_in_later_pixels() {
+        let pixels = [[0.18, 0.5, 0.9], [0.3, f32::NAN, 0.8]];
+        assert_eq!(
+            validate_adobe_input_pixels(&pixels),
+            Err("XMP profile input contains non-finite value".to_string())
+        );
+        assert_eq!(pixels[0], [0.18, 0.5, 0.9]);
+    }
+
+    #[test]
+    fn accepts_finite_hdr_range_without_premature_clipping() {
+        let pixels = [[4.0, 2.0, 0.5], [16.0, 0.18, 1.25]];
+        assert_eq!(validate_adobe_input_pixels(&pixels), Ok(()));
+    }
+
+    #[test]
+    fn native_prophoto_input_skips_the_srgb_to_prophoto_boundary() {
+        // No profile op: isolate the color-space boundary independently from
+        // the actual LookTable and RGBTable kernels.
+        let profile = XmpRgbProfile {
+            name: "ProPhoto boundary test".to_string(),
+            group: None,
+            uuid: "PROPHOTO_BOUNDARY".to_string(),
+            process_version: None,
+            supports_amount: false,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: None,
+            table: None,
+            look_table_id: None,
+            look_table: None,
+        };
+        let prophoto = [0.18, 0.3, 0.5];
+        let expected =
+            mul3(linear_prophoto_to_linear_srgb(), prophoto).map(|channel| channel.clamp(0.0, 1.0));
+        let mut pixels = [prophoto];
+        apply_profile_to_three_color_pixels_with_mode_and_space(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+            true,
+        )
+        .expect("native ProPhoto Adobe pipeline");
+
+        assert_eq!(
+            pixels[0], expected,
+            "must not apply the sRGB boundary twice"
+        );
+    }
+
+    #[test]
+    fn legacy_rejects_prophoto_tagged_pixels_without_modifying_them() {
+        let profile = XmpRgbProfile {
+            name: "Legacy input contract".to_string(),
+            group: None,
+            uuid: "LEGACY_INPUT".to_string(),
+            process_version: None,
+            supports_amount: false,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: None,
+            table: None,
+            look_table_id: None,
+            look_table: None,
+        };
+        let original = [0.18, 0.3, 0.5];
+        let mut pixels = [original];
+        let err = apply_profile_to_three_color_pixels_with_mode_and_space(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::Legacy,
+            true,
+        )
+        .expect_err("Legacy renderer has an sRGB-only input contract");
+        assert!(err.contains("linear sRGB"));
+        assert_eq!(pixels[0], original);
     }
 }

@@ -112,6 +112,7 @@ impl RgbTable {
     /// exactly the way an Adobe encoder would (`round(x * 65535)` clamped).
     /// Test-fixture convenience; production tables arrive as `u16` on the wire.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_f32_nodes(
         dimensions: u32,
         size: usize,

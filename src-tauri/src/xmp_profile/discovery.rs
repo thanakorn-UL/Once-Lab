@@ -556,7 +556,8 @@ mod tests {
             &profile_xmp("Sample", Some("Group"), "UUID-A", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(entries.len(), 1);
         assert_eq!(
@@ -585,7 +586,8 @@ mod tests {
             &grayscale_profile_xmp("Mono ⛏️", "UUID-MONO"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(
             entries.len(),
@@ -615,7 +617,8 @@ mod tests {
         write_file(&dir, "photo.NEF.rrdata", "{\"tags\":[]}");
         write_file(&dir, "photo.acr", "not a profile");
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(entries.len(), 1, "only the .xmp profile may be discovered");
         assert_eq!(entries[0].name, "Sample");
@@ -637,7 +640,8 @@ mod tests {
             &profile_xmp("Mixed", None, "UUID-M", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         let mut names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         names.sort_unstable();
@@ -658,7 +662,8 @@ mod tests {
             &profile_xmp("Good", None, "UUID-G", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must survive bad files");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan must survive bad files");
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Good");
@@ -677,7 +682,8 @@ mod tests {
             &profile_xmp("Good", None, "UUID-G", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Good");
@@ -700,7 +706,8 @@ mod tests {
             &profile_xmp("Three", None, "UUID-3", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(entries.len(), 3);
 
@@ -731,7 +738,8 @@ mod tests {
             &profile_xmp("Delta", None, "UUID-4", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
         let observed: Vec<(&str, Option<&str>)> = entries
             .iter()
             .map(|entry| (entry.name.as_str(), entry.group.as_deref()))
@@ -750,7 +758,8 @@ mod tests {
         );
 
         // Repeated scans of unchanged inputs must agree.
-        let again = discover_xmp_profiles(&[dir.clone()]).expect("rescan should succeed");
+        let again =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("rescan should succeed");
         assert_eq!(entries, again);
 
         fs::remove_dir_all(&dir).expect("remove temp dir");
@@ -790,7 +799,8 @@ mod tests {
             &profile_xmp("Shared B", None, "SHARED-UUID", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
 
         assert_eq!(
             entries.len(),
@@ -828,7 +838,8 @@ mod tests {
         symlink(&external_profile, dir.join("linked.xmp")).expect("symlink to profile");
         symlink(outside.join("nested"), dir.join("linked-dir")).expect("symlink to directory");
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan should succeed");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan should succeed");
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
 
         assert_eq!(
@@ -846,7 +857,7 @@ mod tests {
         let dir = unique_temp_dir();
         let missing = dir.join("does-not-exist");
 
-        let error = discover_xmp_profiles(&[missing.clone()])
+        let error = discover_xmp_profiles(std::slice::from_ref(&missing))
             .expect_err("a missing root must fail the scan");
 
         assert!(
@@ -855,7 +866,7 @@ mod tests {
         );
 
         let file_root = write_file(&dir, "not-a-dir.xmp", &preset_xmp());
-        let error = discover_xmp_profiles(&[file_root.clone()])
+        let error = discover_xmp_profiles(std::slice::from_ref(&file_root))
             .expect_err("a file passed as root must fail the scan");
         assert!(
             error.contains(&file_root.to_string_lossy().to_string()),
@@ -971,7 +982,7 @@ mod tests {
             &profile_xmp("Real ⛏️", Some("Group"), "UUID-REAL", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+        let entries = discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan must succeed");
         assert_eq!(
             entries.len(),
             1,
@@ -1019,7 +1030,8 @@ mod tests {
             &profile_xmp("Good", None, "UUID-G", "True"),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must survive bad files");
+        let entries =
+            discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan must survive bad files");
 
         assert_eq!(
             entries.len(),
@@ -1132,7 +1144,7 @@ mod tests {
             "good.xmp",
             &profile_xmp("Good", None, "UUID-G", "True"),
         );
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+        let entries = discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan must succeed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Good");
 
@@ -1155,7 +1167,7 @@ mod tests {
             ),
         );
 
-        let entries = discover_xmp_profiles(&[dir.clone()]).expect("scan must succeed");
+        let entries = discover_xmp_profiles(std::slice::from_ref(&dir)).expect("scan must succeed");
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Authoritative Name");
