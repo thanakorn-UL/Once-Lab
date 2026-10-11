@@ -74,6 +74,71 @@ fn srgb_to_linear(value: f32) -> f32 {
     }
 }
 
+
+/// Prepare a calibrated linear-sRGB pixel for the profile stage.
+///
+/// Rawler's `Calibrate` step converts camera RGB into linear sRGB/D65. The
+/// Adobe-SDK renderer subsequently converts this to ProPhoto/D50. In Adobe
+/// mode, retain values above 1.0 and their channel ratios until the
+/// RGBTable/LookTable stage performs its own SDK-defined gamut handling.
+/// The original Once-Lab highlight compressor remains unchanged for the
+/// normal editor path and the explicit Legacy XMP renderer.
+fn prepare_three_color_input(
+    mut rgb: [f32; 3],
+    rescale_factor: f32,
+    safe_highlight_compression: f32,
+    clamp_limit: f32,
+    undo_srgb_encoding: bool,
+    preserve_for_adobe_profile: bool,
+) -> [f32; 3] {
+    for value in &mut rgb {
+        *value = (*value * rescale_factor).max(0.0);
+        if undo_srgb_encoding {
+            let encoded = if preserve_for_adobe_profile {
+                *value
+            } else {
+                value.clamp(0.0, 1.0)
+            };
+            *value = srgb_to_linear(encoded);
+        }
+    }
+
+    if preserve_for_adobe_profile {
+        return rgb;
+    }
+
+    let [r, g, b] = rgb;
+    let max_c = r.max(g).max(b);
+    let (final_r, final_g, final_b) = if max_c > 1.0 {
+        let min_c = r.min(g).min(b);
+        let compression_factor =
+            (1.0 - (max_c - 1.0) / (safe_highlight_compression - 1.0)).clamp(0.0, 1.0);
+        let compressed_r = min_c + (r - min_c) * compression_factor;
+        let compressed_g = min_c + (g - min_c) * compression_factor;
+        let compressed_b = min_c + (b - min_c) * compression_factor;
+        let compressed_max = compressed_r.max(compressed_g).max(compressed_b);
+
+        if compressed_max > 1e-6 {
+            let rescale = max_c / compressed_max;
+            (
+                compressed_r * rescale,
+                compressed_g * rescale,
+                compressed_b * rescale,
+            )
+        } else {
+            (max_c, max_c, max_c)
+        }
+    } else {
+        (r, g, b)
+    };
+
+    [
+        final_r.clamp(0.0, clamp_limit),
+        final_g.clamp(0.0, clamp_limit),
+        final_b.clamp(0.0, clamp_limit),
+    ]
+}
+
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
@@ -115,6 +180,15 @@ fn develop_internal(
         "gamma_skip_calib" => (true, false),
         _ => (false, true),
     };
+
+    // Resolve the render mode once. The highlight preprocessing and the
+    // profile evaluator must use the same mode even if the environment is
+    // changed while a RAW file is being developed.
+    let profile_render_mode = profile.map(|_| crate::xmp_profile::profile_render_mode());
+    let preserve_for_adobe_profile = matches!(
+        profile_render_mode,
+        Some(crate::xmp_profile::ProfileRenderMode::AdobeSdk)
+    );
 
     let original_white_level = raw_image
         .whitelevel
@@ -181,44 +255,14 @@ fn develop_internal(
         }
         Intermediate::ThreeColor(pixels) => {
             pixels.data.iter_mut().for_each(|p| {
-                let mut r = (p[0] * rescale_factor).max(0.0);
-                let mut g = (p[1] * rescale_factor).max(0.0);
-                let mut b = (p[2] * rescale_factor).max(0.0);
-
-                if is_linear_format && apply_ungamma {
-                    r = srgb_to_linear(r.clamp(0.0, 1.0));
-                    g = srgb_to_linear(g.clamp(0.0, 1.0));
-                    b = srgb_to_linear(b.clamp(0.0, 1.0));
-                }
-
-                let max_c = r.max(g).max(b);
-
-                let (final_r, final_g, final_b) = if max_c > 1.0 {
-                    let min_c = r.min(g).min(b);
-                    let compression_factor =
-                        (1.0 - (max_c - 1.0) / (safe_highlight_compression - 1.0)).clamp(0.0, 1.0);
-                    let compressed_r = min_c + (r - min_c) * compression_factor;
-                    let compressed_g = min_c + (g - min_c) * compression_factor;
-                    let compressed_b = min_c + (b - min_c) * compression_factor;
-                    let compressed_max = compressed_r.max(compressed_g).max(compressed_b);
-
-                    if compressed_max > 1e-6 {
-                        let rescale = max_c / compressed_max;
-                        (
-                            compressed_r * rescale,
-                            compressed_g * rescale,
-                            compressed_b * rescale,
-                        )
-                    } else {
-                        (max_c, max_c, max_c)
-                    }
-                } else {
-                    (r, g, b)
-                };
-
-                p[0] = final_r.clamp(0.0, clamp_limit);
-                p[1] = final_g.clamp(0.0, clamp_limit);
-                p[2] = final_b.clamp(0.0, clamp_limit);
+                *p = prepare_three_color_input(
+                    *p,
+                    rescale_factor,
+                    safe_highlight_compression,
+                    clamp_limit,
+                    is_linear_format && apply_ungamma,
+                    preserve_for_adobe_profile,
+                );
             });
         }
         Intermediate::FourColor(pixels) => {
@@ -237,19 +281,13 @@ fn develop_internal(
     if let Some(profile) = profile {
         match &mut developed_intermediate {
             Intermediate::ThreeColor(pixels) => {
-                let applied = match profile_amount_percent {
-                    Some(percent) => {
-                        crate::xmp_profile::apply_profile_to_three_color_pixels_with_amount(
-                            &mut pixels.data,
-                            profile,
-                            Some(percent),
-                        )
-                    }
-                    None => crate::xmp_profile::apply_profile_to_three_color_pixels(
-                        &mut pixels.data,
-                        profile,
-                    ),
-                };
+                let mode = profile_render_mode.expect("profile implies resolved render mode");
+                let applied = crate::xmp_profile::apply_profile_to_three_color_pixels_with_mode(
+                    &mut pixels.data,
+                    profile,
+                    profile_amount_percent,
+                    mode,
+                );
 
                 applied.map_err(|error| anyhow!(error))?;
             }
@@ -310,4 +348,39 @@ pub fn get_fast_demosaic_scale_factor(
         }
     }
     1.0
+}
+
+#[cfg(test)]
+mod adobe_profile_upstream_tests {
+    use super::*;
+
+    #[test]
+    fn adobe_profile_preserves_highlight_channel_ratios_before_lut() {
+        let source = [4.0, 1.25, 0.5];
+        let adobe = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, true);
+        let legacy = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, false);
+
+        assert_eq!(adobe, source, "Adobe profile must receive uncompressed linear highlights");
+        assert_ne!(adobe, legacy, "Legacy path must retain its existing compressor");
+        assert!(legacy.iter().all(|v| *v <= 3.0));
+    }
+
+    #[test]
+    fn adobe_profile_ungamma_preserves_values_above_one() {
+        let source = [2.0, 0.5, 0.0];
+        let adobe = prepare_three_color_input(source, 1.0, 3.0, 3.0, true, true);
+        let legacy = prepare_three_color_input(source, 1.0, 3.0, 3.0, true, false);
+
+        assert!(adobe[0] > 1.0, "do not clip encoded highlights before Adobe stage");
+        assert!(legacy[0] <= 1.0, "Legacy encoded input is still pinned");
+        assert!((adobe[1] - srgb_to_linear(0.5)).abs() < 1e-6);
+        assert_eq!(adobe[2], 0.0);
+    }
+
+    #[test]
+    fn editor_without_adobe_profile_uses_legacy_highlight_behavior() {
+        let source = [0.18, 0.5, 0.95];
+        let processed = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, false);
+        assert_eq!(processed, source);
+    }
 }
