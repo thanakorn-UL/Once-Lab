@@ -148,11 +148,33 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_mode(
     ui_percent: Option<f32>,
     mode: ProfileRenderMode,
 ) -> Result<(), String> {
+    apply_profile_to_three_color_pixels_with_mode_and_space(
+        pixels, profile, ui_percent, mode, false,
+    )
+}
+
+/// The RAW camera calibration can deliver Linear ProPhoto D50 directly in
+/// AdobeSdk mode. When `input_is_prophoto` is true, do not re-encode the
+/// already-converted image as if it were linear sRGB.
+pub(crate) fn apply_profile_to_three_color_pixels_with_mode_and_space(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    ui_percent: Option<f32>,
+    mode: ProfileRenderMode,
+    input_is_prophoto: bool,
+) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
     match mode {
-        ProfileRenderMode::Legacy => apply_profile_legacy(pixels, profile, amount),
-        ProfileRenderMode::AdobeSdk => apply_profile_adobe(pixels, profile, amount, false),
+        ProfileRenderMode::Legacy => {
+            if input_is_prophoto {
+                return Err("Legacy XMP profile expects linear sRGB input".to_string());
+            }
+            apply_profile_legacy(pixels, profile, amount)
+        }
+        ProfileRenderMode::AdobeSdk => {
+            apply_profile_adobe_with_space(pixels, profile, amount, false, input_is_prophoto)
+        }
     }
 }
 
@@ -213,6 +235,18 @@ pub(crate) fn apply_profile_adobe(
     amount: f32,
     is_hdr: bool,
 ) -> Result<(), String> {
+    apply_profile_adobe_with_space(pixels, profile, amount, is_hdr, false)
+}
+
+/// Adobe scalar profile rendering from either linear sRGB (old boundary
+/// conversion) or native camera-calibrated Linear ProPhoto/D50.
+fn apply_profile_adobe_with_space(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    amount: f32,
+    is_hdr: bool,
+    input_is_prophoto: bool,
+) -> Result<(), String> {
     // Every stage context is built — and therefore fully validated, with the
     // amount resolved — before the first pixel is touched.
     let rgb_context = match &profile.table {
@@ -241,8 +275,13 @@ pub(crate) fn apply_profile_adobe(
     validate_adobe_input_pixels(pixels)?;
 
     for pixel in pixels.iter_mut() {
-        // Boundary: working space -> Linear ProPhoto D50, once.
-        let mut staged = mul3(srgb_to_prophoto, *pixel);
+        // Adobe native camera path already has ProPhoto D50 values.
+        // The compatibility/fallback path converts from linear sRGB.
+        let mut staged = if input_is_prophoto {
+            *pixel
+        } else {
+            mul3(srgb_to_prophoto, *pixel)
+        };
 
         if let Some(context) = &look_context {
             staged = context.apply(staged);
