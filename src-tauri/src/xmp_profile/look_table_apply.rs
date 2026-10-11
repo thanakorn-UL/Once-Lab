@@ -163,10 +163,41 @@ pub(crate) fn apply_look_table(rgb: [f32; 3], table: &LookTable) -> Result<[f32;
 // when `valDivisions > 1`, `DecodeOverrange` after HSV->RGB under the same
 // gate (`dng_reference.cpp:1562-1579, 1745-1753`).
 
+/// Either a borrowed or an owned [`LookTable`]. The camera-profile stage owns
+/// its interpolated HueSatMap (it does not outlive the renderer), while the
+/// XMP stage borrows the profile's table directly.
+pub(crate) enum LookTableSource<'a> {
+    Borrowed(&'a LookTable),
+    Owned(Box<LookTable>),
+}
+
+impl std::ops::Deref for LookTableSource<'_> {
+    type Target = LookTable;
+    fn deref(&self) -> &LookTable {
+        match self {
+            Self::Borrowed(table) => table,
+            Self::Owned(table) => table,
+        }
+    }
+}
+
+impl<'a> From<&'a LookTable> for LookTableSource<'a> {
+    fn from(table: &'a LookTable) -> Self {
+        Self::Borrowed(table)
+    }
+}
+
+/// An owned table satisfies any lifetime the context is parameterized on.
+impl<'a> From<LookTable> for LookTableSource<'a> {
+    fn from(table: LookTable) -> Self {
+        Self::Owned(Box::new(table))
+    }
+}
+
 /// Prepared LookTable evaluator for Adobe-SDK mode. Validated once, applied
 /// per pixel in Linear ProPhoto D50.
 pub(crate) struct LookTableAdobeContext<'a> {
-    table: &'a LookTable,
+    table: LookTableSource<'a>,
     /// Sampled V encode/decode — present iff `encoding == encoding_sRGB`,
     /// mirroring `hasTable` (both tables built or neither).
     v_encode: Option<SampledTable>,
@@ -175,9 +206,25 @@ pub(crate) struct LookTableAdobeContext<'a> {
 }
 
 impl<'a> LookTableAdobeContext<'a> {
-    pub(crate) fn new(table: &'a LookTable, overrange: bool) -> Result<Self, String> {
-        validate_render_metadata(table)?;
-        validate_table_structure(table)?;
+    pub(crate) fn new(
+        table: impl Into<LookTableSource<'a>>,
+        overrange: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_cap(table, MAX_TOTAL_SAMPLES as usize, overrange)
+    }
+
+    /// [`Self::new`] with an explicit sample-count cap. XMP LookTables keep
+    /// the wire-format `MAX_TOTAL_SAMPLES` bound; DCP `ProfileLookTableData`/
+    /// `ProfileHueSatMapData*` tables are held to the DNG-appropriate bound
+    /// (real Adobe tables reach ~43k samples).
+    pub(crate) fn new_with_cap(
+        table: impl Into<LookTableSource<'a>>,
+        max_samples: usize,
+        overrange: bool,
+    ) -> Result<Self, String> {
+        let table = table.into();
+        validate_render_metadata(&table)?;
+        validate_table_structure_with_cap(&table, max_samples)?;
 
         let (v_encode, v_decode) = if table.encoding == ENCODING_SRGB {
             (
@@ -221,7 +268,7 @@ impl<'a> LookTableAdobeContext<'a> {
         let mut v_encoded = v;
 
         let [hue_shift, sat_scale, val_scale] = if self.table.val_divisions < 2 {
-            lookup_2_5d(self.table, h, s)
+            lookup_2_5d(&self.table, h, s)
         } else {
             if has_table {
                 // `encodeTable->Interpolate (Pin_real32 (v))` — pinned input
@@ -234,7 +281,7 @@ impl<'a> LookTableAdobeContext<'a> {
                     .interpolate(pinned, "LookTable V encode")
                     .unwrap_or(v_encoded);
             }
-            lookup_3d(self.table, h, s, v_encoded)
+            lookup_3d(&self.table, h, s, v_encoded)
         };
 
         h += hue_shift * (6.0 / 360.0);
@@ -447,6 +494,10 @@ fn validate_render_metadata(table: &LookTable) -> Result<(), String> {
 }
 
 fn validate_table_structure(table: &LookTable) -> Result<(), String> {
+    validate_table_structure_with_cap(table, MAX_TOTAL_SAMPLES as usize)
+}
+
+fn validate_table_structure_with_cap(table: &LookTable, max_samples: usize) -> Result<(), String> {
     record_full_table_validation();
 
     let hue = table.hue_divisions;
@@ -464,9 +515,9 @@ fn validate_table_structure(table: &LookTable) -> Result<(), String> {
     }
 
     let total = u64::from(hue) * u64::from(sat) * u64::from(val);
-    if total > u64::from(MAX_TOTAL_SAMPLES) {
+    if total > max_samples as u64 {
         return Err(format!(
-            "LookTable sample count {total} exceeds supported maximum {MAX_TOTAL_SAMPLES}"
+            "LookTable sample count {total} exceeds supported maximum {max_samples}"
         ));
     }
 

@@ -13,6 +13,7 @@ mod android_integration;
 mod app_settings;
 mod app_state;
 mod cache_utils;
+mod camera_profile;
 mod camera_tethering;
 mod culling;
 mod denoising;
@@ -27,6 +28,7 @@ mod formats;
 mod gpu_processing;
 mod guided_perspective;
 mod hdr_deghosting;
+mod icc;
 mod image_loader;
 mod image_processing;
 mod inpainting;
@@ -1324,6 +1326,13 @@ async fn generate_preview_for_path(
         let is_raw = is_raw_file(&source_path_str);
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
+        if is_raw && settings.adobe_comparison_enabled() {
+            crate::camera_profile::annotate_lens_status(
+                &source_path_str,
+                crate::camera_profile::lens_status_from_adjustments(&js_adjustments),
+            );
+        }
+
         let base_image = match read_file_mapped(&source_path) {
             Ok(mmap) => load_and_composite(
                 &mmap,
@@ -2145,6 +2154,8 @@ pub fn run() {
             xmp_profile::inspect_xmp_profile,
             xmp_profile::discover_xmp_profiles,
             xmp_profile::discover_default_xmp_profile_roots,
+            camera_profile::inspect_camera_profile,
+            camera_profile::get_adobe_pipeline_report,
             develop_state_io::resolve_image_develop_profile,
             develop_state_io::save_image_develop_profile,
             develop_state_io::save_develop_profile_for_paths,

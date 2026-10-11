@@ -152,6 +152,27 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
     if is_raw {
         let profile_ref = profile.as_ref();
 
+        // Adobe comparison context: the user's selected DCP camera profile
+        // (if any) and the source path for the diagnostic report.
+        let dcp_path = if adobe_comparison {
+            settings
+                .adobe_camera_profile_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from)
+        } else {
+            None
+        };
+        let adobe_ctx = crate::raw_processing::AdobeRawContext {
+            camera_profile_path: dcp_path.as_deref(),
+            source_path: Some(path_for_ext_check),
+        };
+        let adobe_ctx = if adobe_comparison {
+            Some(adobe_ctx)
+        } else {
+            None
+        };
+
         match panic::catch_unwind(move || {
             crate::raw_processing::develop_raw_image_with_profile(
                 bytes,
@@ -160,7 +181,7 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
                 linear_mode,
                 profile_ref,
                 profile_amount_percent,
-                adobe_comparison,
+                adobe_ctx.as_ref(),
                 cancel_token,
             )
         }) {

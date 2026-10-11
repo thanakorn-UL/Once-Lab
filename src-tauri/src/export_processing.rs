@@ -23,6 +23,7 @@ use crate::file_management::{
     generate_filename_from_template, parse_virtual_path, read_file_mapped,
 };
 use crate::formats::is_raw_file;
+use crate::gpu_processing::process_and_get_dynamic_image_with_depth;
 use crate::image_loader::{
     composite_patches_on_image, load_and_composite, load_base_image_from_bytes,
 };
@@ -418,6 +419,7 @@ fn process_image_for_export_pipeline(
     is_raw: bool,
     debug_tag: &str,
     app_handle: &tauri::AppHandle,
+    output_extension: &str,
 ) -> Result<DynamicImage, String> {
     let (transformed_image, unscaled_crop_offset) =
         apply_all_transformations(Cow::Borrowed(base_image), js_adjustments);
@@ -452,7 +454,17 @@ fn process_image_for_export_pipeline(
 
     let unique_hash = calculate_full_job_hash(path, js_adjustments);
 
-    process_and_get_dynamic_image(
+    // TIFF exports keep the GPU pipeline's native half precision — the
+    // readback renders the identical shader into an rgba16float tile
+    // instead of routing through the RGBA8 store. Every other format
+    // keeps the unchanged U8 path (no behavioral difference).
+    let output_depth = if matches!(output_extension, "tif" | "tiff") {
+        crate::gpu_processing::OutputDepth::F16
+    } else {
+        crate::gpu_processing::OutputDepth::U8
+    };
+
+    process_and_get_dynamic_image_with_depth(
         context,
         state,
         transformed_image.as_ref(),
@@ -464,6 +476,7 @@ fn process_image_for_export_pipeline(
             roi: None,
         },
         debug_tag,
+        output_depth,
     )
 }
 
@@ -553,6 +566,7 @@ fn process_image_for_export(
     state: &tauri::State<AppState>,
     is_raw: bool,
     app_handle: &tauri::AppHandle,
+    output_extension: &str,
 ) -> Result<DynamicImage, String> {
     let processed_image = process_image_for_export_pipeline(
         path,
@@ -563,6 +577,7 @@ fn process_image_for_export(
         is_raw,
         "process_image_for_export",
         app_handle,
+        output_extension,
     )?;
 
     apply_export_resize_and_watermark(processed_image, export_settings)
@@ -651,19 +666,41 @@ fn encode_image_to_bytes(
                 .map_err(|e| e.to_string())?;
         }
         "png" => {
+            use image::ImageEncoder as _;
+
+            // SDR exports are always sRGB-encoded pixel data; tag the file
+            // accordingly. When the image has an alpha channel that is
+            // uniformly opaque, emit RGB (Lightroom-style exports are RGB).
+            let mut encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+            encoder
+                .set_icc_profile(crate::icc::srgb_icc_profile())
+                .map_err(|e| e.to_string())?;
             let image_to_encode = if image.as_rgb32f().is_some() {
                 DynamicImage::ImageRgb16(image.to_rgb16())
             } else {
-                image.clone()
+                let rgba = image.to_rgba8();
+                if rgba.pixels().all(|p| p.0[3] == u8::MAX) {
+                    DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).to_rgb8())
+                } else {
+                    DynamicImage::ImageRgba8(rgba)
+                }
             };
-
             image_to_encode
-                .write_to(&mut cursor, image::ImageFormat::Png)
+                .write_with_encoder(encoder)
                 .map_err(|e| e.to_string())?;
         }
-        "tiff" => {
+        "tif" | "tiff" => {
+            use image::ImageEncoder as _;
+
+            // 16-bit TIFF in sRGB, ICC-tagged via the TIFF ICCProfile field.
+            // ImageRgba16 inputs (the F16 GPU export readback) carry real
+            // half-precision values; `to_rgb16` preserves them.
+            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut cursor);
+            encoder
+                .set_icc_profile(crate::icc::srgb_icc_profile())
+                .map_err(|e| e.to_string())?;
             DynamicImage::ImageRgb16(image.to_rgb16())
-                .write_to(&mut cursor, image::ImageFormat::Tiff)
+                .write_with_encoder(encoder)
                 .map_err(|e| e.to_string())?;
         }
         "avif" => {
@@ -1266,6 +1303,18 @@ pub(crate) async fn export_images_impl(
                         // image without a profile exports through a byte-identical
                         // decode path. The profile is resolved here, after the
                         // `.cube` early-return, so a LUT export never pays for it.
+                        // Annotate the diagnostic report with the lens state
+                        // this export used, so the recorded pipeline trace is
+                        // complete (RAW stage + geometry state together).
+                        if is_raw && settings.adobe_comparison_enabled() {
+                            crate::camera_profile::annotate_lens_status(
+                                &source_path_str,
+                                crate::camera_profile::lens_status_from_adjustments(
+                                    &js_adjustments,
+                                ),
+                            );
+                        }
+
                         let export_profile =
                             resolve_export_profile(&sidecar_meta.develop_state(), is_raw);
 
@@ -1332,6 +1381,7 @@ pub(crate) async fn export_images_impl(
                         &state,
                         is_raw,
                         &app_handle_clone,
+                        &extension,
                     )?;
                     ensure_export_not_cancelled(&cancellation_token_clone)?;
                     save_image_with_metadata(
@@ -1892,7 +1942,8 @@ pub async fn estimate_export_sizes(
 #[cfg(test)]
 mod tests {
     use super::decode_export_base_image;
-    use image::GenericImageView;
+    use image::{GenericImageView, ImageDecoder};
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     /// The untracked acceptance fixture root (`raw-filewithxmp-profile/`), which a
@@ -2003,5 +2054,135 @@ mod tests {
             differing_channels > 0,
             "the profile must reach the decoder: the profiled export is byte-identical to the unprofiled one"
         );
+    }
+
+    /// SDR exports are sRGB pixel data; the PNG encoder must tag them with a
+    /// valid sRGB iCCP chunk, and a uniformly-opaque image must emit RGB
+    /// (color type 2), not RGBA (color type 6).
+    #[test]
+    fn png_export_is_icc_tagged_and_rgb_when_opaque() {
+        use super::encode_image_to_bytes;
+        use image::{DynamicImage, ImageBuffer, Rgba};
+
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(8, 8, |_, _| {
+            Rgba([10u8, 20, 30, u8::MAX])
+        }));
+        let bytes = encode_image_to_bytes(&image, "png", 90).expect("png encode");
+
+        // PNG signature + IHDR color type.
+        assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        assert_eq!(bytes[25], 2, "opaque PNG must be color type 2 (RGB)");
+
+        // Scan chunks for iCCP.
+        let mut pos = 8usize;
+        let mut found_iccp = false;
+        while pos + 12 <= bytes.len() {
+            let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let kind = &bytes[pos + 4..pos + 8];
+            if kind == b"iCCP" {
+                found_iccp = true;
+                break;
+            }
+            pos += 12 + len;
+        }
+        assert!(found_iccp, "PNG export must carry an iCCP chunk");
+    }
+
+    /// An image with a real alpha gradient keeps RGBA.
+    #[test]
+    fn png_export_keeps_rgba_when_alpha_varies() {
+        use super::encode_image_to_bytes;
+        use image::{DynamicImage, ImageBuffer, Rgba};
+
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(8, 8, |x, _| {
+            Rgba([10u8, 20, 30, x as u8 * 32])
+        }));
+        let bytes = encode_image_to_bytes(&image, "png", 90).expect("png encode");
+        assert_eq!(bytes[25], 6, "varying alpha must keep color type 6 (RGBA)");
+    }
+
+    /// `"tif"` and `"tiff"` must encode identically — both are TIFF.
+    #[test]
+    fn tif_and_tiff_extensions_both_encode_tiff() {
+        use super::encode_image_to_bytes;
+        use image::{DynamicImage, ImageBuffer, Rgb};
+
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(4, 4, |x, _| {
+            Rgb([x as u8 * 10, 128u8, 200u8])
+        }));
+        let tiff_bytes = encode_image_to_bytes(&image, "tiff", 90).expect("tiff encode");
+        let tif_bytes = encode_image_to_bytes(&image, "tif", 90).expect("tif encode");
+        assert_eq!(tiff_bytes, tif_bytes);
+        // TIFF little-endian signature.
+        assert_eq!(&tiff_bytes[0..4], &[0x49, 0x49, 0x2A, 0x00]);
+    }
+
+    /// The TIFF export must carry REAL 16-bit data — meaningful precision
+    /// beyond the 8-bit quantization a `u8` source could hold — not a
+    /// 16-bit container wrapping `v * 257` upscaled bytes. Verified by
+    /// feeding values that are NOT multiples of 257 and decoding the
+    /// file with an independent reader.
+    #[test]
+    fn tiff_export_preserves_real_16_bit_precision() {
+        use super::encode_image_to_bytes;
+        use image::{DynamicImage, ImageBuffer, Rgba};
+
+        // Values chosen so low bytes are nonzero: u8*257 upscaling would
+        // produce low byte == high byte; real 16-bit data does not.
+        let image = DynamicImage::ImageRgba16(ImageBuffer::from_fn(6, 4, |x, y| {
+            let v = (x * 3000 + y * 700 + 1234) as u16; // low byte varies
+            Rgba([v, 0x3456u16, 0x789Au16, u16::MAX])
+        }));
+
+        for ext in ["tif", "tiff"] {
+            let bytes = encode_image_to_bytes(&image, ext, 90).expect("tiff encode");
+            let mut decoder =
+                image::codecs::tiff::TiffDecoder::new(Cursor::new(&bytes)).expect("tiff decode");
+            // The embedded sRGB ICC must decode independently.
+            let icc = decoder
+                .icc_profile()
+                .expect("icc read")
+                .expect("icc present");
+            assert_eq!(
+                icc,
+                crate::icc::srgb_icc_profile(),
+                "embedded ICC must be the sRGB profile"
+            );
+
+            let decoded = image::DynamicImage::from_decoder(decoder).expect("tiff image");
+            assert_eq!(decoded.color(), image::ColorType::Rgb16);
+
+            let rgb = decoded.to_rgb16();
+            // No pixel may equal its own u8-upscale — prove the stored
+            // stream is real 16-bit data.
+            let upscaled_only = rgb
+                .pixels()
+                .all(|p| p.0.iter().all(|&v| v == (v >> 8) * 257));
+            assert!(
+                !upscaled_only,
+                "every u16 value equal to its own u8 upscale implies an 8-bit source"
+            );
+            // Exact value preservation for authored data.
+            let expected = (0 * 3000 + 1 * 700 + 1234) as u16;
+            assert_eq!(rgb.get_pixel(0, 1).0[0], expected);
+        }
+    }
+
+    /// u8-sourced TIFF still writes a well-formed 16-bit file (the
+    /// upscaling path remains valid for legacy callers).
+    #[test]
+    fn tiff_export_from_u8_source_writes_valid_file() {
+        use super::encode_image_to_bytes;
+        use image::{DynamicImage, ImageBuffer, Rgb};
+
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(4, 4, |x, _| {
+            Rgb([x as u8 * 20, 100u8, 50u8])
+        }));
+        let bytes = encode_image_to_bytes(&image, "tiff", 90).expect("tiff encode");
+        let mut decoder =
+            image::codecs::tiff::TiffDecoder::new(Cursor::new(&bytes)).expect("tiff decode");
+        assert!(decoder.icc_profile().expect("icc read").is_some());
+        let decoded = image::DynamicImage::from_decoder(decoder).expect("tiff image");
+        assert_eq!(decoded.color(), image::ColorType::Rgb16);
     }
 }

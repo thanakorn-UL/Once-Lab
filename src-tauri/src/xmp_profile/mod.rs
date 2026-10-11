@@ -23,7 +23,8 @@ pub(crate) use apply::apply_rgb_table;
 #[cfg(test)]
 pub(crate) use integration::apply_profile_to_three_color_pixels;
 pub(crate) use integration::{
-    ProfileRenderMode, apply_profile_to_three_color_pixels_with_mode_and_space, profile_render_mode,
+    ProfileRenderMode, apply_profile_to_three_color_pixels_with_mode_space_and_tone,
+    effective_profile_amount, profile_render_mode,
 };
 pub(crate) use loader::load_xmp_rgb_profile_from_path;
 pub(crate) use parser::{XmpRgbProfile, parse_xmp_rgb_profile};
@@ -81,3 +82,19 @@ pub(crate) fn adobe_linear_srgb_to_prophoto_matrix() -> [[f32; 3]; 3] {
 pub(crate) fn adobe_linear_prophoto_to_srgb_matrix() -> [[f32; 3]; 3] {
     look_table_apply::linear_prophoto_to_linear_srgb()
 }
+
+/// `dng_space_ProPhoto::MatrixFromPCS` — XYZ(D50) -> linear ProPhoto(D50), in
+/// the same derived construction (`Invert(SetMatrixToPCS(PROPHOTO_RAW))`) the
+/// XMP boundary hops use. Needed by the camera-profile stage, whose
+/// `CameraToPCS` output is XYZ(D50), to land in Linear ProPhoto D50.
+pub(crate) fn adobe_xyz_to_linear_prophoto_matrix() -> [[f64; 3]; 3] {
+    linear_rgb::invert3(linear_rgb::set_matrix_to_pcs(linear_rgb::PROPHOTO_RAW))
+}
+
+/// The shared hue/sat/value grid type; the DCP `ProfileHueSatMapData` and
+/// `ProfileLookTableData` tags decode into the same layout.
+pub(crate) use look_table::{ENCODING_LINEAR, ENCODING_SRGB, LookTable, MIN_SAT_DIVISIONS};
+/// The per-pixel `dng_hue_sat_map` evaluator used by both the XMP LookTable
+/// stage and (identically, `DoBaselineHueSatMap` in `dng_render.cpp`) the DCP
+/// `ProfileHueSatMap`/`ProfileLookTable` stages.
+pub(crate) use look_table_apply::LookTableAdobeContext;
