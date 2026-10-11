@@ -1730,6 +1730,9 @@
       },
       "nativeDpi": "本来の解像度でレンダリング",
       "preprocessing": {
+        "adobeComparison": "Adobe 比較モード",
+        "adobeComparisonDesc": "RAW ファイルを分離された Adobe 互換パイプライン（ProPhoto 作業色空間、事前シャープ化・ノイズ低減なし、プレーンな出力エンコード）で現像し、Lightroom プロファイルの比較に使用します。新しく読み込んだ画像に適用されます。",
+        "enableAdobeComparison": "Adobe 比較モードを有効化",
         "applyPreprocessing": "RAW以外の画像にも事前処理を適用",
         "applyPreprocessingDesc": "有効にすると、上記のカラーノイズ低減と事前シャープ処理が標準フォーマットの画像にも適用されます。",
         "colorNr": "カラーノイズ低減 (基本)",

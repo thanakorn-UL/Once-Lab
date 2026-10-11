@@ -1268,6 +1268,27 @@ pub(crate) async fn export_images_impl(
                         // `.cube` early-return, so a LUT export never pays for it.
                         let export_profile =
                             resolve_export_profile(&sidecar_meta.develop_state(), is_raw);
+
+                        // In Adobe comparison mode an export must never fall
+                        // back to an unprofiled render while the develop state
+                        // still references one: that would silently produce a
+                        // misleading Lightroom comparison. Surface it instead.
+                        if export_profile.is_none()
+                            && is_raw
+                            && settings.adobe_comparison_enabled()
+                            && sidecar_meta
+                                .develop_state()
+                                .profile
+                                .as_ref()
+                                .and_then(|reference| reference.path.as_deref())
+                                .is_some_and(|path| !path.is_empty())
+                        {
+                            return Err(format!(
+                                "Adobe comparison export requires the saved XMP profile for \
+                                 '{source_path_str}', but it is missing or unreadable"
+                            ));
+                        }
+
                         let profile = export_profile
                             .as_ref()
                             .map(|(path, amount)| (path.as_path(), *amount));

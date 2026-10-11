@@ -1763,7 +1763,14 @@ pub fn generate_thumbnail_data(
             }
             crate::image_processing::apply_cpu_agx_tonemap(&mut final_image);
         } else if is_raw {
-            apply_cpu_default_raw_processing(&mut final_image);
+            if tm_override == Some(2) {
+                // Adobe comparison mode: the same plain encoding the shader's
+                // mode-2 branch performs - no RAW brightness/contrast
+                // emulation on top of the Adobe-controlled RAW stage.
+                final_image = crate::image_processing::apply_linear_to_srgb(final_image);
+            } else {
+                apply_cpu_default_raw_processing(&mut final_image);
+            }
         }
     }
 

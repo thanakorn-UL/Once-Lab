@@ -1732,6 +1732,9 @@
       },
       "nativeDpi": "In nativer DPI rendern",
       "preprocessing": {
+        "adobeComparison": "Adobe-Vergleichsmodus",
+        "adobeComparisonDesc": "Entwickelt RAW-Dateien über die isolierte Adobe-kompatible Pipeline (ProPhoto-Arbeitsfarbraum, keine Vorschärfung oder Rauschunterdrückung, einfache Ausgabekodierung) für Lightroom-Profilvergleiche. Gilt für neu geladene Bilder.",
+        "enableAdobeComparison": "Adobe-Vergleichsmodus aktivieren",
         "applyPreprocessing": "Vorverarbeitung auf Nicht-RAWs anwenden",
         "applyPreprocessingDesc": "Wenn aktiviert, wird die Rauschreduzierung und Vorschärfung auch auf Standardformate angewendet.",
         "colorNr": "Basis-Farbrauschreduzierung",

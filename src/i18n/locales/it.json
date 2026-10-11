@@ -1765,6 +1765,9 @@
       },
       "nativeDpi": "Renderizza al DPI nativo",
       "preprocessing": {
+        "adobeComparison": "Modalità di confronto Adobe",
+        "adobeComparisonDesc": "Sviluppa i file RAW tramite la pipeline isolata compatibile con Adobe (spazio di lavoro ProPhoto, senza pre-nitidezza né riduzione del rumore, codifica di output semplice) per i confronti dei profili Lightroom. Si applica alle immagini appena caricate.",
+        "enableAdobeComparison": "Abilita la modalità di confronto Adobe",
         "applyPreprocessing": "Applica Pre-elaborazione a File non RAW",
         "applyPreprocessingDesc": "Se abilitato, la riduzione del rumore cromatico di base e la pre-nitidezza indicate sopra verranno applicate anche ai formati standard.",
         "colorNr": "Riduzione Rumore Cromatico di Base",

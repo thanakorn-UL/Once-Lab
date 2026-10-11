@@ -810,6 +810,27 @@ mod tests {
     }
 
     #[test]
+    fn set_amount_rounds_before_pinning_to_bounds() {
+        // `SetAmount` resolves the hundredth step BEFORE the bounds pin, so a
+        // request below a non-hundredth minimum lands ON the minimum, not on
+        // the rounded form of it: round(0.254) -> 0.25 -> pin -> 0.257. A
+        // clamp-first order would give round(0.257) -> 0.26.
+        let mut t = table(3, 2, identity_3d(2), 0, 0, 0);
+        t.min_amount = 0.257;
+        let p = PreparedRgbTable::new(&t, 0.254).expect("ctx");
+        assert_eq!(p.amount, 0.257f32, "0.254 -> 0.25 -> pinned to 0.257");
+
+        let p = PreparedRgbTable::new(&t, 0.257).expect("ctx");
+        assert_eq!(p.amount, 0.26f32, "0.257 -> 0.26, already inside bounds");
+
+        // Above a non-hundredth maximum the same order applies.
+        t.min_amount = 0.0;
+        t.max_amount = 1.243;
+        let p = PreparedRgbTable::new(&t, 1.246).expect("ctx");
+        assert_eq!(p.amount, 1.243f32, "1.246 -> 1.25 -> pinned to 1.243");
+    }
+
+    #[test]
     fn amount_one_skips_the_blend_entirely() {
         // hasAmount == false at a == 1.0: r0 is used raw, no lerp+pin.
         let t = table(3, 2, identity_3d(2), 0, 0, 0);

@@ -1800,6 +1800,9 @@
       },
       "nativeDpi": "Renderuj w natywnym DPI",
       "preprocessing": {
+        "adobeComparison": "Tryb porównania Adobe",
+        "adobeComparisonDesc": "Przetwarza pliki RAW przez izolowany potok zgodny z Adobe (przestrzeń robocza ProPhoto, bez wstępnego wyostrzania i redukcji szumów, proste kodowanie wyjściowe) do porównań profili Lightroom. Dotyczy nowo załadowanych obrazów.",
+        "enableAdobeComparison": "Włącz tryb porównania Adobe",
         "applyPreprocessing": "Zastosuj wstępne przetwarzanie do formatów innych niż RAW",
         "applyPreprocessingDesc": "Jeśli włączone, redukcja szumu kolorów i wstępne wyostrzanie powyżej zostaną również zastosowane do standardowych formatów.",
         "colorNr": "Bazowa redukcja szumu koloru",

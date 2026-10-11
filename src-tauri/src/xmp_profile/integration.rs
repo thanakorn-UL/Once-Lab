@@ -77,8 +77,9 @@ pub(crate) fn profile_render_mode() -> ProfileRenderMode {
 /// Once-Lab's compatibility model for the Lightroom Profile Amount slider: the
 /// authored amount is scaled linearly by the percent, so `100` renders exactly
 /// as authored, `0` is identity, and `200` doubles the authored strength. The
-/// result is clamped to the range the table declares as supported, which stays
-/// authoritative for every valid input.
+/// returned REQUEST stays unclamped: the evaluator's `SetAmount` resolves the
+/// amount in hundredth steps before pinning it to the table's declared range,
+/// and clamping here would change that order.
 pub(crate) fn effective_profile_amount(
     profile: &XmpRgbProfile,
     ui_percent: Option<f32>,
@@ -117,8 +118,13 @@ pub(crate) fn effective_profile_amount(
     }
 
     // The product is formed in f64 so a percent of 100 round-trips the authored
-    // amount bit-exactly instead of re-rounding it through f32.
-    Ok((f64::from(base) * f64::from(percent) / 100.0).clamp(min_amount, max_amount) as f32)
+    // amount bit-exactly instead of re-rounding it through f32. The resolved
+    // REQUEST is returned unclamped on purpose: `dng_rgb_table::SetAmount`
+    // resolves an amount in hundredth steps BEFORE pinning it to the table's
+    // authored bounds, so clamping here would corrupt the round-before-clamp
+    // order (a request of 0.254 against a minimum of 0.257 must resolve to
+    // 0.25 -> pinned 0.257, not to 0.257 -> rounded 0.26).
+    Ok((f64::from(base) * f64::from(percent) / 100.0) as f32)
 }
 
 /// Applies `profile` to every pixel in place, honouring an optional Amount control.
@@ -685,6 +691,7 @@ mod acceptance {
             linear_mode.clone(),
             None,
             None,
+            false,
             None,
         )
         .expect("stage input develop");
@@ -807,6 +814,7 @@ mod acceptance {
                         linear_mode.clone(),
                         Some(&profile),
                         Some(0.0),
+                        false,
                         None,
                     )
                     .expect("stage 0% develop");
@@ -1490,8 +1498,9 @@ mod tests {
 
         assert_eq!(effective_profile_amount(&fe, None).unwrap(), 1.0);
         assert_eq!(effective_profile_amount(&fe, Some(100.0)).unwrap(), 1.0);
-        // 200% of 1.0 is clamped to the table maximum (1.0).
-        assert_eq!(effective_profile_amount(&fe, Some(200.0)).unwrap(), 1.0);
+        // 200% of 1.0 is the REQUEST (2.0): `SetAmount` pins it to the table
+        // maximum (1.0) inside the evaluator, not here.
+        assert_eq!(effective_profile_amount(&fe, Some(200.0)).unwrap(), 2.0);
         assert_eq!(effective_profile_amount(&fe, Some(0.0)).unwrap(), 0.0);
     }
 
@@ -1644,26 +1653,43 @@ mod tests {
     }
 
     #[test]
-    fn effective_amount_respects_table_max() {
+    fn effective_amount_request_is_not_prematurely_clamped() {
+        // The SDK order is `SetAmount`: round to hundredths, THEN pin to the
+        // declared bounds. Resolving the request means the raw product is
+        // returned even when it leaves the declared range - the evaluator
+        // owns rounding and pinning, not this function.
+
         // Raw product 0.95 * 2 = 1.9 exceeds the table maximum.
         let profile = make_bounded_profile(CONSTANT_2X2X2, Some(0.95), 0.0, 1.5, true);
         assert_close(
             effective_profile_amount(&profile, Some(200.0)).unwrap(),
-            1.5,
+            1.9,
             1e-7,
-            "clamped to max_amount",
+            "request above max_amount stays unclamped",
         );
-    }
 
-    #[test]
-    fn effective_amount_respects_nonzero_table_min() {
         // Raw product 0.5 * 0 = 0 falls below a table that starts at 0.25.
         let profile = make_bounded_profile(CONSTANT_2X2X2, Some(0.5), 0.25, 1.5, true);
         assert_close(
             effective_profile_amount(&profile, Some(0.0)).unwrap(),
-            0.25,
+            0.0,
             1e-7,
-            "clamped to min_amount",
+            "request below min_amount stays unclamped",
+        );
+    }
+
+    #[test]
+    fn amount_request_preserves_round_before_clamp_boundary() {
+        // Request 0.254 against a minimum of 0.257: `SetAmount` rounds to 0.25
+        // first, so the pin lands on 0.257 - pre-clamping the request to
+        // 0.257 would round to 0.26 instead. The request must reach the
+        // evaluator unclamped for that order to hold.
+        let profile = make_bounded_profile(CONSTANT_2X2X2, Some(0.254), 0.257, 1.5, true);
+        assert_close(
+            effective_profile_amount(&profile, Some(100.0)).unwrap(),
+            0.254,
+            1e-7,
+            "a request under the bound crosses the resolver untouched",
         );
     }
 

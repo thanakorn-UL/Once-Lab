@@ -1734,6 +1734,9 @@
       },
       "nativeDpi": "Render at native DPI",
       "preprocessing": {
+        "adobeComparison": "Adobe Comparison Mode",
+        "adobeComparisonDesc": "Develops RAW files through the isolated Adobe-compatible pipeline (ProPhoto working space, no pre-sharpening or noise reduction, plain output encoding) for Lightroom profile comparisons. Applies to newly loaded images.",
+        "enableAdobeComparison": "Enable Adobe Comparison Mode",
         "applyPreprocessing": "Apply Preprocessing to Non-RAWs",
         "applyPreprocessingDesc": "If enabled, the base color noise reduction and pre-sharpening above will also be applied to standard formats.",
         "colorNr": "Base Color Noise Reduction",

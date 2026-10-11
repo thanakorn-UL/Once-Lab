@@ -2187,6 +2187,18 @@ export default function SettingsPanel({
                           )}
                         </AnimatePresence>
                       </div>
+
+                      <SettingItem
+                        label={t('settings.processing.preprocessing.adobeComparison')}
+                        description={t('settings.processing.preprocessing.adobeComparisonDesc')}
+                      >
+                        <Switch
+                          checked={appSettings?.adobeComparisonMode ?? false}
+                          id="adobe-comparison-toggle"
+                          label={t('settings.processing.preprocessing.enableAdobeComparison')}
+                          onChange={(checked) => onSettingsChange({ ...appSettings, adobeComparisonMode: checked })}
+                        />
+                      </SettingItem>
                     </div>
                   </div>
 

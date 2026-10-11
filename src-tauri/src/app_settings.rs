@@ -540,8 +540,29 @@ pub struct AppSettings {
     pub group_preferred_type: Option<String>,
     #[serde(default)]
     pub always_decode_raw_thumbnails: Option<bool>,
+    /// Isolated Adobe Lightroom comparison pipeline for RAW files. When
+    /// enabled, RAW development uses the unclipped camera -> Linear ProPhoto
+    /// calibration, skips the highlight compressor and the post-develop
+    /// noise-reduction/sharpening pass, and the output stage uses the plain
+    /// sRGB encoding instead of the RAW brightness/contrast emulation. Works
+    /// with or without a Creative XMP profile (RAW baseline). Takes effect on
+    /// newly loaded images; `ONCELAB_ADOBE_COMPARISON=1` forces it on for
+    /// headless runs.
+    #[serde(default)]
+    pub adobe_comparison_mode: Option<bool>,
     #[serde(default)]
     pub workspace: WorkspaceState,
+}
+
+impl AppSettings {
+    /// Whether the isolated Adobe Lightroom comparison pipeline is active.
+    /// The persisted setting can be overridden for headless runs with
+    /// `ONCELAB_ADOBE_COMPARISON=1` (and `=0` never forces it off; the setting
+    /// remains authoritative).
+    pub fn adobe_comparison_enabled(&self) -> bool {
+        self.adobe_comparison_mode.unwrap_or(false)
+            || std::env::var("ONCELAB_ADOBE_COMPARISON").as_deref() == Ok("1")
+    }
 }
 
 impl Default for AppSettings {
@@ -636,6 +657,7 @@ impl Default for AppSettings {
             group_associated_files: Some(false),
             group_preferred_type: Some("raw".to_string()),
             always_decode_raw_thumbnails: Some(false),
+            adobe_comparison_mode: Some(false),
             workspace: WorkspaceState::default(),
         }
     }
@@ -800,6 +822,31 @@ mod tests {
         let reloaded: AppSettings =
             serde_json::from_str(&serialized).expect("deserialize settings");
         assert_eq!(reloaded.xmp_profile_roots, roots);
+    }
+
+    /// Settings written before the Adobe comparison mode existed must keep
+    /// loading, with the comparison pipeline defaulting to OFF.
+    #[test]
+    fn old_settings_without_adobe_comparison_still_load() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{ "lastRootPath": "/photos", "theme": "dark" }"#)
+                .expect("old settings must deserialize");
+        assert_eq!(settings.adobe_comparison_mode, None);
+        assert!(!settings.adobe_comparison_enabled());
+    }
+
+    #[test]
+    fn adobe_comparison_mode_roundtrips_and_enables() {
+        let settings = AppSettings {
+            adobe_comparison_mode: Some(true),
+            ..AppSettings::default()
+        };
+        let serialized = serde_json::to_string(&settings).expect("serialize settings");
+        assert!(serialized.contains("\"adobeComparisonMode\":true"));
+
+        let reloaded: AppSettings =
+            serde_json::from_str(&serialized).expect("deserialize settings");
+        assert!(reloaded.adobe_comparison_enabled());
     }
 
     /// The copy/paste adjustment sets are `HashSet`s, so their arrays come back
