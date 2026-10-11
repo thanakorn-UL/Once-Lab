@@ -97,7 +97,12 @@ impl UnclippedSrgbCalibration {
     fn for_raw(raw: &RawImage) -> Option<Self> {
         // The supported path is ordinary 3-color CFA data. Four-component
         // sensors still use Rawler's own Calibrate operation.
-        if raw.cpp == 4 {
+        if raw.cpp == 4
+            || matches!(
+                &raw.photometric,
+                RawPhotometricInterpretation::Cfa(config) if config.cfa.unique_colors() == 4
+            )
+        {
             return None;
         }
         let (_, matrix) = raw
@@ -284,6 +289,11 @@ fn develop_internal(
         *level = u32::MAX;
     }
 
+    // Resolve any RAW-specific white-balance override before preparing
+    // either Rawler's or the Adobe-mode unclipped camera calibration.
+    raw_image.wb_coeffs =
+        crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
+
     // Only Adobe mode can bypass Rawler's sRGB negative-channel clip.
     // For cameras without a standard 3-component color matrix, or when
     // calibration is intentionally disabled, keep Rawler's existing path.
@@ -311,16 +321,6 @@ fn develop_internal(
         developer.steps.retain(|&step| step != ProcessingStep::SRgb);
     }
 
-    raw_image.wb_coeffs =
-        crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
-
-    // The compensation above may change WB; derive the calibration only
-    // after the effective white balance has been finalized.
-    let unclipped_calibration = if unclipped_calibration.is_some() {
-        UnclippedSrgbCalibration::for_raw(&raw_image)
-    } else {
-        None
-    };
     if unclipped_calibration.is_some() {
         developer.steps.retain(|step| *step != ProcessingStep::Calibrate);
     }
