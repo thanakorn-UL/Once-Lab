@@ -23,7 +23,7 @@ pub(crate) use apply::apply_rgb_table;
 pub(crate) use integration::{
     ProfileRenderMode, apply_profile_to_three_color_pixels,
     apply_profile_to_three_color_pixels_with_amount, apply_profile_to_three_color_pixels_with_mode,
-    profile_render_mode,
+    apply_profile_to_three_color_pixels_with_mode_and_space, profile_render_mode,
 };
 pub(crate) use loader::load_xmp_rgb_profile_from_path;
 pub(crate) use parser::{XmpRgbProfile, parse_xmp_rgb_profile};
@@ -65,4 +65,12 @@ pub fn discover_default_xmp_profile_roots(
         .map_err(|error| error.to_string())?;
 
     Ok(default_roots::existing_default_xmp_profile_roots(&home))
+}
+
+/// Camera-calibration path for Adobe mode: precompose Rawler's camera->linear
+/// sRGB matrix with the D50-adapted ProPhoto transform. The RAW source then
+/// enters the Adobe Profile stages *directly* in linear ProPhoto, preserving
+/// signed out-of-sRGB-gamut coordinates without a per-pixel sRGB round-trip.
+pub(crate) fn adobe_linear_srgb_to_prophoto_matrix() -> [[f32; 3]; 3] {
+    look_table_apply::linear_srgb_to_linear_prophoto()
 }
