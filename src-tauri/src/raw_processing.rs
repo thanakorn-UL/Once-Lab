@@ -80,20 +80,20 @@ fn srgb_to_linear(value: f32) -> f32 {
 
 
 /// Rawler's camera-matrix calibration without its final negative-channel
-/// floor. The operation order, normalization, inverse and WB coefficients
-/// are the same as `rawler::imgop::raw::map_3ch_to_rgb`. Adobe mode needs
-/// the signed linear-sRGB coordinates so a later sRGB->ProPhoto conversion can
-/// retain colors outside the smaller sRGB gamut. No change to Legacy or to
-/// rendering when an Adobe XMP profile isn't selected.
+/// floor. Use the same Rawler camera-to-sRGB inverse and white balance, but
+/// precompose its sRGB->ProPhoto/D50 transform ONCE, before evaluating pixels.
+/// Adobe mode therefore enters the XMP profile stages in Linear ProPhoto and
+/// retains colors that fall outside the smaller sRGB gamut. Normal editing
+/// and Legacy profiles continue to use Rawler's original calibration.
 ///
-/// This remains a Rawler-based camera transform, NOT an Adobe camera profile
-/// or native ProPhoto camera pipeline.
-struct UnclippedSrgbCalibration {
-    camera_to_srgb: [[f32; 4]; 3],
+/// This is still a Rawler-based camera calibration, not Adobe's proprietary
+/// camera-profile or full RAW color pipeline.
+struct UnclippedProPhotoCalibration {
+    camera_to_prophoto: [[f32; 4]; 3],
     white_balance: [f32; 4],
 }
 
-impl UnclippedSrgbCalibration {
+impl UnclippedProPhotoCalibration {
     fn for_raw(raw: &RawImage) -> Option<Self> {
         // The supported path is ordinary 3-color CFA data. Four-component
         // sensors still use Rawler's own Calibrate operation.
@@ -122,8 +122,12 @@ impl UnclippedSrgbCalibration {
         }
 
         let rgb_to_camera = normalize(multiply(&xyz_to_camera, &SRGB_TO_XYZ_D65));
-        let camera_to_srgb = pseudo_inverse(rgb_to_camera);
-        if !camera_to_srgb.iter().flatten().all(|v| v.is_finite()) {
+        let camera_to_srgb_unclipped = pseudo_inverse(rgb_to_camera);
+        let camera_to_prophoto = multiply(
+            &crate::xmp_profile::adobe_linear_srgb_to_prophoto_matrix(),
+            &camera_to_srgb_unclipped,
+        );
+        if !camera_to_prophoto.iter().flatten().all(|v| v.is_finite()) {
             return None;
         }
 
@@ -133,7 +137,7 @@ impl UnclippedSrgbCalibration {
             raw.wb_coeffs
         };
         Some(Self {
-            camera_to_srgb,
+            camera_to_prophoto,
             white_balance,
         })
     }
@@ -143,7 +147,7 @@ impl UnclippedSrgbCalibration {
         let r = r * self.white_balance[0];
         let g = g * self.white_balance[1];
         let b = b * self.white_balance[2];
-        let m = &self.camera_to_srgb;
+        let m = &self.camera_to_prophoto;
         *pixel = [
             m[0][0] * r + m[0][1] * g + m[0][2] * b,
             m[1][0] * r + m[1][1] * g + m[1][2] * b,
@@ -152,12 +156,12 @@ impl UnclippedSrgbCalibration {
     }
 }
 
-/// Prepare a calibrated linear-sRGB pixel for the profile stage.
+/// Prepare a calibrated linear RGB pixel for the profile stage.
 ///
-/// Rawler's `Calibrate` step converts camera RGB into linear sRGB/D65. The
-/// Adobe-SDK renderer subsequently converts this to ProPhoto/D50. In Adobe
-/// mode, retain values above 1.0 and their channel ratios until the
-/// RGBTable/LookTable stage performs its own SDK-defined gamut handling.
+/// Rawler's default `Calibrate` converts camera RGB to linear sRGB/D65
+/// and floors negative channels. Where available, Adobe mode instead uses
+/// the direct camera->ProPhoto calibration above; the fallback path retains
+/// signed, high-range linear RGB until the profile's SDK-defined gamut handling.
 /// The original Once-Lab highlight compressor remains unchanged for the
 /// normal editor path and the explicit Legacy XMP renderer.
 fn prepare_three_color_input(
@@ -301,7 +305,7 @@ fn develop_internal(
         && !is_linear_format
         && apply_calibration
     {
-        UnclippedSrgbCalibration::for_raw(&raw_image)
+        UnclippedProPhotoCalibration::for_raw(&raw_image)
     } else {
         None
     };
@@ -328,12 +332,14 @@ fn develop_internal(
     check_cancel()?;
     let mut developed_intermediate = developer.develop_intermediate(&raw_image)?;
 
+    let mut profile_input_is_prophoto = false;
     if let (Some(calibration), Intermediate::ThreeColor(pixels)) =
         (&unclipped_calibration, &mut developed_intermediate)
     {
         for pixel in &mut pixels.data {
             calibration.apply(pixel);
         }
+        profile_input_is_prophoto = true;
     }
 
     drop(raw_image);
@@ -390,12 +396,14 @@ fn develop_internal(
         match &mut developed_intermediate {
             Intermediate::ThreeColor(pixels) => {
                 let mode = profile_render_mode.expect("profile implies resolved render mode");
-                let applied = crate::xmp_profile::apply_profile_to_three_color_pixels_with_mode(
-                    &mut pixels.data,
-                    profile,
-                    profile_amount_percent,
-                    mode,
-                );
+                let applied =
+                    crate::xmp_profile::apply_profile_to_three_color_pixels_with_mode_and_space(
+                        &mut pixels.data,
+                        profile,
+                        profile_amount_percent,
+                        mode,
+                        profile_input_is_prophoto,
+                    );
 
                 applied.map_err(|error| anyhow!(error))?;
             }
@@ -495,9 +503,9 @@ mod adobe_profile_upstream_tests {
     }
 
     #[test]
-    fn calibrated_rgb_values_are_not_floored_in_adobe_mode() {
-        let calibration = UnclippedSrgbCalibration {
-            camera_to_srgb: [
+    fn calibrated_prophoto_values_are_not_floored_in_adobe_mode() {
+        let calibration = UnclippedProPhotoCalibration {
+            camera_to_prophoto: [
                 [1.0, -1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
