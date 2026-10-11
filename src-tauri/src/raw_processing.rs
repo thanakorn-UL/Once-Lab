@@ -3,7 +3,11 @@ use anyhow::{Result, anyhow};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use rawler::{
     decoders::{Orientation, RawDecodeParams},
-    imgop::develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
+    imgop::{
+        develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
+        matrix::{multiply, normalize, pseudo_inverse},
+        xyz::{Illuminant, SRGB_TO_XYZ_D65},
+    },
     rawimage::{RawImage, RawPhotometricInterpretation},
     rawsource::RawSource,
 };
@@ -75,6 +79,74 @@ fn srgb_to_linear(value: f32) -> f32 {
 }
 
 
+/// Rawler's camera-matrix calibration without its final negative-channel
+/// floor. The operation order, normalization, inverse and WB coefficients
+/// are the same as `rawler::imgop::raw::map_3ch_to_rgb`. Adobe mode needs
+/// the signed linear-sRGB coordinates so a later sRGB->ProPhoto conversion can
+/// retain colors outside the smaller sRGB gamut. No change to Legacy or to
+/// rendering when an Adobe XMP profile isn't selected.
+///
+/// This remains a Rawler-based camera transform, NOT an Adobe camera profile
+/// or native ProPhoto camera pipeline.
+struct UnclippedSrgbCalibration {
+    camera_to_srgb: [[f32; 4]; 3],
+    white_balance: [f32; 4],
+}
+
+impl UnclippedSrgbCalibration {
+    fn for_raw(raw: &RawImage) -> Option<Self> {
+        // The supported path is ordinary 3-color CFA data. Four-component
+        // sensors still use Rawler's own Calibrate operation.
+        if raw.cpp == 4 {
+            return None;
+        }
+        let (_, matrix) = raw
+            .color_matrix
+            .iter()
+            .find(|(illuminant, _)| **illuminant == Illuminant::D65)
+            .or_else(|| raw.color_matrix.iter().next())?;
+        if matrix.len() != 9 {
+            return None;
+        }
+
+        let mut xyz_to_camera = [[0.0f32; 3]; 4];
+        for channel in 0..3 {
+            for axis in 0..3 {
+                xyz_to_camera[channel][axis] = matrix[channel * 3 + axis];
+            }
+        }
+
+        let rgb_to_camera = normalize(multiply(&xyz_to_camera, &SRGB_TO_XYZ_D65));
+        let camera_to_srgb = pseudo_inverse(rgb_to_camera);
+        if !camera_to_srgb.iter().flatten().all(|v| v.is_finite()) {
+            return None;
+        }
+
+        let white_balance = if raw.wb_coeffs[0].is_nan() {
+            [1.0; 4]
+        } else {
+            raw.wb_coeffs
+        };
+        Some(Self {
+            camera_to_srgb,
+            white_balance,
+        })
+    }
+
+    fn apply(&self, pixel: &mut [f32; 3]) {
+        let [r, g, b] = *pixel;
+        let r = r * self.white_balance[0];
+        let g = g * self.white_balance[1];
+        let b = b * self.white_balance[2];
+        let m = &self.camera_to_srgb;
+        *pixel = [
+            m[0][0] * r + m[0][1] * g + m[0][2] * b,
+            m[1][0] * r + m[1][1] * g + m[1][2] * b,
+            m[2][0] * r + m[2][1] * g + m[2][2] * b,
+        ];
+    }
+}
+
 /// Prepare a calibrated linear-sRGB pixel for the profile stage.
 ///
 /// Rawler's `Calibrate` step converts camera RGB into linear sRGB/D65. The
@@ -92,7 +164,12 @@ fn prepare_three_color_input(
     preserve_for_adobe_profile: bool,
 ) -> [f32; 3] {
     for value in &mut rgb {
-        *value = (*value * rescale_factor).max(0.0);
+        let scaled = *value * rescale_factor;
+        *value = if preserve_for_adobe_profile {
+            scaled
+        } else {
+            scaled.max(0.0)
+        };
         if undo_srgb_encoding {
             let encoded = if preserve_for_adobe_profile {
                 *value
@@ -207,6 +284,18 @@ fn develop_internal(
         *level = u32::MAX;
     }
 
+    // Only Adobe mode can bypass Rawler's sRGB negative-channel clip.
+    // For cameras without a standard 3-component color matrix, or when
+    // calibration is intentionally disabled, keep Rawler's existing path.
+    let unclipped_calibration = if preserve_for_adobe_profile
+        && !is_linear_format
+        && apply_calibration
+    {
+        UnclippedSrgbCalibration::for_raw(&raw_image)
+    } else {
+        None
+    };
+
     let mut developer = RawDevelop::default();
 
     if is_linear_format {
@@ -225,8 +314,27 @@ fn develop_internal(
     raw_image.wb_coeffs =
         crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, file_bytes);
 
+    // The compensation above may change WB; derive the calibration only
+    // after the effective white balance has been finalized.
+    let unclipped_calibration = if unclipped_calibration.is_some() {
+        UnclippedSrgbCalibration::for_raw(&raw_image)
+    } else {
+        None
+    };
+    if unclipped_calibration.is_some() {
+        developer.steps.retain(|step| *step != ProcessingStep::Calibrate);
+    }
+
     check_cancel()?;
     let mut developed_intermediate = developer.develop_intermediate(&raw_image)?;
+
+    if let (Some(calibration), Intermediate::ThreeColor(pixels)) =
+        (&unclipped_calibration, &mut developed_intermediate)
+    {
+        for pixel in &mut pixels.data {
+            calibration.apply(pixel);
+        }
+    }
 
     drop(raw_image);
 
@@ -375,6 +483,31 @@ mod adobe_profile_upstream_tests {
         assert!(legacy[0] <= 1.0, "Legacy encoded input is still pinned");
         assert!((adobe[1] - srgb_to_linear(0.5)).abs() < 1e-6);
         assert_eq!(adobe[2], 0.0);
+    }
+
+    #[test]
+    fn adobe_profile_keeps_negative_srgb_chroma_for_prophoto_conversion() {
+        let source = [-0.15, 0.4, 1.4];
+        let adobe = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, true);
+        let legacy = prepare_three_color_input(source, 1.0, 3.0, 3.0, false, false);
+        assert_eq!(adobe, source);
+        assert_eq!(legacy[0], 0.0);
+    }
+
+    #[test]
+    fn calibrated_rgb_values_are_not_floored_in_adobe_mode() {
+        let calibration = UnclippedSrgbCalibration {
+            camera_to_srgb: [
+                [1.0, -1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            white_balance: [1.0; 4],
+        };
+        let mut pixel = [0.2, 0.9, 0.5];
+        calibration.apply(&mut pixel);
+        assert!(pixel[0] < 0.0);
+        assert_eq!(pixel[1], 0.9);
     }
 
     #[test]
