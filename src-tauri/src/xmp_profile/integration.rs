@@ -2252,4 +2252,66 @@ mod adobe_input_preflight_tests {
         let pixels = [[4.0, 2.0, 0.5], [16.0, 0.18, 1.25]];
         assert_eq!(validate_adobe_input_pixels(&pixels), Ok(()));
     }
+
+    #[test]
+    fn native_prophoto_input_skips_the_srgb_to_prophoto_boundary() {
+        // No profile op: isolate the color-space boundary independently from
+        // the actual LookTable and RGBTable kernels.
+        let profile = XmpRgbProfile {
+            name: "ProPhoto boundary test".to_string(),
+            group: None,
+            uuid: "PROPHOTO_BOUNDARY".to_string(),
+            process_version: None,
+            supports_amount: false,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: None,
+            table: None,
+            look_table_id: None,
+            look_table: None,
+        };
+        let prophoto = [0.18, 0.3, 0.5];
+        let expected = mul3(linear_prophoto_to_linear_srgb(), prophoto)
+            .map(|channel| channel.clamp(0.0, 1.0));
+        let mut pixels = [prophoto];
+        apply_profile_to_three_color_pixels_with_mode_and_space(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::AdobeSdk,
+            true,
+        )
+        .expect("native ProPhoto Adobe pipeline");
+
+        assert_eq!(pixels[0], expected, "must not apply the sRGB boundary twice");
+    }
+
+    #[test]
+    fn legacy_rejects_prophoto_tagged_pixels_without_modifying_them() {
+        let profile = XmpRgbProfile {
+            name: "Legacy input contract".to_string(),
+            group: None,
+            uuid: "LEGACY_INPUT".to_string(),
+            process_version: None,
+            supports_amount: false,
+            convert_to_grayscale: false,
+            rgb_table_id: None,
+            rgb_table_amount: None,
+            table: None,
+            look_table_id: None,
+            look_table: None,
+        };
+        let original = [0.18, 0.3, 0.5];
+        let mut pixels = [original];
+        let err = apply_profile_to_three_color_pixels_with_mode_and_space(
+            &mut pixels,
+            &profile,
+            None,
+            ProfileRenderMode::Legacy,
+            true,
+        )
+        .expect_err("Legacy renderer has an sRGB-only input contract");
+        assert!(err.contains("linear sRGB"));
+        assert_eq!(pixels[0], original);
+    }
 }
