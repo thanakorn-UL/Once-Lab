@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn linear_rgb_hop_matches_both_stages() {
         let shared_forward = to_f32(compose_working_to_primaries(PROPHOTO_RAW, SRGB_RAW));
-        let shared_inverse = to_f32(invert3(compose_working_to_primaries(PROPHOTO_RAW, SRGB_RAW)));
+        let shared_inverse = to_f32(invert3(compose_working_to_primaries(
+            PROPHOTO_RAW,
+            SRGB_RAW,
+        )));
 
         // (1) The LookTable stage's hop is the shared one, exactly.
         assert_eq!(
@@ -228,7 +231,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(max_delta, 0.0, "the two ProPhoto hops must be bit-identical");
+        assert_eq!(
+            max_delta, 0.0,
+            "the two ProPhoto hops must be bit-identical"
+        );
 
         // Non-vacuity: the composed hop is a real matrix, not an identity (so the
         // equality above is not trivially satisfied by two identity matrices).
