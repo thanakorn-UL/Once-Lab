@@ -1222,7 +1222,7 @@ pub fn write_image_with_metadata(
     strip_gps: bool,
 ) -> Result<(), String> {
     // FIXME: temporary solution until I find a way to write metadata to TIFF
-    if !keep_metadata || output_format.to_lowercase() == "tiff" {
+    if !keep_metadata || matches!(output_format.to_lowercase().as_str(), "tiff" | "tif") {
         return Ok(());
     }
 
@@ -1246,7 +1246,7 @@ pub fn write_image_with_metadata(
         "png" => FileExtension::PNG {
             as_zTXt_chunk: true,
         },
-        "tiff" => FileExtension::TIFF,
+        "tiff" | "tif" => FileExtension::TIFF,
         "webp" => FileExtension::WEBP,
         _ => return Ok(()),
     };

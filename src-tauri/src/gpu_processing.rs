@@ -431,8 +431,9 @@ fn read_texture_data_roi(
     texture: &wgpu::Texture,
     origin: wgpu::Origin3d,
     size: wgpu::Extent3d,
+    bytes_per_pixel: u32,
 ) -> Result<Vec<u8>, String> {
-    let unpadded_bytes_per_row = 4 * size.width;
+    let unpadded_bytes_per_row = bytes_per_pixel * size.width;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
     let output_buffer_size = (padded_bytes_per_row * size.height) as u64;
@@ -545,6 +546,10 @@ pub struct GpuProcessor {
 
     main_bgl: wgpu::BindGroupLayout,
     main_pipeline: wgpu::ComputePipeline,
+    /// Same WGSL entry compiled against an `rgba16float` storage texture —
+    /// the export-only high-bit-depth output path.
+    main_bgl_f16: wgpu::BindGroupLayout,
+    main_pipeline_f16: wgpu::ComputePipeline,
     adjustments_buffer: wgpu::Buffer,
     dummy_blur_view: wgpu::TextureView,
     dummy_lut_view: wgpu::TextureView,
@@ -557,6 +562,10 @@ pub struct GpuProcessor {
 
     pub tile_output_texture: wgpu::Texture,
     pub tile_output_texture_view: wgpu::TextureView,
+    /// Rgba16Float variant of the tile output used only by the F16 render:
+    /// identical pipeline, different storage format.
+    tile_output_texture_f16: wgpu::Texture,
+    tile_output_texture_f16_view: wgpu::TextureView,
     pub working_texture: wgpu::Texture,
     pub working_texture_view: wgpu::TextureView,
     pub output_texture: wgpu::Texture,
@@ -915,6 +924,41 @@ impl GpuProcessor {
             entries: &bind_group_layout_entries,
         });
 
+        // The F16 export variant: identical bindings except binding 1's
+        // storage format is Rgba16Float, matching the shader variant whose
+        // `output_texture` is declared `texture_storage_2d<rgba16float>`.
+        let mut f16_bind_group_layout_entries = bind_group_layout_entries.clone();
+        f16_bind_group_layout_entries[1].ty = wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba16Float,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        };
+        let main_bgl_f16 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Main BGL (F16)"),
+            entries: &f16_bind_group_layout_entries,
+        });
+        let shader_module_f16 = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Image Processing Shader (F16)"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/shader.wgsl")
+                    .replace("rgba8unorm", "rgba16float")
+                    .into(),
+            ),
+        });
+        let pipeline_layout_f16 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout (F16)"),
+            bind_group_layouts: &[Some(&main_bgl_f16)],
+            immediate_size: 0,
+        });
+        let main_pipeline_f16 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline (F16)"),
+            layout: Some(&pipeline_layout_f16),
+            module: &shader_module_f16,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[Some(&main_bgl)],
@@ -1034,6 +1078,18 @@ impl GpuProcessor {
         });
         let tile_output_texture_view = tile_output_texture.create_view(&Default::default());
 
+        let tile_output_texture_f16 = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Tile Output Texture (F16)"),
+            size: clamped_tile_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let tile_output_texture_f16_view = tile_output_texture_f16.create_view(&Default::default());
+
         let working_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Working Output Texture"),
             size: full_image_size,
@@ -1079,6 +1135,8 @@ impl GpuProcessor {
             flare_sampler,
             main_bgl,
             main_pipeline,
+            main_bgl_f16,
+            main_pipeline_f16,
             adjustments_buffer,
             dummy_blur_view,
             dummy_lut_view,
@@ -1090,6 +1148,8 @@ impl GpuProcessor {
             structure_blur_view,
             tile_output_texture,
             tile_output_texture_view,
+            tile_output_texture_f16,
+            tile_output_texture_f16_view,
             working_texture,
             working_texture_view,
             output_texture,
@@ -1097,6 +1157,7 @@ impl GpuProcessor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         input_texture_view: &wgpu::TextureView,
@@ -1105,7 +1166,8 @@ impl GpuProcessor {
         request: RenderRequest,
         skip_cpu_readback: bool,
         output_to_display: bool,
-    ) -> Result<(Vec<u8>, u32, u32, u32, u32), String> {
+        output_depth: OutputDepth,
+    ) -> Result<(GpuReadbackPixels, u32, u32, u32, u32), String> {
         let device = &self.context.device;
         let queue = &self.context.queue;
         let scale = (width.min(height) as f32) / 1080.0;
@@ -1303,12 +1365,32 @@ impl GpuProcessor {
         const TILE_SIZE: u32 = 2048;
         const TILE_OVERLAP: u32 = 128;
 
-        let mut final_pixels = vec![
+        // The export path renders the identical shader into an
+        // `rgba16float` tile; the display/preview path keeps `rgba8unorm`.
+        let (main_pipeline, main_bgl, tile_texture, tile_texture_view, bytes_per_pixel) =
+            match output_depth {
+                OutputDepth::U8 => (
+                    &self.main_pipeline,
+                    &self.main_bgl,
+                    &self.tile_output_texture,
+                    &self.tile_output_texture_view,
+                    4u32,
+                ),
+                OutputDepth::F16 => (
+                    &self.main_pipeline_f16,
+                    &self.main_bgl_f16,
+                    &self.tile_output_texture_f16,
+                    &self.tile_output_texture_f16_view,
+                    8u32,
+                ),
+            };
+
+        let mut final_bytes = vec![
             0u8;
             if skip_cpu_readback {
                 0
             } else {
-                (out_width * out_height * 4) as usize
+                (out_width * out_height * bytes_per_pixel) as usize
             }
         ];
 
@@ -1446,9 +1528,7 @@ impl GpuProcessor {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.tile_output_texture_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(tile_texture_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -1517,13 +1597,13 @@ impl GpuProcessor {
 
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Tile Bind Group"),
-                    layout: &self.main_bgl,
+                    layout: main_bgl,
                     entries: &bind_group_entries,
                 });
 
                 {
                     let mut compute_pass = main_encoder.begin_compute_pass(&Default::default());
-                    compute_pass.set_pipeline(&self.main_pipeline);
+                    compute_pass.set_pipeline(main_pipeline);
                     compute_pass.set_bind_group(0, &bind_group, &[]);
                     compute_pass.dispatch_workgroups(
                         input_width.div_ceil(8),
@@ -1571,21 +1651,23 @@ impl GpuProcessor {
                     let processed_tile_data = read_texture_data_roi(
                         device,
                         queue,
-                        &self.tile_output_texture,
+                        tile_texture,
                         wgpu::Origin3d::ZERO,
                         input_texture_size,
+                        bytes_per_pixel,
                     )?;
 
+                    let bpp = bytes_per_pixel as usize;
                     for row in 0..tile_height {
                         let final_y = y_start + row - bounds.y;
                         let final_x = x_start - bounds.x;
-                        let final_row_offset = (final_y * out_width + final_x) as usize * 4;
+                        let final_row_offset = (final_y * out_width + final_x) as usize * bpp;
                         let source_y = crop_y_start + row;
                         let source_row_offset =
-                            (source_y * input_width + crop_x_start) as usize * 4;
-                        let copy_bytes = (tile_width * 4) as usize;
+                            (source_y * input_width + crop_x_start) as usize * bpp;
+                        let copy_bytes = (tile_width as usize) * bpp;
 
-                        final_pixels[final_row_offset..final_row_offset + copy_bytes]
+                        final_bytes[final_row_offset..final_row_offset + copy_bytes]
                             .copy_from_slice(
                                 &processed_tile_data
                                     [source_row_offset..source_row_offset + copy_bytes],
@@ -1595,8 +1677,42 @@ impl GpuProcessor {
             }
         }
 
-        Ok((final_pixels, out_width, out_height, bounds.x, bounds.y))
+        let pixels = match output_depth {
+            OutputDepth::U8 => GpuReadbackPixels::U8(final_bytes),
+            OutputDepth::F16 => GpuReadbackPixels::U16(
+                final_bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .flat_map(|px| {
+                        px.as_chunks::<2>().0.iter().map(|b| {
+                            let v = f16::from_bits(u16::from_le_bytes(*b)).to_f32();
+                            (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+                        })
+                    })
+                    .collect(),
+            ),
+        };
+
+        Ok((pixels, out_width, out_height, bounds.x, bounds.y))
     }
+}
+
+/// GPU readback depth. `U8` is the legacy preview/export path
+/// (`rgba8unorm` tile); `F16` renders the identical shader into an
+/// `rgba16float` tile so export readbacks keep the pipeline's native
+/// half precision — genuine sub-8-bit data, not upscaled RGBA8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDepth {
+    U8,
+    F16,
+}
+
+/// The per-pixel payload returned by [`GpuProcessor::run`].
+pub enum GpuReadbackPixels {
+    U8(Vec<u8>),
+    /// `round(clamp01(f16) * 65535)` — ready for an `ImageRgba16`.
+    U16(Vec<u16>),
 }
 
 pub fn process_and_get_dynamic_image(
@@ -1616,6 +1732,33 @@ pub fn process_and_get_dynamic_image(
         caller_id,
         false,
         None,
+        OutputDepth::U8,
+    )
+}
+
+/// [`process_and_get_dynamic_image`] with an explicit readback depth.
+/// Only meaningful for non-display renders: `output_to_display` always
+/// stays on the U8 path regardless of `output_depth`.
+#[allow(clippy::too_many_arguments)]
+pub fn process_and_get_dynamic_image_with_depth(
+    context: &GpuContext,
+    state: &tauri::State<AppState>,
+    base_image: &DynamicImage,
+    transform_hash: u64,
+    request: RenderRequest,
+    caller_id: &str,
+    output_depth: OutputDepth,
+) -> Result<DynamicImage, String> {
+    process_and_get_dynamic_image_inner(
+        context,
+        state,
+        base_image,
+        transform_hash,
+        request,
+        caller_id,
+        false,
+        None,
+        output_depth,
     )
 }
 
@@ -1639,6 +1782,7 @@ pub fn process_and_get_dynamic_image_with_analytics(
         caller_id,
         output_to_display,
         analytics_config,
+        OutputDepth::U8,
     )
 }
 
@@ -1652,6 +1796,7 @@ fn process_and_get_dynamic_image_inner(
     caller_id: &str,
     output_to_display: bool,
     analytics_config: Option<crate::AnalyticsConfig>,
+    output_depth: OutputDepth,
 ) -> Result<DynamicImage, String> {
     let start_time = Instant::now();
     let (width, height) = base_image.dimensions();
@@ -1782,6 +1927,13 @@ fn process_and_get_dynamic_image_inner(
 
     let skip_readback = output_to_display;
 
+    // The display/analytics path always renders U8; only non-display
+    // (export) renders may ask for the F16 tile.
+    let run_depth = if output_to_display {
+        OutputDepth::U8
+    } else {
+        output_depth
+    };
     let (processed_pixels, out_w, out_h, out_x, out_y) = processor.run(
         &cache.texture_view,
         cache.width,
@@ -1789,6 +1941,7 @@ fn process_and_get_dynamic_image_inner(
         request,
         skip_readback,
         output_to_display,
+        run_depth,
     )?;
 
     let mut final_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1932,10 +2085,14 @@ fn process_and_get_dynamic_image_inner(
                 }
             });
         } else {
-            let pixels_clone = processed_pixels.clone();
+            // Analytics wants 8-bit; down-convert F16 readbacks the same
+            // way `DynamicImage::to_rgba8` does (top byte of u16).
+            let pixels_u8: Vec<u8> = match &processed_pixels {
+                GpuReadbackPixels::U8(bytes) => bytes.clone(),
+                GpuReadbackPixels::U16(buf) => buf.iter().map(|v| (v >> 8) as u8).collect(),
+            };
             std::thread::spawn(move || {
-                if let Some(img_buf) =
-                    ImageBuffer::<Rgba<u8>, _>::from_raw(out_w, out_h, pixels_clone)
+                if let Some(img_buf) = ImageBuffer::<Rgba<u8>, _>::from_raw(out_w, out_h, pixels_u8)
                 {
                     let dynamic_img = DynamicImage::ImageRgba8(img_buf);
                     let _ = analytics.sender.send(crate::AnalyticsJob {
@@ -2015,7 +2172,167 @@ fn process_and_get_dynamic_image_inner(
         fps
     );
 
-    let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(out_w, out_h, processed_pixels)
-        .ok_or("Failed to create image buffer from GPU data")?;
-    Ok(DynamicImage::ImageRgba8(img_buf))
+    match processed_pixels {
+        GpuReadbackPixels::U8(bytes) => {
+            let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(out_w, out_h, bytes)
+                .ok_or("Failed to create image buffer from GPU data")?;
+            Ok(DynamicImage::ImageRgba8(img_buf))
+        }
+        GpuReadbackPixels::U16(buf) => {
+            let img_buf = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(out_w, out_h, buf)
+                .ok_or("Failed to create 16-bit image buffer from GPU data")?;
+            Ok(DynamicImage::ImageRgba16(img_buf))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Headless GPU context for the precision-consistency test. Gated on
+    /// `ONCELAB_GPU_TEST=1` — CI machines without a Metal/Vulkan adapter
+    /// skip cleanly.
+    fn headless_context() -> Result<GpuContext, String> {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("no adapter: {e}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Export Test Device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(|e| e.to_string())?;
+        Ok(GpuContext {
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            limits: adapter.limits(),
+            display: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    /// The F16 export readback must carry real sub-8-bit precision and
+    /// round-trip to the same image as the U8 path (preview/export
+    /// consistency): every `u16 >> 8` sample must equal the U8 readback
+    /// within ±1, while the u16 stream holds values that are NOT
+    /// u8-multiples — proof the data is genuinely high-bit-depth.
+    #[test]
+    fn f16_export_readback_matches_u8_and_holds_real_precision() {
+        if std::env::var("ONCELAB_GPU_TEST").is_err() {
+            eprintln!("SKIPPED: set ONCELAB_GPU_TEST=1 to run the GPU check");
+            return;
+        }
+        let context = match headless_context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIPPED: {e}");
+                return;
+            }
+        };
+
+        let (w, h) = (256u32, 256u32);
+        let processor = GpuProcessor::new(context.clone(), w, h).expect("processor");
+
+        // Smooth gradient in linear space — outputs land between u8 steps.
+        let input: Vec<f16> = (0..w * h)
+            .flat_map(|i| {
+                let t = i as f32 / (w * h - 1) as f32;
+                [
+                    f16::from_f32(t),
+                    f16::from_f32(t * 0.37 + 0.11),
+                    f16::from_f32(1.0 - t * 0.55),
+                    f16::ONE,
+                ]
+            })
+            .collect();
+        let input_texture = context.device.create_texture_with_data(
+            &context.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Test Input"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&input),
+        );
+        let input_view = input_texture.create_view(&Default::default());
+
+        let mut adjustments = AllAdjustments::default();
+        adjustments.global.is_raw_image = 1; // input already linear
+        let make_request = |adjustments: AllAdjustments| RenderRequest {
+            adjustments,
+            mask_bitmaps: &[],
+            lut: None,
+            roi: None,
+        };
+
+        let (pixels_u8, out_w, out_h, _, _) = processor
+            .run(
+                &input_view,
+                w,
+                h,
+                make_request(adjustments),
+                false,
+                false,
+                OutputDepth::U8,
+            )
+            .expect("u8 render");
+        let (pixels_u16, out_w16, out_h16, _, _) = processor
+            .run(
+                &input_view,
+                w,
+                h,
+                make_request(adjustments),
+                false,
+                false,
+                OutputDepth::F16,
+            )
+            .expect("f16 render");
+
+        let (GpuReadbackPixels::U8(u8_buf), GpuReadbackPixels::U16(u16_buf)) =
+            (pixels_u8, pixels_u16)
+        else {
+            panic!("unexpected readback variants");
+        };
+        assert_eq!((out_w, out_h), (out_w16, out_h16));
+        assert_eq!(u16_buf.len() as u64, u8_buf.len() as u64);
+
+        // Precision: a meaningful fraction of u16 values must NOT be
+        // exact u8 up-scales (`v == (v >> 8) * 257`).
+        let non_multiples = u16_buf.iter().filter(|&&v| v != (v >> 8) * 257).count();
+        eprintln!(
+            "f16 samples: {} non-u8-multiples of {}",
+            non_multiples,
+            u16_buf.len()
+        );
+        assert!(
+            non_multiples as u64 * 5 > u16_buf.len() as u64,
+            "f16 readback looks like upscaled 8-bit data"
+        );
+
+        // Consistency: u16 >> 8 vs the u8 readback, per channel.
+        let mut max_diff = 0i64;
+        for (a, b) in u8_buf.iter().zip(u16_buf.iter()) {
+            max_diff = max_diff.max((*a as i64 - (*b >> 8) as i64).abs());
+        }
+        eprintln!("max |u8 - (u16>>8)|: {max_diff}");
+        assert!(max_diff <= 1, "preview/export rounding drift: {max_diff}");
+    }
 }
