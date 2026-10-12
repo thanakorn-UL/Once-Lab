@@ -2335,4 +2335,392 @@ mod tests {
         eprintln!("max |u8 - (u16>>8)|: {max_diff}");
         assert!(max_diff <= 1, "preview/export rounding drift: {max_diff}");
     }
+
+    /// Probes the output-stage dither at real image coordinates: renders a
+    /// constant mid-gray input through the F16 path at 8192x5464 and reports
+    /// the residual distribution. A correct ±(1/510) symmetric dither should
+    /// center on zero; a degenerate hash (fract of an f32 too large to hold
+    /// fractions) pins the residual near -0.5/255 = -128 u16.
+    /// Gated on `ONCELAB_GPU_TEST`.
+    #[test]
+    fn dither_at_8k_coordinates_is_not_a_constant_bias() {
+        if std::env::var("ONCELAB_GPU_TEST").is_err() {
+            eprintln!("SKIPPED: set ONCELAB_GPU_TEST=1 to run the GPU check");
+            return;
+        }
+        let context = match headless_context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIPPED: {e}");
+                return;
+            }
+        };
+        let (w, h) = (8192u32, 5464u32);
+        let processor = GpuProcessor::new(context.clone(), w, h).expect("processor");
+        // Saturated warm tone matching the masked-pixel population
+        // (R~0.42, G~0.28, B~0 linear).
+        let input: Vec<f16> = (0..(w * h) as usize)
+            .flat_map(|_| {
+                [
+                    f16::from_f32(0.4223),
+                    f16::from_f32(0.2785),
+                    f16::from_f32(0.0001),
+                    f16::ONE,
+                ]
+            })
+            .collect();
+        let input_texture = context.device.create_texture_with_data(
+            &context.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Dither Probe Input"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&input),
+        );
+        let input_view = input_texture.create_view(&Default::default());
+        let settings = crate::app_settings::AppSettings {
+            adobe_comparison_mode: Some(true),
+            ..Default::default()
+        };
+        let tm_override = crate::image_processing::resolve_tonemapper_override(&settings, true);
+        let adjustments = crate::image_processing::get_all_adjustments_from_json(
+            &serde_json::json!({}),
+            true,
+            tm_override,
+        );
+        let (pixels, _, _, _, _) = processor
+            .run(
+                &input_view,
+                w,
+                h,
+                RenderRequest {
+                    adjustments,
+                    mask_bitmaps: &[],
+                    lut: None,
+                    roi: None,
+                },
+                false,
+                false,
+                OutputDepth::F16,
+            )
+            .expect("f16 render");
+        let GpuReadbackPixels::U16(buf) = pixels else {
+            panic!("expected u16 readback");
+        };
+        // srgb encode of 0.4223/0.2785/1e-4 -> base u16 per channel.
+        // Residual = output - base isolates the dither term.
+        let enc = |v: f32| -> i64 {
+            let c = v.clamp(0.0, 1.0);
+            let s = if c <= 0.0031308 {
+                12.92 * c
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 65535.0 + 0.5) as i64
+        };
+        let base = [enc(0.4223), enc(0.2785), enc(0.0001)];
+        let mut band_sum = [[0i64; 3]; 6];
+        let mut band_n = [0i64; 6];
+        for (i, px) in buf.as_chunks::<4>().0.iter().enumerate() {
+            let row = i / w as usize;
+            let band = (row * 6 / h as usize).min(5);
+            for c in 0..3 {
+                band_sum[band][c] += px[c] as i64 - base[c];
+            }
+            band_n[band] += 1;
+        }
+        for b in 0..6 {
+            eprintln!(
+                "rows {:>4}-{:>4}: residual u16 R {:+.1} G {:+.1} B {:+.1}",
+                b * h as usize / 6,
+                (b + 1) * h as usize / 6 - 1,
+                band_sum[b][0] as f64 / band_n[b].max(1) as f64,
+                band_sum[b][1] as f64 / band_n[b].max(1) as f64,
+                band_sum[b][2] as f64 / band_n[b].max(1) as f64,
+            );
+        }
+        // Restricted to masked coordinates if ONCELAB_TRACE_MASK is set —
+        // isolates the position-dependent dither component.
+        if let Ok(mask_path) = std::env::var("ONCELAB_TRACE_MASK") {
+            let raw = std::fs::read(&mask_path).expect("mask");
+            let indices: &[u32] = bytemuck::cast_slice(&raw[4..]);
+            let mut sum = [0i64; 3];
+            for &i in indices {
+                for c in 0..3 {
+                    sum[c] += buf[i as usize * 4 + c] as i64 - base[c];
+                }
+            }
+            let n = indices.len() as f64;
+            eprintln!(
+                "masked-coord residual u16: R {:+.1} G {:+.1} B {:+.1}",
+                sum[0] as f64 / n,
+                sum[1] as f64 / n,
+                sum[2] as f64 / n
+            );
+        }
+    }
+
+    /// Renders the traced stage-6 working-buffer values (sparse, embedded in a
+    /// full-size f16 texture) through the real F16 export path and dumps the
+    /// readback at each masked position. Because every non-default shader
+    /// stage is gated off, a sparse render reproduces the export's masked
+    /// pixels exactly — isolating whether the residual lives in the GPU
+    /// encode of these f16 values or in the upstream buffer.
+    /// Gated on `ONCELAB_TRACE_MASK`/`ONCELAB_TRACE_OUT` + `ONCELAB_GPU_TEST`.
+    #[test]
+    fn render_traced_out_stage_through_f16_path() {
+        if std::env::var("ONCELAB_GPU_TEST").is_err() {
+            eprintln!("SKIPPED: set ONCELAB_GPU_TEST=1");
+            return;
+        }
+        let (Ok(mask_path), Ok(trace_dir)) = (
+            std::env::var("ONCELAB_TRACE_MASK"),
+            std::env::var("ONCELAB_TRACE_OUT"),
+        ) else {
+            eprintln!("SKIPPED: set ONCELAB_TRACE_MASK/TRACE_OUT");
+            return;
+        };
+        let context = match headless_context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIPPED: {e}");
+                return;
+            }
+        };
+        let raw = std::fs::read(&mask_path).expect("mask");
+        let indices: &[u32] = bytemuck::cast_slice(&raw[4..]);
+        let trace = std::fs::read(format!("{trace_dir}/trace.f32")).expect("trace");
+        let tv: &[f32] = bytemuck::cast_slice(&trace);
+
+        let (w, h) = (8192u32, 5464u32);
+        let mut img = vec![f16::ZERO; (w * h * 4) as usize];
+        for (k, &i) in indices.iter().enumerate() {
+            let px = i as usize * 4;
+            let base = k * 21 + 18; // stage 6 = `out`
+            img[px] = f16::from_f32(tv[base]);
+            img[px + 1] = f16::from_f32(tv[base + 1]);
+            img[px + 2] = f16::from_f32(tv[base + 2]);
+            img[px + 3] = f16::ONE;
+        }
+        let processor = GpuProcessor::new(context.clone(), w, h).expect("processor");
+        let input_texture = context.device.create_texture_with_data(
+            &context.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Sparse Trace Input"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&img),
+        );
+        let input_view = input_texture.create_view(&Default::default());
+        let settings = crate::app_settings::AppSettings {
+            adobe_comparison_mode: Some(true),
+            ..Default::default()
+        };
+        let tm_override = crate::image_processing::resolve_tonemapper_override(&settings, true);
+        let adjustments = crate::image_processing::get_all_adjustments_from_json(
+            &serde_json::json!({}),
+            true,
+            tm_override,
+        );
+        let (pixels, _, _, _, _) = processor
+            .run(
+                &input_view,
+                w,
+                h,
+                RenderRequest {
+                    adjustments,
+                    mask_bitmaps: &[],
+                    lut: None,
+                    roi: None,
+                },
+                false,
+                false,
+                OutputDepth::F16,
+            )
+            .expect("render");
+        let GpuReadbackPixels::U16(buf) = pixels else {
+            panic!("expected u16");
+        };
+        let mut out = Vec::with_capacity(indices.len() * 6);
+        for &i in indices {
+            for c in 0..3 {
+                out.extend_from_slice(&buf[i as usize * 4 + c].to_le_bytes());
+            }
+        }
+        std::fs::write(format!("{trace_dir}/masked_u16_f16render.bin"), &out).unwrap();
+        eprintln!("wrote masked_u16_f16render.bin");
+    }
+
+    /// Generates the four controlled `DngBaselineMode` exports through the
+    /// REAL export path — `load_base_image_from_bytes_with_xmp_profile`
+    /// (develop incl. the Adobe comparison context) → f16 GPU render →
+    /// `encode_image_to_bytes("tiff")` — the same executed code the app
+    /// export uses (minus EXIF metadata, which `keep_metadata=false`
+    /// strips anyway; provenance is recorded in a JSON sidecar instead).
+    /// Gated on `ONCELAB_EXPORT_FIXTURE` (RAW path), `ONCELAB_EXPORT_XMP`
+    /// (Au profile path) and `ONCELAB_EXPORT_DIR` (output dir).
+    #[test]
+    fn export_four_baseline_modes_via_real_export_path() {
+        let (Ok(raw_path), Ok(xmp_path), Ok(out_dir)) = (
+            std::env::var("ONCELAB_EXPORT_FIXTURE"),
+            std::env::var("ONCELAB_EXPORT_XMP"),
+            std::env::var("ONCELAB_EXPORT_DIR"),
+        ) else {
+            eprintln!("SKIPPED: set ONCELAB_EXPORT_FIXTURE/XMP/DIR to generate exports");
+            return;
+        };
+        let context = match headless_context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIPPED: {e}");
+                return;
+            }
+        };
+        let bytes = std::fs::read(&raw_path).expect("read RAW fixture");
+        let mut provenance = Vec::new();
+        // A0 no-profile control: ONCELAB_EXPORT_NOPROFILE=1 adds a fifth
+        // export with `xmp_profile_path=None` at acr3 — the counterfactual
+        // "same RAW, no creative table" measurement.
+        let modes: Vec<(&str, Option<&str>)> = {
+            let mut v: Vec<(&str, Option<&str>)> = [
+                ("identity", Some(xmp_path.as_str())),
+                ("acr3", Some(xmp_path.as_str())),
+                ("shadow-toe", Some(xmp_path.as_str())),
+                ("acr3+toe", Some(xmp_path.as_str())),
+            ]
+            .into_iter()
+            .collect();
+            if std::env::var("ONCELAB_EXPORT_NOPROFILE").as_deref() == Ok("1") {
+                v.push(("acr3-noprofile", None));
+            }
+            v
+        };
+
+        for (mode, profile_path) in modes {
+            let settings = crate::app_settings::AppSettings {
+                adobe_comparison_mode: Some(true),
+                adobe_dng_baseline_mode: Some(
+                    mode.strip_suffix("-noprofile").unwrap_or(mode).to_string(),
+                ),
+                ..Default::default()
+            };
+            // Same call the export path makes (`use_fast_raw_dev=false`).
+            let base = crate::image_loader::load_base_image_from_bytes_with_xmp_profile(
+                &bytes,
+                &raw_path,
+                false,
+                &settings,
+                profile_path.map(std::path::Path::new),
+                Some(0.0),
+                None,
+            )
+            .expect("develop");
+
+            // `process_image_for_export_pipeline` with default adjustments:
+            // no transforms, no masks, no LUT — identical to what the app
+            // exported for the unadjusted comparison renders.
+            let js_adjustments = serde_json::json!({});
+            let (transformed, _) =
+                crate::adjustment_utils::apply_all_transformations(&base, &js_adjustments);
+            let tm_override = crate::image_processing::resolve_tonemapper_override(&settings, true);
+            let adjustments = crate::image_processing::get_all_adjustments_from_json(
+                &js_adjustments,
+                true,
+                tm_override,
+            );
+
+            let (w, h) = (
+                transformed.width().div_ceil(256) * 256,
+                transformed.height().div_ceil(256) * 256,
+            );
+            let processor = GpuProcessor::new(context.clone(), w, h).expect("processor");
+            let img_f16 = to_rgba_f16(&transformed);
+            let texture = context.device.create_texture_with_data(
+                &context.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("Export Input"),
+                    size: wgpu::Extent3d {
+                        width: transformed.width(),
+                        height: transformed.height(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                TextureDataOrder::MipMajor,
+                bytemuck::cast_slice(&img_f16),
+            );
+            let view = texture.create_view(&Default::default());
+            let (pixels, out_w, out_h, _, _) = processor
+                .run(
+                    &view,
+                    transformed.width(),
+                    transformed.height(),
+                    RenderRequest {
+                        adjustments,
+                        mask_bitmaps: &[],
+                        lut: None,
+                        roi: None,
+                    },
+                    false,
+                    false,
+                    OutputDepth::F16,
+                )
+                .expect("f16 export render");
+            let GpuReadbackPixels::U16(buf) = pixels else {
+                panic!("expected u16 readback");
+            };
+            let rgba16 =
+                ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(out_w, out_h, buf).unwrap();
+            let img = DynamicImage::ImageRgba16(rgba16);
+            let tiff = crate::export_processing::encode_image_to_bytes(&img, "tiff", 90)
+                .expect("tiff encode");
+            let name = format!("Once_Au0_{mode}.tiff")
+                .replace("Once_Au0_acr3-noprofile", "Once_noXMP_acr3");
+            let out = format!("{out_dir}/{name}");
+            std::fs::write(&out, &tiff).expect("write tiff");
+            provenance.push(serde_json::json!({
+                "mode": mode,
+                "file": name,
+                "bytes": tiff.len(),
+                "dimensions": [out_w, out_h],
+                "develop": "load_base_image_from_bytes_with_xmp_profile(use_fast_raw_dev=false, amount=0.0)",
+                "adjustments": "get_all_adjustments_from_json({}, is_raw=true, tm_override=plain)",
+                "render": "GpuProcessor::run OutputDepth::F16 (rgba16float tile, real f16 readback)",
+                "encode": "encode_image_to_bytes(\"tiff\") + sRGB ICC (exif strip)",
+            }));
+            eprintln!("wrote {out} ({} bytes)", tiff.len());
+        }
+        std::fs::write(
+            format!("{out_dir}/export-provenance.json"),
+            serde_json::to_string_pretty(&provenance).unwrap(),
+        )
+        .unwrap();
+    }
 }

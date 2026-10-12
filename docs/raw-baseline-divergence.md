@@ -134,3 +134,120 @@ A0/A100 TIFF comparison. The acr3 table is the documented SDK fallback,
 - Au RGBTable evaluation untouched; golden oracle tests all pass (411 lib tests).
 - Preview/display U8 path untouched; TIFF export still reads back f16.
 - No Adobe assets extracted or committed; no Lightroom-parity claim.
+
+---
+
+## RAW 00009 / Task A — per-pixel kill-chain for Once B=0 vs Lightroom B>0
+
+Fixture: `Canon-eos-r5-raw-00009.cr3` (8192×5464 export). Mode: `acr3` baseline +
+`Au ⛏️.xmp` at 0% (`ProfileRenderMode::AdobeSdk`, `adobe_comparison_mode`).
+Mask: 273,792 pixels where the Once F16 TIFF has `B16 == 0` and
+`Lr_Au 0%.tif` has `B16 > 0` (LR masked B mean 8,567/65535). Region: y 3530–5463,
+full width — saturated warm tones.
+
+Method: `raw_processing::round3_probe::trace_zero_blue_kill_chain` replicates the
+upstream RAW path, applies the **real** profile evaluator, snapshots 7 stages per
+masked pixel, and proves bit-identical output vs `develop_raw_image_with_profile`
+over all 44.7M pixels (max diff 0.0). `xmp_profile::AdobeStageProbe` extracts the
+production stage functions — the trace is the executed math, not a model.
+
+### Measured stage values (B channel, 273,792 pixels)
+
+| Stage | B < 0 | B == 0 | min | mean | Comment |
+|---|---:|---:|---:|---:|---|
+| camera RGB (post-demosaic/rescale) | 36 | 0 | −0.00298 | +0.02018 | signed sub-black/demosaic excursions, legit |
+| ProPhoto (post-calibration) | 598 | 0 | −0.02324 | +0.02272 | +562 new negatives — normal wide-gamut excursions of saturated warm colors |
+| post-LookTable | 598 | 0 | −0.02324 | +0.02272 | Au has no LookTable — pass-through |
+| post-ACR3 tone | 0 | 598 | 0.0 | +0.02623 | **entry pin `[0,1]` zeroes all 598 negatives; zero positive B was killed by the curve** |
+| post-Au RGBTable (0%) | 0 | 0 | +0.00072 | +0.03234 | NOT a no-op: gamut-clip table rewrites 271,234 px (99.1%), parks clipped colors on the sRGB surface, lifts ProPhoto B (mean Δ +6.1e-3) |
+| sRGB pre-clamp | 58,506 | 141,890 | −1.5e-8 | ~0 | post-table conversion lands the parked colors *on* the `b=0` plane — negatives are ε-deep, not −0.083 (that figure was the counterfactual direct conversion's depth, see below) |
+| working-buffer out | 0 | 200,396 | 0.0 | ~0 | 73,396 px survive with 0 < B ≤ 1.5e-4 |
+| TIFF u16 | — | 273,792 | 0 | 0 | all dead |
+
+### Attribution — disjoint, actual stages (measured, not hypothetical)
+
+The masked 273,792 px partition into mutually exclusive sets by the **first
+executed stage where B became ≤ 0** (or, if never ≤ 0, where it died):
+
+| set | count | mechanism |
+|---|---:|---|
+| **S1 — ACR3 entry pin** | **598** | signed negative ProPhoto B (36 already negative in camera space) pinned at the `apply_rgb` input clamp (`camera_profile/spline.rs`, verbatim `RefBaselineRGBTone`). 437 stay ≤0 through the table+conversion; **161 are resurrected to positive** by the RGBTable (table lookups are not channel-monotone) but die at the u16 encode anyway |
+| **S2 — post-Au gamut boundary pin** | **199,959** | post-RGBTable ProPhoto→sRGB conversion yields B ≤ 0 (58,506 negative, 141,890 exactly on the `b=0` plane) → the SDR output `clamp(0,1)` kills them |
+| **S3 — encode floor** | **73,235** | survive every stage positive (0 < B ≤ 1.5e-4) but encode to u16 0 — see dither decomposition below |
+
+598 + 199,959 + 73,235 = **273,792** ✓ disjoint. (The earlier
+"200,396 working-buffer zeros" = S1-stayed-zero 437 + S2 199,959;
+"73,396 buffer-positive dead" = 161 resurrected + 73,235.)
+
+**Counterfactual (labeled, not actual):** converting post-tone ProPhoto→sRGB
+*without* the Au table and predicting u16 yields B=0 for **271,222** of the
+same mask — the Au table does not cause the loss; it moves the pin to its
+own sRGB-primaries boundary and parks ~141.9k colors *on* the `b=0` plane,
+which is an equivalent outcome. The earlier "270,607 hypothetical
+out-of-sRGB" number refers to this counterfactual population — overlapping,
+not an independent causal category.
+
+### F16 / dither / u16 decomposition (direct no-dither control)
+
+Re-encoding the traced `out` buffer to u16 *without* dither
+(`round(sRGB(out.B)·65535)`) and comparing against the real TIFF:
+
+- **70,665 px** of the 73,235 encode-floor deaths have predicted u16 = 0 —
+  they die at ≤½ LSB **with or without dither** (f16 precision and the
+  dither term are irrelevant for these).
+- **2,570 px** would have encoded u16 1–47 without dither and are killed
+  solely by the position-dependent biased dither (≈ −0.30/255 mean over
+  the masked region, deterministic per pixel — a sparse re-render
+  reproduced all 273,792 TIFF pixels bit-exactly).
+- The remaining 161 (S1-resurrected) distribute the same way.
+
+### A0 no-profile control (measured, same RAW/mode/coords)
+
+`acr3` baseline, `xmp_profile_path=None` vs `Au ⛏️.xmp` at 0%:
+
+- B=0 masks **bit-identical** between the two exports (282,630 px each);
+  the FP-vs-LR set is identical (273,792).
+- Only 215,082 px (0.48%) differ at all — max |Δ| 32/65535 (~½ u8-LSB),
+  mean |Δ| on changed px 4–10 u16; 87% of changed pixels are the B channel.
+- Conclusion: Au at effective amount 0 **does not change clipping or the
+  zero-blue outcome**; its gamut-clip stage writes values the SDR pins
+  would have produced anyway (max sub-LSB color shift elsewhere).
+
+### Secondary finding — biased output dither
+
+On a constant-input F16 render, residual vs CPU-simulated encode is
+**−77 u16 mean at the masked coordinates** but −14 u16 globally — the
+position-dependent `dither(id.xy)` term is biased ≈ −0.30/255 over this region
+(tile-local hash coords, args ~1.2e4–2e5). It is deterministic per pixel (a
+sparse re-render of the traced buffer reproduced all 273,792 TIFF pixels
+bit-exactly) and pushed 2,570 pixels that would have encoded u16 2–119 to 0.
+Small (~0.12% FS) but systematic — worth a separate look at the hash's
+large-argument behavior.
+
+### Cross-mode B=0 counts (same mask definition vs LR)
+
+| baseline mode | Once B16=0 total | ∩ LR B>0 |
+|---|---:|---:|
+| identity | 26,739 | 21,899 |
+| acr3 | 282,630 | 273,792 |
+| shadow-toe | 88,338 | 74,831 |
+| acr3+toe | 653,572 | 639,122 |
+
+### Conclusion
+
+The masked pixels' color is **not corrupted — it is clipped** (CODE-VERIFIED +
+MEASURED). The dominant mechanism is genuinely out-of-sRGB-gamut content
+meeting hard per-channel `[0,1]` pins at the ProPhoto→sRGB boundary,
+preceded by the ACR3 entry pin for the 598 negative-ProPhoto pixels.
+
+**INFERRED (not proven):** that Lightroom keeps B ≈ 8.5k/65535 here because
+PV2012 preserves signed/wide channels until a final gamut-mapping step.
+Alternative explanations consistent with the same observation: a different
+baseline tone response producing larger B, a different camera transform
+yielding in-gamut colors, or channel-preserving gamut handling elsewhere
+in the stack. Lightroom-side evidence (E1/E2) is required before treating
+this as established.
+
+**UNKNOWN:** whether the 273,792 masked pixels' camera colors were otherwise
+correct — the mask selects for B≈0 outliers by construction and cannot
+establish correctness on R/G.

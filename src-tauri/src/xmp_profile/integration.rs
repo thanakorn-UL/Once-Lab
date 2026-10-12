@@ -278,55 +278,88 @@ pub(crate) fn apply_profile_adobe(
     apply_profile_adobe_with_space(pixels, profile, amount, is_hdr, false, None)
 }
 
-/// Adobe scalar profile rendering from either linear sRGB (old boundary
-/// conversion) or native camera-calibrated Linear ProPhoto/D50.
-fn apply_profile_adobe_with_space(
-    pixels: &mut [[f32; 3]],
-    profile: &XmpRgbProfile,
-    amount: f32,
+/// The per-pixel stage contexts of `apply_profile_adobe_with_space`, built
+/// once so the bulk loop and the diagnostic probe execute the same code.
+struct AdobeStageContexts<'a> {
+    rgb_context: Option<PreparedRgbTable<'a>>,
+    look_context: Option<LookTableAdobeContext<'a>>,
+    srgb_to_prophoto: [[f32; 3]; 3],
+    prophoto_to_srgb: [[f32; 3]; 3],
     is_hdr: bool,
     input_is_prophoto: bool,
-    baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
-) -> Result<(), String> {
-    // Every stage context is built — and therefore fully validated, with the
-    // amount resolved — before the first pixel is touched.
-    let rgb_context = match &profile.table {
-        Some(table) => {
-            let context = if is_hdr {
-                PreparedRgbTable::new_overrange(table, f64::from(amount))?
-            } else {
-                PreparedRgbTable::new(table, f64::from(amount))?
-            };
-            Some(context)
-        }
-        None => None,
-    };
-    let look_context = match &profile.look_table {
-        Some(table) => Some(LookTableAdobeContext::new(table, is_hdr)?),
-        None => None,
-    };
+}
 
-    let srgb_to_prophoto = linear_srgb_to_linear_prophoto();
-    let prophoto_to_srgb = linear_prophoto_to_linear_srgb();
+/// Per-boundary values of one pixel through the Adobe stage chain.
+/// Only `.out` is consumed by the production loop; the intermediate
+/// fields exist for the test-only stage probe.
+#[allow(dead_code)]
+pub(crate) struct AdobePixelTrace {
+    /// Value staged in ProPhoto (post input boundary).
+    pub(crate) prophoto_in: [f32; 3],
+    pub(crate) post_look_table: [f32; 3],
+    pub(crate) post_tone_curve: [f32; 3],
+    pub(crate) post_rgb_table: [f32; 3],
+    /// `prophoto_to_srgb` output BEFORE the SDR [0,1] pin.
+    pub(crate) srgb_pre_clamp: [f32; 3],
+    /// Final stage output written to the working buffer.
+    pub(crate) out: [f32; 3],
+}
 
-    // Preflight the full input buffer *before* mutating the first pixel.
-    // The old per-pixel check could error at pixel N after pixels 0..N-1
-    // had already been changed, despite the documented atomic validation
-    // contract of the profile renderer.
-    validate_adobe_input_pixels(pixels)?;
-
-    for pixel in pixels.iter_mut() {
-        // Adobe native camera path already has ProPhoto D50 values.
-        // The compatibility/fallback path converts from linear sRGB.
-        let mut staged = if input_is_prophoto {
-            *pixel
-        } else {
-            mul3(srgb_to_prophoto, *pixel)
+impl<'a> AdobeStageContexts<'a> {
+    /// Every stage context is built — and therefore fully validated, with the
+    /// amount resolved — before the first pixel is touched.
+    fn new(
+        profile: &'a XmpRgbProfile,
+        amount: f32,
+        is_hdr: bool,
+        input_is_prophoto: bool,
+    ) -> Result<Self, String> {
+        let rgb_context = match &profile.table {
+            Some(table) => {
+                let context = if is_hdr {
+                    PreparedRgbTable::new_overrange(table, f64::from(amount))?
+                } else {
+                    PreparedRgbTable::new(table, f64::from(amount))?
+                };
+                Some(context)
+            }
+            None => None,
+        };
+        let look_context = match &profile.look_table {
+            Some(table) => Some(LookTableAdobeContext::new(table, is_hdr)?),
+            None => None,
         };
 
-        if let Some(context) = &look_context {
+        Ok(Self {
+            rgb_context,
+            look_context,
+            srgb_to_prophoto: linear_srgb_to_linear_prophoto(),
+            prophoto_to_srgb: linear_prophoto_to_linear_srgb(),
+            is_hdr,
+            input_is_prophoto,
+        })
+    }
+
+    /// The verbatim per-pixel stage order of `apply_profile_adobe_with_space`,
+    /// recording every stage boundary for the trace probe.
+    fn trace_pixel(
+        &self,
+        pixel: [f32; 3],
+        baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
+    ) -> AdobePixelTrace {
+        // Adobe native camera path already has ProPhoto D50 values.
+        // The compatibility/fallback path converts from linear sRGB.
+        let mut staged = if self.input_is_prophoto {
+            pixel
+        } else {
+            mul3(self.srgb_to_prophoto, pixel)
+        };
+        let prophoto_in = staged;
+
+        if let Some(context) = &self.look_context {
             staged = context.apply(staged);
         }
+        let post_look_table = staged;
 
         // Baseline tone stage (`dng_render.cpp:1974-1996`: LookTable ->
         // ProfileToneCurve -> RGBTables). Currently fed by the camera DCP's
@@ -339,22 +372,86 @@ fn apply_profile_adobe_with_space(
             // (`dng_render.cpp`'s `fToneCurve` dispatch), not a per-channel map.
             curve.apply_rgb(&mut staged);
         }
+        let post_tone_curve = staged;
 
-        if let Some(context) = &rgb_context {
+        if let Some(context) = &self.rgb_context {
             staged = context.apply(staged);
         }
+        let post_rgb_table = staged;
 
         // Boundary back to the working space. In SDR the kernel output is
         // already pinned, but the boundary matrix can introduce ~1e-8
         // excursions; the SDK's own pipeline clamps downstream, so pin here
         // to keep the stage output in contract. HDR never pins.
-        let mut out = mul3(prophoto_to_srgb, staged);
-        if !is_hdr {
+        let srgb_pre_clamp = mul3(self.prophoto_to_srgb, staged);
+        let mut out = srgb_pre_clamp;
+        if !self.is_hdr {
             for channel in out.iter_mut() {
                 *channel = channel.clamp(0.0, 1.0);
             }
         }
-        *pixel = out;
+
+        AdobePixelTrace {
+            prophoto_in,
+            post_look_table,
+            post_tone_curve,
+            post_rgb_table,
+            srgb_pre_clamp,
+            out,
+        }
+    }
+}
+
+/// Test-only probe exposing the per-boundary values of
+/// [`apply_profile_adobe_with_space`] — same stage contexts, same per-pixel
+/// code path, so traced values are executed values, not a re-implementation.
+#[cfg(test)]
+pub(crate) struct AdobeStageProbe<'a> {
+    contexts: AdobeStageContexts<'a>,
+}
+
+#[cfg(test)]
+impl<'a> AdobeStageProbe<'a> {
+    pub(crate) fn new(
+        profile: &'a XmpRgbProfile,
+        amount: f32,
+        is_hdr: bool,
+        input_is_prophoto: bool,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            contexts: AdobeStageContexts::new(profile, amount, is_hdr, input_is_prophoto)?,
+        })
+    }
+
+    pub(crate) fn trace(
+        &self,
+        pixel: [f32; 3],
+        baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
+    ) -> AdobePixelTrace {
+        self.contexts.trace_pixel(pixel, baseline_tone_curve)
+    }
+}
+
+/// Adobe scalar profile rendering from either linear sRGB (old boundary
+/// conversion) or native camera-calibrated Linear ProPhoto/D50.
+fn apply_profile_adobe_with_space(
+    pixels: &mut [[f32; 3]],
+    profile: &XmpRgbProfile,
+    amount: f32,
+    is_hdr: bool,
+    input_is_prophoto: bool,
+    baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
+) -> Result<(), String> {
+    let contexts = AdobeStageContexts::new(profile, amount, is_hdr, input_is_prophoto)?;
+
+    // Preflight the full input buffer *before* mutating the first pixel.
+    // The old per-pixel check could error at pixel N after pixels 0..N-1
+    // had already been changed, despite the documented atomic validation
+    // contract of the profile renderer.
+    validate_adobe_input_pixels(pixels)?;
+
+    for pixel in pixels.iter_mut() {
+        *pixel = contexts.trace_pixel(*pixel, baseline_tone_curve).out;
     }
 
     Ok(())

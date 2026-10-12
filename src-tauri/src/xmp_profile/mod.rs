@@ -21,6 +21,8 @@ pub(crate) mod summary;
 #[cfg(test)]
 pub(crate) use apply::apply_rgb_table;
 #[cfg(test)]
+pub(crate) use integration::AdobeStageProbe;
+#[cfg(test)]
 pub(crate) use integration::apply_profile_to_three_color_pixels;
 pub(crate) use integration::{
     ProfileRenderMode, apply_profile_to_three_color_pixels_with_mode_space_and_tone,

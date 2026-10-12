@@ -1381,6 +1381,232 @@ mod round3_probe {
         }
     }
 
+    /// Per-pixel stage trace for the measured "Once B=0 / Lightroom B>0"
+    /// divergence (RAW 00009, acr3 baseline mode, Au profile at amount 0%).
+    ///
+    /// Re-runs the SAME executed code `develop_internal` runs for the Adobe
+    /// comparison + XMP profile path — signed CFA develop, signed rescale,
+    /// `UnclippedProPhotoCalibration`, then the real
+    /// `apply_profile_to_three_color_pixels_with_mode_space_and_tone` — and
+    /// snapshots the buffer at every stage boundary for the pixel indices
+    /// listed in `ONCELAB_TRACE_MASK` (u32-le count + u32-le row-major
+    /// indices over the developed buffer). Inside the profile apply the
+    /// sub-stage values come from `AdobeStageProbe`, which executes the
+    /// same stage-context code as the production loop.
+    ///
+    /// Fidelity gate: the replicated upstream buffer is pushed through the
+    /// REAL profile apply and compared channel-for-channel against the
+    /// image produced by `develop_raw_image_with_profile` — the probe is
+    /// accepted only when that comparison is bit-identical, which proves
+    /// the replication executed the same operations in the same order.
+    ///
+    /// Writes `ONCELAB_TRACE_OUT/trace.f32` — 7 RGB triples per masked
+    /// pixel in mask order: camera-space RGB (post-demosaic/rescale),
+    /// ProPhoto post-calibration, post-LookTable, post-baseline-tone
+    /// (acr3), post-RGBTable (Au, amount 0), sRGB pre-clamp, final clamped
+    /// output — plus `trace.json` describing the layout.
+    ///
+    /// Gated on: ONCELAB_RAW_FIXTURE, ONCELAB_EXPORT_XMP,
+    /// ONCELAB_TRACE_MASK, ONCELAB_TRACE_OUT.
+    #[test]
+    fn trace_zero_blue_kill_chain() {
+        let (Ok(raw_path), Ok(xmp_path), Ok(mask_path), Ok(out_dir)) = (
+            std::env::var("ONCELAB_RAW_FIXTURE"),
+            std::env::var("ONCELAB_EXPORT_XMP"),
+            std::env::var("ONCELAB_TRACE_MASK"),
+            std::env::var("ONCELAB_TRACE_OUT"),
+        ) else {
+            eprintln!("SKIPPED: set ONCELAB_RAW_FIXTURE/EXPORT_XMP/TRACE_MASK/TRACE_OUT");
+            return;
+        };
+        let file_bytes = std::fs::read(&raw_path).expect("read RAW fixture");
+        let mask_bytes = std::fs::read(&mask_path).expect("read mask");
+        let count = u32::from_le_bytes(mask_bytes[0..4].try_into().unwrap()) as usize;
+        let indices: Vec<usize> = mask_bytes[4..4 + count * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c) as usize)
+            .collect();
+        let profile =
+            crate::xmp_profile::load_xmp_rgb_profile_from_path(std::path::Path::new(&xmp_path))
+                .expect("load XMP profile");
+
+        // ---- replicate develop_internal's Adobe+profile upstream --------
+        // Identical calls/order to `develop_internal`: decode, WB
+        // neutralization, white-level override, signed CFA develop,
+        // signed rescale, unclipped ProPhoto calibration. `linear_mode`
+        // "auto" => apply_ungamma=false, apply_calibration=true.
+        let source = RawSource::new_from_slice(&file_bytes);
+        let decoder = rawler::get_decoder(&source).expect("decoder");
+        let mut raw_image = decoder
+            .raw_image(&source, &RawDecodeParams::default(), false)
+            .expect("raw_image");
+
+        let original_white_level = raw_image
+            .whitelevel
+            .0
+            .first()
+            .cloned()
+            .unwrap_or(u16::MAX as u32) as f32;
+        let original_black_level = raw_image
+            .blacklevel
+            .levels
+            .first()
+            .map(|r| r.as_f32())
+            .unwrap_or(0.0);
+        let denominator = (original_white_level - original_black_level).max(1.0);
+        let rescale_factor = (u32::MAX as f32 - original_black_level) / denominator;
+
+        raw_image.wb_coeffs =
+            crate::multi_exposure::neutralize_wb_if_multiexposure(raw_image.wb_coeffs, &file_bytes);
+
+        // Same eligibility check as `signed_cfa_develop` in develop_internal.
+        let signed_cfa_develop = !is_linear_raw_format(&raw_image)
+            && raw_image.cpp == 1
+            && matches!(
+                &raw_image.photometric,
+                RawPhotometricInterpretation::Cfa(config)
+                    if config.cfa.unique_colors() != 4 && config.cfa.is_rgb()
+            );
+        assert!(signed_cfa_develop, "fixture must take the signed CFA path");
+
+        for level in raw_image.whitelevel.0.iter_mut() {
+            *level = u32::MAX;
+        }
+        let calibration = UnclippedProPhotoCalibration::for_raw(&raw_image)
+            .expect("unclipped calibration resolves");
+        let developed_intermediate =
+            develop_intermediate_signed_cfa(&raw_image, DemosaicAlgorithm::Quality)
+                .expect("signed develop");
+        let Intermediate::ThreeColor(pixels) = developed_intermediate else {
+            panic!("expected ThreeColor intermediate");
+        };
+        let (width, height) = (pixels.dim().w as u32, pixels.dim().h as u32);
+        let mut data = pixels.data;
+
+        // `prepare_three_color_input` with preserve=true: signed rescale,
+        // no ungamma, no clamp — same executed call as develop_internal.
+        for p in data.iter_mut() {
+            *p = prepare_three_color_input(*p, rescale_factor, 2.5, 2.5, false, true);
+        }
+        let camera_rgb: Vec<[f32; 3]> = indices.iter().map(|&i| data[i]).collect();
+
+        for p in data.iter_mut() {
+            calibration.apply(p);
+        }
+
+        // ---- real profile apply on the replicated ProPhoto buffer -------
+        let amount = crate::xmp_profile::effective_profile_amount(&profile, Some(0.0))
+            .expect("amount resolves");
+        let curve = SampledToneCurve::acr3_default();
+        let mut real_apply = data.clone();
+        crate::xmp_profile::apply_profile_to_three_color_pixels_with_mode_space_and_tone(
+            &mut real_apply,
+            &profile,
+            Some(0.0),
+            crate::xmp_profile::ProfileRenderMode::AdobeSdk,
+            true,
+            Some(&curve),
+        )
+        .expect("profile apply");
+
+        // ---- ground truth: the real exported develop path ---------------
+        let ctx = AdobeRawContext {
+            camera_profile_path: None,
+            source_path: Some(raw_path.as_str()),
+            baseline_mode: DngBaselineMode::Acr3Tone,
+        };
+        let real_image = develop_raw_image_with_profile(
+            &file_bytes,
+            false,
+            2.5,
+            "auto".to_string(),
+            Some(&profile),
+            Some(0.0),
+            Some(&ctx),
+            None,
+        )
+        .expect("real develop");
+        let DynamicImage::ImageRgba32F(real_buf) = &real_image else {
+            panic!("expected f32 working buffer");
+        };
+        assert_eq!(
+            (real_buf.width(), real_buf.height()),
+            (width, height),
+            "real develop dims must match intermediate dims"
+        );
+
+        // Fidelity gate: replicated upstream + real profile apply must be
+        // bit-identical to the real develop, for EVERY pixel — proving the
+        // snapshot stages are the values the export actually saw.
+        let mut max_diff = 0.0f32;
+        for (i, px) in real_buf.pixels().enumerate() {
+            for (c, &applied) in real_apply[i].iter().enumerate().take(3) {
+                max_diff = max_diff.max((px.0[c] - applied).abs());
+            }
+        }
+        assert_eq!(max_diff, 0.0, "replication diverges from real develop");
+
+        // ---- per-pixel sub-stage trace inside the profile apply ---------
+        let probe = crate::xmp_profile::AdobeStageProbe::new(&profile, amount, false, true)
+            .expect("probe contexts");
+        let mut trace = Vec::with_capacity(indices.len() * 21);
+        for (k, &i) in indices.iter().enumerate() {
+            let t = probe.trace(data[i], Some(&curve));
+            // The probe's final output must equal the real applied pixel —
+            // per-pixel proof that trace values are executed values.
+            assert_eq!(t.out, real_apply[i], "probe output mismatch at mask {k}");
+            for px in [
+                camera_rgb[k],
+                t.prophoto_in,
+                t.post_look_table,
+                t.post_tone_curve,
+                t.post_rgb_table,
+                t.srgb_pre_clamp,
+                t.out,
+            ] {
+                trace.extend_from_slice(&px);
+            }
+        }
+        let mut bin = Vec::with_capacity(trace.len() * 4);
+        for v in trace {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(format!("{out_dir}/trace.f32"), &bin).unwrap();
+        std::fs::write(
+            format!("{out_dir}/trace.json"),
+            serde_json::json!({
+                "layout": "float32-le, row-major, 21 values per masked pixel in mask.bin order",
+                "columns": [
+                    "camera_r","camera_g","camera_b",
+                    "prophoto_r","prophoto_g","prophoto_b",
+                    "postLook_r","postLook_g","postLook_b",
+                    "postTone_r","postTone_g","postTone_b",
+                    "postTable_r","postTable_g","postTable_b",
+                    "srgbPreClamp_r","srgbPreClamp_g","srgbPreClamp_b",
+                    "out_r","out_g","out_b"
+                ],
+                "count": indices.len(),
+                "width": width,
+                "height": height,
+                "baseline_mode": "acr3",
+                "profile_amount_percent": 0.0,
+                "resolved_amount": amount,
+                "raw_path": raw_path,
+                "fidelity": "replicated upstream + real profile apply bit-identical to develop_raw_image_with_profile (max diff 0.0, all pixels)",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        eprintln!(
+            "wrote {out_dir}/trace.f32 for {} masked pixels ({} bytes)",
+            indices.len(),
+            bin.len()
+        );
+    }
+
     /// The signed normalization keeps sub-black values: `(v - b)/d` for
     /// `v < b` is negative, where Rawler's `clip()` would emit 0. Per-plane
     /// denominators and CFA-position indexing are verified against the
