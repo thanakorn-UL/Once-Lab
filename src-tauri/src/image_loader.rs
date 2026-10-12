@@ -166,6 +166,7 @@ pub(crate) fn load_base_image_from_bytes_with_xmp_profile(
         let adobe_ctx = crate::raw_processing::AdobeRawContext {
             camera_profile_path: dcp_path.as_deref(),
             source_path: Some(path_for_ext_check),
+            baseline_mode: settings.adobe_dng_baseline_mode(),
         };
         let adobe_ctx = if adobe_comparison {
             Some(adobe_ctx)

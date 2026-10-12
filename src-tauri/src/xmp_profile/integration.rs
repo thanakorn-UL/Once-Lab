@@ -195,7 +195,7 @@ pub(crate) fn apply_profile_to_three_color_pixels_with_mode_space_and_tone(
     ui_percent: Option<f32>,
     mode: ProfileRenderMode,
     input_is_prophoto: bool,
-    baseline_tone_curve: Option<&crate::camera_profile::spline::DngSpline>,
+    baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
 ) -> Result<(), String> {
     let amount = effective_profile_amount(profile, ui_percent)?;
 
@@ -286,7 +286,7 @@ fn apply_profile_adobe_with_space(
     amount: f32,
     is_hdr: bool,
     input_is_prophoto: bool,
-    baseline_tone_curve: Option<&crate::camera_profile::spline::DngSpline>,
+    baseline_tone_curve: Option<&dyn crate::camera_profile::spline::BaselineToneCurve>,
 ) -> Result<(), String> {
     // Every stage context is built — and therefore fully validated, with the
     // amount resolved — before the first pixel is touched.
@@ -1321,7 +1321,7 @@ mod tests {
     /// observable; a non-linear curve makes a double application observable.
     #[test]
     fn baseline_tone_curve_runs_before_rgb_table_exactly_once() {
-        use crate::camera_profile::spline::DngSpline;
+        use crate::camera_profile::spline::{BaselineToneCurve, DngSpline};
 
         // An S-shaped, strictly non-linear curve.
         let curve = DngSpline::solve(&[(0.0, 0.0), (0.3, 0.1), (0.7, 0.9), (1.0, 1.0)])
