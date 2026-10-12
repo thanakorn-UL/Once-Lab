@@ -556,13 +556,14 @@ pub struct AppSettings {
     /// color-matrix fallback (explicitly not "Adobe Standard" parity).
     #[serde(default)]
     pub adobe_camera_profile_path: Option<String>,
-    /// Opt-in: when the camera profile has no `ProfileToneCurve`, substitute
-    /// the DNG SDK's baked `dng_tone_curve_acr3_default` table at the baseline
-    /// tone stage. This is the documented SDK fallback — it is NOT Lightroom
-    /// Classic's private PV2012 adaptive tone mapping. Default `false` keeps
-    /// the established identity baseline.
+    /// Developer-only experiment selector for the DNG baseline tone/exposure
+    /// defaults used when a camera profile has no `ProfileToneCurve`. One of
+    /// `"identity"` (default), `"acr3"`, `"shadow-toe"`, `"acr3+toe"`. The
+    /// env var `ONCELAB_ADOBE_DNG_TONE_MODE` overrides it. Not a permanent
+    /// user-facing feature — deliberately absent from the Settings UI; the
+    /// documented SDK fallbacks are NOT Lightroom's private PV2012 stack.
     #[serde(default)]
-    pub adobe_dng_baseline_tone: Option<bool>,
+    pub adobe_dng_baseline_mode: Option<String>,
     #[serde(default)]
     pub workspace: WorkspaceState,
 }
@@ -577,12 +578,17 @@ impl AppSettings {
             || std::env::var("ONCELAB_ADOBE_COMPARISON").as_deref() == Ok("1")
     }
 
-    /// Whether the baseline tone stage substitutes the SDK's baked
-    /// `dng_tone_curve_acr3_default` when the camera profile has none.
-    /// Off by default — opt-in only (documented, not PV2012).
-    pub fn adobe_dng_baseline_tone(&self) -> bool {
-        self.adobe_dng_baseline_tone.unwrap_or(false)
-            || std::env::var("ONCELAB_ADOBE_DNG_TONE").as_deref() == Ok("1")
+    /// The developer-only DNG baseline tone/exposure experiment mode.
+    /// `ONCELAB_ADOBE_DNG_TONE_MODE` takes precedence over the persisted
+    /// setting; both default to `Identity` (the established baseline).
+    pub fn adobe_dng_baseline_mode(&self) -> crate::raw_processing::DngBaselineMode {
+        if let Ok(v) = std::env::var("ONCELAB_ADOBE_DNG_TONE_MODE") {
+            return crate::raw_processing::DngBaselineMode::from_label(&v);
+        }
+        self.adobe_dng_baseline_mode
+            .as_deref()
+            .map(crate::raw_processing::DngBaselineMode::from_label)
+            .unwrap_or_default()
     }
 }
 
@@ -680,7 +686,7 @@ impl Default for AppSettings {
             always_decode_raw_thumbnails: Some(false),
             adobe_comparison_mode: Some(false),
             adobe_camera_profile_path: None,
-            adobe_dng_baseline_tone: Some(false),
+            adobe_dng_baseline_mode: None,
             workspace: WorkspaceState::default(),
         }
     }

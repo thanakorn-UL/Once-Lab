@@ -1775,10 +1775,7 @@
           "basic": "Basic"
         },
         "tonemapperOverride": "Global Tonemapper Override",
-        "tonemapperOverrideDesc": "Force a specific tonemapper globally for all images, hiding the tonemapper switch from the adjustments panel.",
-        "dngBaselineTone": "DNG Baseline Tone Curve",
-        "dngBaselineToneDesc": "When the camera profile has no ProfileToneCurve, substitute the DNG SDK's baked dng_tone_curve_acr3_default table at the baseline tone stage (before the Creative RGBTable). This is the documented SDK fallback — not Lightroom Classic's private PV2012 tone mapping. Off keeps the established identity baseline.",
-        "dngBaselineToneEnable": "Use DNG SDK default tone curve"
+        "tonemapperOverrideDesc": "Force a specific tonemapper globally for all images, hiding the tonemapper switch from the adjustments panel."
       },
       "previewRes": "Preview Resolution",
       "previewResDesc": "Determines the maximum resolution of the preview. Lower values significantly improve performance.",

@@ -33,22 +33,54 @@ pub(crate) struct AdobeRawContext<'a> {
     pub camera_profile_path: Option<&'a std::path::Path>,
     /// Source path for the diagnostic report (pixel work never depends on it).
     pub source_path: Option<&'a str>,
-    /// Baseline tone stage selection (`dng_render` runs LookTable ->
-    /// ProfileToneCurve -> RGBTables). `DngAcr3Default` substitutes the SDK's
-    /// baked `dng_tone_curve_acr3_default` whenever the profile authored no
-    /// curve — the documented SDK fallback, explicitly *not* Lightroom's
-    /// private PV2012 tone stack. `Identity` preserves the established
-    /// Once-Lab baseline.
-    pub baseline_tone: BaselineToneChoice,
+    /// Developer-only experiment selector for the profile-less baseline's
+    /// exposure/tone defaults (`dng_render` runs the exposure ramp between
+    /// camera transform and LookTable, then LookTable -> ProfileToneCurve ->
+    /// RGBTables). Deliberately NOT a permanent user-facing feature: modes
+    /// select which documented SDK defaults run when the camera profile
+    /// authored none. `Identity` preserves the established Once-Lab
+    /// baseline. None of these reproduce Lightroom's private PV2012 stack.
+    pub baseline_mode: DngBaselineMode,
 }
 
-/// Which curve runs at the baseline tone stage when the camera profile has
-/// none. Selectable; defaults to the established identity behavior.
+/// The four experiment modes for the DNG baseline tone/exposure defaults.
+/// Developer-only — selected via `ONCELAB_ADOBE_DNG_TONE_MODE` or the
+/// `adobeDngBaselineMode` settings key, not a permanent UI feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum BaselineToneChoice {
+pub enum DngBaselineMode {
+    /// Established Once-Lab baseline: no baseline tone, no ramp toe.
     #[default]
     Identity,
-    DngAcr3Default,
+    /// `dng_tone_curve_acr3_default` (1025-pt sampled table) at the tone
+    /// stage when the profile has no ProfileToneCurve.
+    Acr3Tone,
+    /// SDK render-default exposure ramp (`Shadows=5`, `ShadowScale=1`,
+    /// EV 0 → ~0.5% quadratic black toe) on the fallback path.
+    ShadowToe,
+    /// Both SDK defaults: exposure ramp toe AND the acr3 tone curve.
+    Acr3ToneWithShadowToe,
+}
+
+impl DngBaselineMode {
+    /// True when the acr3 default curve runs at the tone stage.
+    pub fn acr3_tone(self) -> bool {
+        matches!(self, Self::Acr3Tone | Self::Acr3ToneWithShadowToe)
+    }
+
+    /// True when the SDK Shadows=5 ramp runs on the fallback path.
+    pub fn shadow_toe(self) -> bool {
+        matches!(self, Self::ShadowToe | Self::Acr3ToneWithShadowToe)
+    }
+
+    /// Parse a settings/env string; unknown values fall back to Identity.
+    pub fn from_label(s: &str) -> Self {
+        match s {
+            "acr3" | "acr3-tone" | "tone" => Self::Acr3Tone,
+            "toe" | "shadow-toe" | "shadows" => Self::ShadowToe,
+            "acr3+toe" | "acr3-tone-shadow-toe" | "full" | "both" => Self::Acr3ToneWithShadowToe,
+            _ => Self::Identity,
+        }
+    }
 }
 
 /// Develop a RAW file and collect the full stage-boundary diagnostic
@@ -705,14 +737,15 @@ fn develop_internal(
 
     // Whether the user opted into the SDK's documented defaults for the
     // profile-less baseline (acr3 tone curve + Shadows=5 ramp toe).
-    let sdk_baseline_tone =
-        adobe.map(|ctx| ctx.baseline_tone) == Some(BaselineToneChoice::DngAcr3Default);
-    // The SDK's render defaults for the exposure ramp (`fShadows = 5`,
-    // `ShadowScale = 1`, EV 0) — a ~0.5% quadratic black toe. Runs on the
-    // Rawler-fallback path only when the same opt-in is enabled; a real DCP
-    // carries its own ramp data instead.
+    // Developer-only experiment selector: which SDK documented defaults
+    // run when the camera profile authored none. `Identity` is the
+    // established baseline. The ramp (`fShadows = 5`, `ShadowScale = 1`,
+    // EV 0 → ~0.5% quadratic black toe) runs only on the Rawler-fallback
+    // path in toe modes; a real DCP carries its own ramp data instead.
+    let baseline_mode = adobe.map(|ctx| ctx.baseline_mode).unwrap_or_default();
     let sdk_default_ramp = ExposureRamp::new(0.0, 5.0, 1.0);
-    let fallback_ramp_active = sdk_baseline_tone && dcp_render.is_none() && sdk_default_ramp.active;
+    let fallback_ramp_active =
+        baseline_mode.shadow_toe() && dcp_render.is_none() && sdk_default_ramp.active;
 
     // ------------------------------------------------- camera transform
     // Runs AFTER normalization: the DCP stage clips at the camera-white point
@@ -791,7 +824,11 @@ fn develop_internal(
     let tone_curve: Option<&dyn BaselineToneCurve> = dcp_render
         .as_ref()
         .and_then(|render| render.tone_curve())
-        .or_else(|| sdk_baseline_tone.then_some(&acr3_default_curve as &dyn BaselineToneCurve));
+        .or_else(|| {
+            baseline_mode
+                .acr3_tone()
+                .then_some(&acr3_default_curve as &dyn BaselineToneCurve)
+        });
     let tone_curve_label = tone_curve.map(|c| c.label()).unwrap_or("identity");
 
     if let Some(d) = diag.as_mut() {
@@ -805,7 +842,13 @@ fn develop_internal(
         let beo = dcp_render
             .as_ref()
             .and_then(|r| r.report.baseline_exposure_offset_ev);
-        d.record_tone(&ramp_label, beo, tone_curve_label, false);
+        let mode_label = match baseline_mode {
+            DngBaselineMode::Identity => "identity",
+            DngBaselineMode::Acr3Tone => "acr3",
+            DngBaselineMode::ShadowToe => "shadow-toe",
+            DngBaselineMode::Acr3ToneWithShadowToe => "acr3+toe",
+        };
+        d.record_tone(&ramp_label, beo, mode_label, tone_curve_label, false);
     }
 
     if let Some(profile) = profile {
@@ -1119,7 +1162,7 @@ mod adobe_dcp_end_to_end {
             Some(&AdobeRawContext {
                 camera_profile_path: Some(dcp_path.as_path()),
                 source_path: Some(raw_path.to_str().unwrap()),
-                baseline_tone: BaselineToneChoice::Identity,
+                baseline_mode: DngBaselineMode::Identity,
             }),
             None,
         )
@@ -1150,7 +1193,7 @@ mod adobe_dcp_end_to_end {
             Some(&AdobeRawContext {
                 camera_profile_path: None,
                 source_path: Some(raw_path.to_str().unwrap()),
-                baseline_tone: BaselineToneChoice::Identity,
+                baseline_mode: DngBaselineMode::Identity,
             }),
             None,
         )
@@ -1207,7 +1250,7 @@ mod adobe_dcp_end_to_end {
             Some(&AdobeRawContext {
                 camera_profile_path: Some(Path::new(&dcp_path)),
                 source_path: Some(raw_path.as_str()),
-                baseline_tone: BaselineToneChoice::Identity,
+                baseline_mode: DngBaselineMode::Identity,
             }),
             None,
         )
@@ -1255,14 +1298,16 @@ mod round3_probe {
         };
         let bytes = std::fs::read(&raw_path).expect("read RAW fixture");
 
-        for baseline_tone in [
-            BaselineToneChoice::Identity,
-            BaselineToneChoice::DngAcr3Default,
+        for baseline_mode in [
+            DngBaselineMode::Identity,
+            DngBaselineMode::Acr3Tone,
+            DngBaselineMode::ShadowToe,
+            DngBaselineMode::Acr3ToneWithShadowToe,
         ] {
             let ctx = AdobeRawContext {
                 camera_profile_path: None,
                 source_path: Some(raw_path.as_str()),
-                baseline_tone,
+                baseline_mode,
             };
             let (_image, diag) = develop_raw_image_diagnostics(
                 &bytes,
@@ -1299,10 +1344,22 @@ mod round3_probe {
                 .expect("tone report")
                 .tone_curve
                 .clone();
-            match baseline_tone {
-                BaselineToneChoice::Identity => assert_eq!(tone_label, "identity"),
-                BaselineToneChoice::DngAcr3Default => {
+            match baseline_mode {
+                DngBaselineMode::Identity | DngBaselineMode::ShadowToe => {
+                    assert_eq!(tone_label, "identity")
+                }
+                DngBaselineMode::Acr3Tone | DngBaselineMode::Acr3ToneWithShadowToe => {
                     assert!(tone_label.contains("acr3_default"))
+                }
+            }
+            // The toe mode must run the SDK ramp on the fallback path.
+            let ramp_label = &diag.exposure_tone.as_ref().unwrap().exposure_ramp;
+            match baseline_mode {
+                DngBaselineMode::Identity | DngBaselineMode::Acr3Tone => {
+                    assert!(ramp_label.contains("identity"))
+                }
+                DngBaselineMode::ShadowToe | DngBaselineMode::Acr3ToneWithShadowToe => {
+                    assert!(ramp_label.contains("shadows=5"))
                 }
             }
 
@@ -1312,10 +1369,11 @@ mod round3_probe {
             std::fs::create_dir_all(&out_dir).unwrap();
             let name = format!(
                 "raw-baseline-diagnostics-{}.json",
-                if baseline_tone == BaselineToneChoice::DngAcr3Default {
-                    "acr3tone"
-                } else {
-                    "identity"
+                match baseline_mode {
+                    DngBaselineMode::Identity => "identity",
+                    DngBaselineMode::Acr3Tone => "acr3tone",
+                    DngBaselineMode::ShadowToe => "shadowtoe",
+                    DngBaselineMode::Acr3ToneWithShadowToe => "acr3tone+shadowtoe",
                 }
             );
             std::fs::write(format!("{out_dir}/{name}"), &json).unwrap();

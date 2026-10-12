@@ -2330,18 +2330,6 @@ export default function SettingsPanel({
                               )}
 
                               <SettingItem
-                                label={t('settings.processing.preprocessing.dngBaselineTone')}
-                                description={t('settings.processing.preprocessing.dngBaselineToneDesc')}
-                              >
-                                <Switch
-                                  checked={appSettings?.adobeDngBaselineTone ?? false}
-                                  id="adobe-dng-tone-toggle"
-                                  label={t('settings.processing.preprocessing.dngBaselineToneEnable')}
-                                  onChange={(checked) => onSettingsChange({ ...appSettings, adobeDngBaselineTone: checked })}
-                                />
-                              </SettingItem>
-
-                              <SettingItem
                                 label={t('settings.processing.preprocessing.dcpDiagnostics')}
                                 description={t('settings.processing.preprocessing.dcpDiagnosticsDesc')}
                               >

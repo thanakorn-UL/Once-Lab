@@ -198,6 +198,9 @@ pub struct ExposureToneReport {
     pub baseline_exposure_offset_ev: Option<f64>,
     pub shadow_scale: f64,
     pub shadows_ui_applied: bool,
+    /// The developer-only experiment mode in force: "identity" |
+    /// "acr3" | "shadow-toe" | "acr3+toe".
+    pub baseline_mode: String,
     pub tone_curve: String,
     pub note: String,
 }
@@ -360,6 +363,7 @@ impl RawPipelineDiagnostics {
         &mut self,
         exposure_ramp: &str,
         beo_ev: Option<f64>,
+        baseline_mode: &str,
         tone_curve: &str,
         shadows_ui: bool,
     ) {
@@ -369,6 +373,7 @@ impl RawPipelineDiagnostics {
             baseline_exposure_offset_ev: beo_ev,
             shadow_scale: 1.0,
             shadows_ui_applied: shadows_ui,
+            baseline_mode: baseline_mode.to_string(),
             tone_curve: tone_curve.to_string(),
             note: "SDR path: exposure_tone is a NOP at EV>=0; stage3 black is absent for CR3"
                 .to_string(),
@@ -625,11 +630,7 @@ pub fn get_raw_baseline_diagnostics(
     let ctx = crate::raw_processing::AdobeRawContext {
         camera_profile_path: dcp_path.as_deref(),
         source_path: Some(path.as_str()),
-        baseline_tone: if settings.adobe_dng_baseline_tone() {
-            crate::raw_processing::BaselineToneChoice::DngAcr3Default
-        } else {
-            crate::raw_processing::BaselineToneChoice::Identity
-        },
+        baseline_mode: settings.adobe_dng_baseline_mode(),
     };
     let adobe_ctx = adobe_enabled.then_some(&ctx);
 
@@ -685,7 +686,13 @@ mod tests {
     #[test]
     fn tone_report_records_the_actual_curve() {
         let mut diag = RawPipelineDiagnostics::new("/tmp/x.cr3", true);
-        diag.record_tone("identity (no DCP exposure ramp)", None, "identity", false);
+        diag.record_tone(
+            "identity (no DCP exposure ramp)",
+            None,
+            "identity",
+            "identity",
+            false,
+        );
         let json = serde_json::to_value(&diag).unwrap();
         assert_eq!(json["exposureTone"]["toneCurve"], "identity");
         assert_eq!(

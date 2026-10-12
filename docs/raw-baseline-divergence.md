@@ -72,16 +72,21 @@ Once-Lab previously ran identity here.
 - Also implemented: SDK render-default exposure ramp (`Shadows=5`, `ShadowScale=1`,
   EV 0 → black=0.005 quadratic toe) on the fallback path under the same flag; DCP
   profiles continue to carry their own ramp (BaselineExposureOffset + black render).
-- **Opt-in only** (`adobe_dng_baseline_tone` setting + `ONCELAB_ADOBE_DNG_TONE=1` +
-  Settings → Processing → "DNG Baseline Tone Curve" toggle). Default OFF preserves the
-  established baseline.
+- **Developer-only experiment selector** — four modes via
+  `ONCELAB_ADOBE_DNG_TONE_MODE` (or the `adobeDngBaselineMode` settings key;
+  intentionally no permanent Settings UI):
+  `identity` (default) · `acr3` (tone curve only) · `shadow-toe` (Shadows=5
+  ramp only) · `acr3+toe` (both). Mode is recorded in the diagnostics'
+  `exposureTone.baselineMode` field for reproducibility.
 
-**Measured effect on the fixture (Rawler-fallback path):**
+**Measured effect on the fixture (Rawler-fallback path, final linear sRGB working buffer):**
 
-| Stage (final linear sRGB) | luma mean | luma p50 | luma p99 | luma max |
+| Mode | luma mean | luma p50 | luma p99 | luma max |
 |---|---|---|---|---|
-| identity baseline | 0.0684 | 0.0380 | 0.2992 | 0.798 |
-| acr3 + Shadows=5 ramp | 0.1163 | 0.0444 | 0.5865 | 0.940 |
+| `identity` (default) | 0.0684 | 0.0380 | 0.2992 | 0.798 |
+| `shadow-toe` | 0.0637 | 0.0331 | 0.2956 | — |
+| `acr3` | 0.1247 | 0.0534 | 0.5916 | — |
+| `acr3+toe` | 0.1162 | 0.0444 | 0.5865 | 0.940 |
 
 The ACR3 experiment demonstrates a **large modeled tone effect** on Once-Lab's
 own baseline — the identity tone leaves the working buffer ~1.7× darker than the
