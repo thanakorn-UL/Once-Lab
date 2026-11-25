@@ -203,7 +203,7 @@ mod tests {
             let base = 132 + i * 12;
             let off = u32::from_be_bytes(icc[base + 4..base + 8].try_into().unwrap()) as usize;
             let size = u32::from_be_bytes(icc[base + 8..base + 12].try_into().unwrap()) as usize;
-            assert!(off % 4 == 0, "tag {i} offset {off} unaligned");
+            assert!(off.is_multiple_of(4), "tag {i} offset {off} unaligned");
             assert!(off + size <= icc.len(), "tag {i} out of bounds");
         }
     }

@@ -20,7 +20,7 @@
 
 use super::color_spec::{DcpColorSpec, Xy, illuminant_to_temperature, temperature_from_xy};
 use super::dcp::{CameraMatch, DEFAULT_BLACK_RENDER_NONE, DcpProfile};
-use super::spline::DngSpline;
+use super::spline::{BaselineToneCurve, DngSpline};
 use crate::xmp_profile::LookTable;
 use crate::xmp_profile::LookTableAdobeContext;
 
@@ -111,14 +111,19 @@ pub(crate) struct ExposureRamp {
     black: f64,
     radius: f64,
     qscale: f64,
-    active: bool,
-    label: String,
+    /// `false` when the ramp is a true identity (EV 0, shadows 0).
+    pub(crate) active: bool,
+    /// Diagnostic label for reports/diagnostics.
+    pub(crate) label: String,
 }
 
 impl ExposureRamp {
     /// `white = 1 / 2^max(0, exposure)`, `black = shadows * shadowScale *
     /// stage3Gain * 0.001` pinned below `0.99 * white`.
-    fn new(exposure_ev: f64, shadows: f64, shadow_scale: f64) -> Self {
+    ///
+    /// `pub(crate)` so the Rawler-fallback baseline can explicitly opt into
+    /// the SDK render-default ramp (`Shadows=5`, `ShadowScale=1`, EV 0).
+    pub(crate) fn new(exposure_ev: f64, shadows: f64, shadow_scale: f64) -> Self {
         let white = 1.0 / (2.0f64).powf(exposure_ev.max(0.0));
         let black = (shadows * shadow_scale * 0.001).min(0.99 * white);
 
@@ -149,7 +154,7 @@ impl ExposureRamp {
         }
     }
 
-    fn evaluate(&self, x: f32) -> f32 {
+    pub(crate) fn evaluate(&self, x: f32) -> f32 {
         let x = f64::from(x);
         if x <= self.black - self.radius {
             return 0.0;
@@ -192,6 +197,8 @@ pub struct RenderReport {
     pub hue_sat_map: String,
     pub look_table: String,
     pub exposure_stage: String,
+    /// `BaselineExposureOffset` (EV) authored by the profile, when present.
+    pub baseline_exposure_offset_ev: Option<f64>,
     pub tone_curve: String,
     pub match_kind: String,
 }
@@ -329,6 +336,7 @@ impl DcpRender {
                     })
                     .unwrap_or_else(|| "none".to_string()),
                 exposure_stage: exposure_label,
+                baseline_exposure_offset_ev: dcp.baseline_exposure_offset,
                 tone_curve: tone_label,
                 match_kind,
             },
@@ -369,8 +377,10 @@ impl DcpRender {
 
     /// The baseline tone stage's tone curve, when the DCP authored one.
     /// Returns `None` for the explicit identity fallback.
-    pub(crate) fn tone_curve(&self) -> Option<&DngSpline> {
-        self.tone_curve.as_ref()
+    pub(crate) fn tone_curve(&self) -> Option<&dyn BaselineToneCurve> {
+        self.tone_curve
+            .as_ref()
+            .map(|s| s as &dyn BaselineToneCurve)
     }
 }
 

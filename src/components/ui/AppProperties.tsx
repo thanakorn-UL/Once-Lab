@@ -262,6 +262,10 @@ export interface AppSettings {
   alwaysDecodeRawThumbnails?: boolean;
   adobeComparisonMode?: boolean;
   adobeCameraProfilePath?: string | null;
+  // Developer-only DNG baseline experiment selector; intentionally not a
+  // Switch in Settings UI. One of "identity" | "acr3" | "shadow-toe" |
+  // "acr3+toe"; the ONCELAB_ADOBE_DNG_TONE_MODE env var overrides it.
+  adobeDngBaselineMode?: string | null;
   xmpProfileRoots?: string[];
   workspace?: WorkspaceState;
 }

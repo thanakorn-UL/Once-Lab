@@ -42,6 +42,7 @@ mod negative_conversion;
 mod panorama_stitching;
 mod panorama_utils;
 mod preset_converter;
+mod raw_diagnostics;
 mod raw_processing;
 mod tagging;
 mod tagging_utils;
@@ -2156,6 +2157,7 @@ pub fn run() {
             xmp_profile::discover_default_xmp_profile_roots,
             camera_profile::inspect_camera_profile,
             camera_profile::get_adobe_pipeline_report,
+            raw_diagnostics::get_raw_baseline_diagnostics,
             develop_state_io::resolve_image_develop_profile,
             develop_state_io::save_image_develop_profile,
             develop_state_io::save_develop_profile_for_paths,
